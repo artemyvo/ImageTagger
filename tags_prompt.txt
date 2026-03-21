@@ -1,0 +1,1 @@
+Analyze the image and return a list of short descriptive tags, one tag per line. Each tag must be one or two words maximum. Use lowercase only. Do not use commas. Do not include numbering, explanations, or sentences.
