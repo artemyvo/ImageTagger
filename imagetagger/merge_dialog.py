@@ -6,14 +6,16 @@ from typing import Callable
 
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, Qt, QSize
-from PyQt6.QtGui import QColor, QKeySequence, QPixmap, QPainter, QPalette, QTextCharFormat, QTextCursor, QTextDocument
+from PyQt6.QtCore import QEvent, Qt, QSize, QStringListModel, QTimer
+from PyQt6.QtGui import QAction, QColor, QKeySequence, QPixmap, QPainter, QPalette, QTextCharFormat, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCompleter,
     QDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -306,6 +308,7 @@ class FixupDialog(QDialog):
         restore_fixup: Callable[[str], bool] | None = None,
         can_navigate_prev: bool = False,
         can_navigate_next: bool = False,
+        tag_suggestions: list[str] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -327,6 +330,22 @@ class FixupDialog(QDialog):
         self.left_list.setWordWrap(True)
         self.left_list.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.left_list.setUniformItemSizes(False)
+
+        self.remove_left_tag_action = QAction("Remove Selected Existing Tags", self)
+        self.remove_left_tag_action.setShortcut("Delete")
+        self.remove_left_tag_action.triggered.connect(self._remove_selected_left_items)
+        self.left_list.addAction(self.remove_left_tag_action)
+
+        self.left_tag_input = QLineEdit(self)
+        self.left_tag_input.setPlaceholderText("Type a tag and press Enter")
+        self.left_tag_input.returnPressed.connect(self._add_left_tag_from_input)
+
+        self._tag_suggestions_model = QStringListModel(tag_suggestions or [], self)
+        _completer = QCompleter(self._tag_suggestions_model, self)
+        _completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        _completer.setFilterMode(Qt.MatchFlag.MatchStartsWith)
+        _completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.left_tag_input.setCompleter(_completer)
 
         self.right_list = QListWidget(self)
         self.right_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -398,12 +417,27 @@ class FixupDialog(QDialog):
         self.next_button.setToolTip("Go to next item (Alt+Right)")
         self.next_button.clicked.connect(self._navigate_next)
 
+        for button in (
+            self.accept_button,
+            self.reject_button,
+            self.merge_button,
+            self.undo_button,
+            self.accept_next_button,
+            self.reject_next_button,
+            self.merge_next_button,
+            self.prev_button,
+            self.next_button,
+        ):
+            button.setAutoDefault(False)
+            button.setDefault(False)
+
         # Left pane
         left_pane = QWidget(self)
         left_layout = QVBoxLayout(left_pane)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.addWidget(QLabel("Existing", self))
         left_layout.addWidget(self.left_list, stretch=1)
+        left_layout.addWidget(self.left_tag_input, stretch=0)
 
         # Right pane
         right_pane = QWidget(self)
@@ -454,6 +488,22 @@ class FixupDialog(QDialog):
         item = QListWidgetItem(normalized)  # Set text on item
         item.setData(DIFF_RANGES_ROLE, [])
         self.left_list.addItem(item)
+
+    def _add_left_tag_from_input(self) -> None:
+        new_tag = self.left_tag_input.text().strip()
+        if not new_tag:
+            return
+
+        existing_tags = [text.strip() for text in self._current_texts(self.left_list)]
+        if new_tag in existing_tags:
+            self.left_tag_input.selectAll()
+            return
+
+        self._add_left_item(new_tag)
+        self.left_tag_input.clear()
+        QTimer.singleShot(0, self.left_tag_input.clear)
+        self._refresh_button_state()
+        self._update_difference_highlights()
 
     def _add_right_item(self, text: str) -> None:
         """Add item to right list with accept button."""
@@ -835,6 +885,28 @@ class FixupDialog(QDialog):
             if item_text.strip() == normalized:
                 self.left_list.takeItem(i)
                 break
+        self._refresh_button_state()
+        self._update_difference_highlights()
+
+    def _remove_selected_left_items(self) -> None:
+        selected = self.left_list.selectedItems()
+        if not selected:
+            return
+
+        removed_any = False
+        for item in selected:
+            widget = self.left_list.itemWidget(item)
+            item_text = widget.text if widget else item.text()
+            if self._is_protected_existing_text(item_text):
+                continue
+            row = self.left_list.row(item)
+            removed = self.left_list.takeItem(row)
+            del removed
+            removed_any = True
+
+        if not removed_any:
+            return
+
         self._refresh_button_state()
         self._update_difference_highlights()
 

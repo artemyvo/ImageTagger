@@ -60,6 +60,7 @@ def open_fixup_dialog_for_image(
     save_geometry: Callable[[dict[str, int]], None] | None = None,
     can_navigate_prev: bool = False,
     can_navigate_next: bool = False,
+    tag_suggestions: list[str] | None = None,
 ) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
     fixup_path = existing_fixup_path_for_image(image_path)
     if fixup_path is None:
@@ -109,7 +110,8 @@ def open_fixup_dialog_for_image(
         restore_fixup,
         can_navigate_prev,
         can_navigate_next,
-        parent,
+        tag_suggestions=tag_suggestions,
+        parent=parent,
     )
 
     if initial_geometry:

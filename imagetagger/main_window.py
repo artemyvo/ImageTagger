@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -84,10 +85,10 @@ class FolderLoadWorker(QObject):
             image_paths = sorted(
                 [
                     p
-                    for p in self.folder.iterdir()
+                    for p in self.folder.rglob("*")
                     if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
                 ],
-                key=lambda p: p.name.lower(),
+                key=lambda p: p.relative_to(self.folder).as_posix().lower(),
             )
         except OSError as exc:
             self.failed.emit(f"Failed to read folder: {exc}")
@@ -239,6 +240,7 @@ class MainWindow(QMainWindow):
         self._ollama_thread: QThread | None = None
         self._ollama_worker: OllamaTaskWorker | None = None
         self.known_tags: set[str] = set()
+        self.tag_counts: Counter[str] = Counter()
         self._updating_tag_list = False
         self._ignore_selection_sync = False
         self._generate_batch_total = 0
@@ -462,7 +464,13 @@ class MainWindow(QMainWindow):
         if last_dir:
             folder = Path(last_dir)
             if folder.exists() and folder.is_dir():
-                self.load_directory(folder)
+                last_image_str = self._cfg.get("last_selected_image", "").strip()
+                restore_path: Path | None = None
+                if last_image_str:
+                    candidate = Path(last_image_str)
+                    if candidate.exists() and candidate.is_file() and candidate.parent == folder:
+                        restore_path = candidate
+                self.load_directory(folder, restore_selection=restore_path)
 
     def _build_menu(self) -> None:
         menu = self.menuBar().addMenu("File")
@@ -880,9 +888,11 @@ class MainWindow(QMainWindow):
         if record is None:
             return
 
-        initial_fixup_total = sum(
-            1 for item in self.records if existing_fixup_path_for_image(item.image_path) is not None
-        )
+        initial_fixup_record_indices = [
+            i for i, item in enumerate(self.records)
+            if existing_fixup_path_for_image(item.image_path) is not None
+        ]
+        initial_fixup_total = len(initial_fixup_record_indices)
         if initial_fixup_total <= 0:
             return
 
@@ -891,11 +901,10 @@ class MainWindow(QMainWindow):
             if record is None:
                 return
 
-            current_fixup_total = sum(
-                1 for item in self.records if existing_fixup_path_for_image(item.image_path) is not None
-            )
-            fixed_count = max(0, initial_fixup_total - current_fixup_total)
-            display_index = min(initial_fixup_total, fixed_count + 1)
+            try:
+                display_index = initial_fixup_record_indices.index(self.current_index) + 1
+            except ValueError:
+                display_index = 1
             dialog_title = f"Fixup - {record.image_path.name} ({display_index} of {initial_fixup_total})"
 
             prev_fixup_index = self._find_adjacent_fixup_index(self.current_index, -1)
@@ -919,6 +928,7 @@ class MainWindow(QMainWindow):
                 save_geometry=self._save_merge_dialog_geometry,
                 can_navigate_prev=prev_fixup_index is not None,
                 can_navigate_next=next_fixup_index is not None,
+                tag_suggestions=self._sorted_tag_suggestions(),
             )
 
             if outcome == "prev" and prev_fixup_index is not None:
@@ -975,6 +985,7 @@ class MainWindow(QMainWindow):
         self._pending_selection_path = restore_selection
         self.records = []
         self.known_tags.clear()
+        self.tag_counts.clear()
         self.list_widget.clear()
         self.image_label.setText("No image selected")
         self.tag_input.clear()
@@ -1050,7 +1061,9 @@ class MainWindow(QMainWindow):
 
         record = ImageRecord(image_path=image_path, text_path=text_path, text=text)
         self.records.append(record)
-        self.known_tags.update(self._parse_tags(text))
+        parsed_tags = self._parse_tags(text)
+        self.known_tags.update(parsed_tags)
+        self.tag_counts.update(parsed_tags)
         self._add_list_item(record, thumb_image)
 
     def _on_load_progress(self, processed: int, total: int, percent: int) -> None:
@@ -1178,7 +1191,7 @@ class MainWindow(QMainWindow):
         self._populate_tag_list(tags)
         self.tag_input.clear()
         self._update_fixup_button_state()
-        self.statusBar().showMessage(str(record.image_path))
+        self.statusBar().showMessage(f"({index + 1} of {len(self.records)}) {record.image_path}")
 
     def _show_image(self, image_path: Path) -> None:
         pixmap = QPixmap(str(image_path))
@@ -1207,6 +1220,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._save_main_window_geometry()
+        record = self._current_record()
+        if record is not None:
+            self._cfg["last_selected_image"] = str(record.image_path)
+        else:
+            self._cfg.pop("last_selected_image", None)
+        _config.save(self._cfg)
         super().closeEvent(event)
 
     def _populate_tag_list(self, tags: list[str]) -> None:
@@ -1256,13 +1275,20 @@ class MainWindow(QMainWindow):
         self._write_record_text(record, status_prefix=status_prefix)
 
     def _rebuild_known_tags_from_records(self) -> None:
-        known: set[str] = set()
+        counts: Counter[str] = Counter()
         for record in self.records:
-            known.update(self._parse_tags(record.text))
-        self.known_tags = known
+            counts.update(self._parse_tags(record.text))
+        self.tag_counts = counts
+        self.known_tags = set(counts)
+
+    def _sorted_tag_suggestions(self) -> list[str]:
+        return sorted(
+            self.known_tags,
+            key=lambda tag: (-self.tag_counts.get(tag, 0), tag.lower(), tag),
+        )
 
     def _refresh_tag_completions(self) -> None:
-        suggestions = sorted(self.known_tags, key=lambda t: t.lower())
+        suggestions = self._sorted_tag_suggestions()
         self.tag_suggestions_model.setStringList(suggestions)
 
     def _add_tag_from_input(self) -> None:
