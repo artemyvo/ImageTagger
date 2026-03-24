@@ -369,6 +369,11 @@ class MainWindow(QMainWindow):
         self.ollama_timeout_input.setText(str(int(DEFAULT_TIMEOUT)))
         self.ollama_timeout_input.setMaximumWidth(90)
 
+        self.ollama_retry_input = QLineEdit(self)
+        self.ollama_retry_input.setValidator(QIntValidator(0, 10, self))
+        self.ollama_retry_input.setText("3")
+        self.ollama_retry_input.setMaximumWidth(60)
+
         server_row = QHBoxLayout()
         server_row.addWidget(self.ollama_server_input, stretch=1)
         server_row.addWidget(self.ollama_fetch_button)
@@ -389,6 +394,9 @@ class MainWindow(QMainWindow):
         generate_options_row.addSpacing(12)
         generate_options_row.addWidget(QLabel("Timeout", self))
         generate_options_row.addWidget(self.ollama_timeout_input)
+        generate_options_row.addSpacing(8)
+        generate_options_row.addWidget(QLabel("Retries", self))
+        generate_options_row.addWidget(self.ollama_retry_input)
         generate_options_row.addStretch(1)
 
         gen_row = QHBoxLayout()
@@ -631,6 +639,14 @@ class MainWindow(QMainWindow):
             raise OllamaError("Timeout must be at least 1 second.")
 
         return float(timeout)
+
+    def _ollama_retry_count(self) -> int:
+        raw_value = self.ollama_retry_input.text().strip()
+        try:
+            retries = int(raw_value)
+        except ValueError:
+            return 0
+        return max(0, retries)
 
     def _update_ollama_controls(self) -> None:
         connected = bool(self.ollama_model_name.strip())
@@ -896,6 +912,39 @@ class MainWindow(QMainWindow):
         if initial_fixup_total <= 0:
             return
 
+        regenerate_tags_enabled = self.generate_tags_checkbox.isChecked()
+        regenerate_description_enabled = self.generate_description_checkbox.isChecked()
+        timeout_text = self.ollama_timeout_input.text().strip()
+        retry_text = self.ollama_retry_input.text().strip()
+        try:
+            regenerate_timeout_seconds = int(timeout_text) if timeout_text else int(DEFAULT_TIMEOUT)
+        except ValueError:
+            regenerate_timeout_seconds = int(DEFAULT_TIMEOUT)
+        try:
+            regenerate_retry_count = int(retry_text) if retry_text else 0
+        except ValueError:
+            regenerate_retry_count = 0
+
+        def _capture_regenerate_settings(values: dict[str, int | bool]) -> None:
+            nonlocal regenerate_tags_enabled
+            nonlocal regenerate_description_enabled
+            nonlocal regenerate_timeout_seconds
+            nonlocal regenerate_retry_count
+
+            tags_enabled = values.get("tags_enabled")
+            description_enabled = values.get("description_enabled")
+            timeout_seconds = values.get("timeout_seconds")
+            retry_count = values.get("retry_count")
+
+            if isinstance(tags_enabled, bool):
+                regenerate_tags_enabled = tags_enabled
+            if isinstance(description_enabled, bool):
+                regenerate_description_enabled = description_enabled
+            if isinstance(timeout_seconds, int):
+                regenerate_timeout_seconds = max(1, timeout_seconds)
+            if isinstance(retry_count, int):
+                regenerate_retry_count = max(0, retry_count)
+
         while True:
             record = self._current_record()
             if record is None:
@@ -929,6 +978,13 @@ class MainWindow(QMainWindow):
                 can_navigate_prev=prev_fixup_index is not None,
                 can_navigate_next=next_fixup_index is not None,
                 tag_suggestions=self._sorted_tag_suggestions(),
+                ollama_server_url=self.ollama_server_url,
+                ollama_model_name=self.ollama_model_name,
+                regenerate_tags_enabled=regenerate_tags_enabled,
+                regenerate_description_enabled=regenerate_description_enabled,
+                regenerate_timeout_seconds=regenerate_timeout_seconds,
+                regenerate_retry_count=regenerate_retry_count,
+                save_regenerate_settings=_capture_regenerate_settings,
             )
 
             if outcome == "prev" and prev_fixup_index is not None:
@@ -1033,6 +1089,7 @@ class MainWindow(QMainWindow):
         self.ollama_fetch_button.setEnabled(not loading and self._ollama_thread is None)
         self.ollama_model_combo.setEnabled(not loading and self._ollama_thread is None)
         self.ollama_timeout_input.setEnabled(not loading and self._ollama_thread is None)
+        self.ollama_retry_input.setEnabled(not loading and self._ollama_thread is None)
         self.ollama_use_button.setEnabled(not loading and self._ollama_thread is None)
         self.fixup_button.setEnabled(False)
         if loading:
@@ -1423,57 +1480,94 @@ class MainWindow(QMainWindow):
             report_item: Callable[[object], None],
         ) -> object:
             timeout = self._ollama_timeout_seconds()
+            retry_count = self._ollama_retry_count()
             total = len(selected_indexes)
 
             for position, record_index in enumerate(selected_indexes, start=1):
                 record = self.records[record_index]
-                generated_items: list[str] = []
-                image_start = time.monotonic()
                 image_name = record.image_path.name
+                generated_items: list[str] = []
 
-                print(
-                    f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_start image={image_name}",
-                    flush=True,
-                )
+                for attempt in range(retry_count + 1):
+                    cancel_token.raise_if_cancelled()
 
-                def remaining_timeout() -> float:
-                    elapsed = time.monotonic() - image_start
-                    remaining = timeout - elapsed
-                    if remaining <= 0:
-                        raise OllamaError(
-                            f"Timed out after {int(timeout)} seconds while generating annotations for {record.image_path.name}."
+                    attempt_start = time.monotonic()
+
+                    if attempt == 0:
+                        print(
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_start image={image_name}",
+                            flush=True,
                         )
-                    return remaining
+                        report_progress(
+                            f"Generate: processing {position}/{total} - {record.image_path.name}"
+                        )
+                    else:
+                        print(
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_retry image={image_name} attempt={attempt + 1}/{retry_count + 1}",
+                            flush=True,
+                        )
+                        report_progress(
+                            f"Generate: retry {attempt}/{retry_count} - {position}/{total} - {record.image_path.name}"
+                        )
 
-                report_progress(
-                    f"Generate: processing {position}/{total} - {record.image_path.name}"
-                )
-
-                if include_description:
-                    description = self._sanitize_annotation_text(
-                        generate_description(
-                            self.ollama_server_url,
-                            self.ollama_model_name,
-                            record.image_path,
-                            timeout=remaining_timeout(),
-                            cancellation=cancel_token,
-                        ).strip()
-                    )
-                    if description:
-                        generated_items.append(description)
-
-                if include_tags:
-                    generated_items.extend(
-                        self._parse_tags(
-                            generate_tags(
-                                self.ollama_server_url,
-                                self.ollama_model_name,
-                                record.image_path,
-                                timeout=remaining_timeout(),
-                                cancellation=cancel_token,
+                    def remaining_timeout(_start=attempt_start) -> float:
+                        elapsed = time.monotonic() - _start
+                        remaining = timeout - elapsed
+                        if remaining <= 0:
+                            raise OllamaError(
+                                f"Timed out after {int(timeout)} seconds while generating annotations for {record.image_path.name}."
                             )
+                        return remaining
+
+                    attempt_items: list[str] = []
+                    retry_needed = False
+                    try:
+                        if include_description:
+                            description = self._sanitize_annotation_text(
+                                generate_description(
+                                    self.ollama_server_url,
+                                    self.ollama_model_name,
+                                    record.image_path,
+                                    timeout=remaining_timeout(),
+                                    cancellation=cancel_token,
+                                ).strip()
+                            )
+                            if description:
+                                attempt_items.append(description)
+
+                        if include_tags:
+                            attempt_items.extend(
+                                self._parse_tags(
+                                    generate_tags(
+                                        self.ollama_server_url,
+                                        self.ollama_model_name,
+                                        record.image_path,
+                                        timeout=remaining_timeout(),
+                                        cancellation=cancel_token,
+                                    )
+                                )
+                            )
+
+                        if not attempt_items:
+                            retry_needed = True
+                    except OllamaCancelled:
+                        raise
+                    except OllamaError:
+                        retry_needed = True
+
+                    elapsed_seconds = time.monotonic() - attempt_start
+                    if not retry_needed:
+                        generated_items = attempt_items
+                        print(
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_done image={image_name} elapsed_s={elapsed_seconds:.2f}",
+                            flush=True,
                         )
-                    )
+                        break
+                    else:
+                        print(
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
+                            flush=True,
+                        )
 
                 report_item(
                     {
@@ -1483,12 +1577,6 @@ class MainWindow(QMainWindow):
                         "position": position,
                         "total": total,
                     }
-                )
-
-                elapsed_seconds = time.monotonic() - image_start
-                print(
-                    f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_done image={image_name} elapsed_s={elapsed_seconds:.2f}",
-                    flush=True,
                 )
 
             report_progress(f"Generate: finalizing {total}/{total}")
@@ -1635,6 +1723,7 @@ class MainWindow(QMainWindow):
         self.ollama_fetch_button.setEnabled(False)
         self.ollama_model_combo.setEnabled(False)
         self.ollama_timeout_input.setEnabled(False)
+        self.ollama_retry_input.setEnabled(False)
         self.ollama_use_button.setEnabled(False)
         self._ollama_action_name = action_name
         self._ollama_cancel = cancel_token
@@ -1987,10 +2076,7 @@ class MainWindow(QMainWindow):
         record = self.records[record_index]
         if cleaned.casefold() == "ok":
             clear_fixup_files_for_image(record.image_path)
-            if self.current_index == record_index:
-                self._on_fixup_state_changed()
-            else:
-                self._apply_image_filter()
+            self._on_fixup_state_changed(record.image_path)
             return "clean"
 
         try:
@@ -1998,10 +2084,7 @@ class MainWindow(QMainWindow):
         except OSError:
             return "error"
 
-        if self.current_index == record_index:
-            self._on_fixup_state_changed()
-        else:
-            self._apply_image_filter()
+        self._on_fixup_state_changed(record.image_path)
         return "issues"
 
     def _cleanup_ollama_task(self) -> None:
@@ -2027,6 +2110,7 @@ class MainWindow(QMainWindow):
         self.ollama_fetch_button.setEnabled(True)
         self.ollama_model_combo.setEnabled(True)
         self.ollama_timeout_input.setEnabled(True)
+        self.ollama_retry_input.setEnabled(True)
         self.ollama_use_button.setEnabled(True)
         self._update_fixup_button_state()
 

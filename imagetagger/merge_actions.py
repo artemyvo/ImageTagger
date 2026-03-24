@@ -61,6 +61,13 @@ def open_fixup_dialog_for_image(
     can_navigate_prev: bool = False,
     can_navigate_next: bool = False,
     tag_suggestions: list[str] | None = None,
+    ollama_server_url: str = "",
+    ollama_model_name: str = "",
+    regenerate_tags_enabled: bool = True,
+    regenerate_description_enabled: bool = True,
+    regenerate_timeout_seconds: int = 300,
+    regenerate_retry_count: int = 3,
+    save_regenerate_settings: Callable[[dict[str, int | bool]], None] | None = None,
 ) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
     fixup_path = existing_fixup_path_for_image(image_path)
     if fixup_path is None:
@@ -111,6 +118,13 @@ def open_fixup_dialog_for_image(
         can_navigate_prev,
         can_navigate_next,
         tag_suggestions=tag_suggestions,
+        normalize_annotation=sanitize_annotation,
+        ollama_server_url=ollama_server_url,
+        ollama_model_name=ollama_model_name,
+        regenerate_tags_enabled=regenerate_tags_enabled,
+        regenerate_description_enabled=regenerate_description_enabled,
+        regenerate_timeout_seconds=regenerate_timeout_seconds,
+        regenerate_retry_count=regenerate_retry_count,
         parent=parent,
     )
 
@@ -123,6 +137,27 @@ def open_fixup_dialog_for_image(
             dialog.setGeometry(x, y, width, height)
 
     result = dialog.exec()
+
+    if save_regenerate_settings is not None:
+        timeout_raw = dialog.regenerate_timeout_input.text().strip()
+        retry_raw = dialog.regenerate_retry_input.text().strip()
+        try:
+            timeout_value = int(timeout_raw) if timeout_raw else max(1, int(regenerate_timeout_seconds))
+        except ValueError:
+            timeout_value = max(1, int(regenerate_timeout_seconds))
+        try:
+            retry_value = int(retry_raw) if retry_raw else max(0, int(regenerate_retry_count))
+        except ValueError:
+            retry_value = max(0, int(regenerate_retry_count))
+
+        save_regenerate_settings(
+            {
+                "tags_enabled": dialog.regenerate_tags_checkbox.isChecked(),
+                "description_enabled": dialog.regenerate_description_checkbox.isChecked(),
+                "timeout_seconds": max(1, timeout_value),
+                "retry_count": max(0, retry_value),
+            }
+        )
 
     if save_geometry is not None:
         geometry = dialog.geometry()

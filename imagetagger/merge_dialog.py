@@ -2,30 +2,46 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 from dataclasses import dataclass
+import time
 from typing import Callable
 
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, Qt, QSize, QStringListModel, QTimer
-from PyQt6.QtGui import QAction, QColor, QKeySequence, QPixmap, QPainter, QPalette, QTextCharFormat, QTextCursor, QTextDocument
+from PyQt6.QtCore import QEvent, QObject, Qt, QSize, QStringListModel, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QIntValidator, QKeySequence, QPixmap, QPainter, QPalette, QTextCharFormat, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCheckBox,
     QCompleter,
     QDialog,
+    QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSplitter,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
+)
+
+from imagetagger.ollama import (
+    OllamaCancellation,
+    OllamaCancelled,
+    OllamaError,
+    consume_resize_warning,
+    generate_description,
+    generate_tags,
 )
 
 
@@ -113,6 +129,31 @@ class FixupData:
     issues: str
     corrected_description: str
     corrected_tags: list[str]
+
+
+class RegenerateWorker(QObject):
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, task: Callable[[Callable[[str], None]], object]) -> None:
+        super().__init__()
+        self.task = task
+
+    def run(self) -> None:
+        try:
+            result = self.task(self.progress.emit)
+        except OllamaCancelled as exc:
+            self.cancelled.emit(str(exc))
+            return
+        except OllamaError as exc:
+            self.failed.emit(str(exc))
+            return
+        except Exception as exc:
+            self.failed.emit(f"Unexpected Ollama error: {exc}")
+            return
+        self.finished.emit(result)
 
 
 DIFF_RANGES_ROLE = int(Qt.ItemDataRole.UserRole) + 1
@@ -309,6 +350,13 @@ class FixupDialog(QDialog):
         can_navigate_prev: bool = False,
         can_navigate_next: bool = False,
         tag_suggestions: list[str] | None = None,
+        normalize_annotation: Callable[[str], str] | None = None,
+        ollama_server_url: str = "",
+        ollama_model_name: str = "",
+        regenerate_tags_enabled: bool = True,
+        regenerate_description_enabled: bool = True,
+        regenerate_timeout_seconds: int = 300,
+        regenerate_retry_count: int = 3,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -316,13 +364,23 @@ class FixupDialog(QDialog):
         self.resize(1280, 640)
         self._apply_annotations = apply_annotations
         self._initial_annotations = [tag.strip() for tag in current_tags if tag.strip()]
+        self._initial_proposed_description = fixup_data.corrected_description.strip()
+        self._initial_proposed_tags = [tag.strip() for tag in fixup_data.corrected_tags if tag.strip()]
         self._initial_fixup_content = initial_fixup_content
         self._clear_fixup = clear_fixup
         self._restore_fixup = restore_fixup
         self._resolved = False
         self._undo_available = False
         self._has_proposed_description = bool(fixup_data.corrected_description)
+        self._exact_match_only_for_tags = False
         self._protected_existing_keys: set[str] = set()
+        self._normalize_annotation = normalize_annotation or (lambda text: text)
+        self._image_path = image_path
+        self._ollama_server_url = ollama_server_url.strip()
+        self._ollama_model_name = ollama_model_name.strip()
+        self._regenerate_thread: QThread | None = None
+        self._regenerate_worker: RegenerateWorker | None = None
+        self._regenerate_cancel: OllamaCancellation | None = None
 
         self.left_list = QListWidget(self)
         self.left_list.setItemDelegate(DiffHighlightDelegate(self.left_list))
@@ -330,11 +388,13 @@ class FixupDialog(QDialog):
         self.left_list.setWordWrap(True)
         self.left_list.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.left_list.setUniformItemSizes(False)
+        self.left_list.hide()
 
         self.remove_left_tag_action = QAction("Remove Selected Existing Tags", self)
         self.remove_left_tag_action.setShortcut("Delete")
         self.remove_left_tag_action.triggered.connect(self._remove_selected_left_items)
         self.left_list.addAction(self.remove_left_tag_action)
+        self.addAction(self.remove_left_tag_action)
 
         self.left_tag_input = QLineEdit(self)
         self.left_tag_input.setPlaceholderText("Type a tag and press Enter")
@@ -352,6 +412,56 @@ class FixupDialog(QDialog):
         self.right_list.setWordWrap(True)
         self.right_list.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.right_list.setUniformItemSizes(False)
+        self.right_list.hide()
+
+        self.comparison_table = QTableWidget(self)
+        self.comparison_table.setColumnCount(3)
+        self.comparison_table.setHorizontalHeaderLabels(["Existing", "", "Proposed"])
+        self.comparison_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.comparison_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.comparison_table.setWordWrap(True)
+        self.comparison_table.verticalHeader().setVisible(False)
+        self.comparison_table.setAlternatingRowColors(True)
+        self.comparison_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.comparison_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.comparison_table.setMouseTracking(False)
+        self.comparison_table.viewport().setMouseTracking(False)
+        self.comparison_table.setStyleSheet(
+            "QTableWidget::item:hover { background-color: transparent; }"
+        )
+        header = self.comparison_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._action_button_width = 24
+        self._action_button_height = 22
+        self._update_action_column_metrics()
+        self._table_row_map: list[tuple[int | None, int | None]] = []
+
+        self.regenerate_tags_checkbox = QCheckBox("Tags", self)
+        self.regenerate_tags_checkbox.setChecked(regenerate_tags_enabled)
+        self.regenerate_tags_checkbox.checkStateChanged.connect(lambda _state: self._update_regenerate_controls())
+
+        self.regenerate_description_checkbox = QCheckBox("Description", self)
+        self.regenerate_description_checkbox.setChecked(regenerate_description_enabled)
+        self.regenerate_description_checkbox.checkStateChanged.connect(lambda _state: self._update_regenerate_controls())
+
+        self.regenerate_timeout_input = QLineEdit(self)
+        self.regenerate_timeout_input.setValidator(QIntValidator(1, 86400, self))
+        self.regenerate_timeout_input.setText(str(max(1, int(regenerate_timeout_seconds))))
+        self.regenerate_timeout_input.setMaximumWidth(90)
+
+        self.regenerate_retry_input = QLineEdit(self)
+        self.regenerate_retry_input.setValidator(QIntValidator(0, 10, self))
+        self.regenerate_retry_input.setText(str(max(0, int(regenerate_retry_count))))
+        self.regenerate_retry_input.setMaximumWidth(60)
+
+        self.regenerate_button = QPushButton("Regenerate", self)
+        self.regenerate_button.clicked.connect(self._regenerate_proposed_annotations)
+
+        self.regenerate_status_label = QLabel(self)
+        self.regenerate_status_label.setWordWrap(True)
+        self.regenerate_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
         self.issues_label = QLabel(fixup_data.issues or "No issue details provided.", self)
         self.issues_label.setWordWrap(True)
@@ -431,33 +541,28 @@ class FixupDialog(QDialog):
             button.setAutoDefault(False)
             button.setDefault(False)
 
-        # Left pane
-        left_pane = QWidget(self)
-        left_layout = QVBoxLayout(left_pane)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(QLabel("Existing", self))
-        left_layout.addWidget(self.left_list, stretch=1)
-        left_layout.addWidget(self.left_tag_input, stretch=0)
-
-        # Right pane
-        right_pane = QWidget(self)
-        right_layout = QVBoxLayout(right_pane)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(QLabel("Proposed", self))
-        right_layout.addWidget(self.right_list, stretch=1)
+        # Table pane
+        table_pane = QWidget(self)
+        table_layout = QVBoxLayout(table_pane)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(self.comparison_table, stretch=1)
+        input_row = QHBoxLayout()
+        input_row.setContentsMargins(0, 0, 0, 0)
+        input_row.setSpacing(8)
+        input_row.addWidget(self.left_tag_input, stretch=1)
+        input_row.addStretch(1)
+        table_layout.addLayout(input_row, stretch=0)
 
         # Image pane
         image_pane = self._create_image_pane(image_path)
 
         # Create splitter for resizable panes
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        splitter.addWidget(left_pane)
-        splitter.addWidget(right_pane)
+        splitter.addWidget(table_pane)
         splitter.addWidget(image_pane)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
-        splitter.setCollapsible(2, False)
-        splitter.setSizes([300, 300, 300])
+        splitter.setSizes([700, 500])
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.prev_button)
@@ -479,6 +584,7 @@ class FixupDialog(QDialog):
         self._refresh_button_state()
         self._update_difference_highlights()
         self._refresh_widget_item_sizes()
+        self._update_regenerate_controls()
 
     def _add_left_item(self, text: str) -> None:
         """Add item to left list with remove button if unmatched in right list."""
@@ -495,7 +601,13 @@ class FixupDialog(QDialog):
             return
 
         existing_tags = [text.strip() for text in self._current_texts(self.left_list)]
-        if new_tag in existing_tags:
+        normalized_new_key = self._normalized_compare_key(new_tag)
+        existing_keys = {
+            self._normalized_compare_key(text)
+            for text in existing_tags
+            if self._normalized_compare_text(text)
+        }
+        if normalized_new_key in existing_keys:
             self.left_tag_input.selectAll()
             return
 
@@ -531,6 +643,12 @@ class FixupDialog(QDialog):
                 texts.append(item_text)
         return texts
 
+    def _normalized_compare_text(self, text: str) -> str:
+        return self._normalize_annotation(text).strip()
+
+    def _normalized_compare_key(self, text: str) -> str:
+        return self._normalized_compare_text(text).casefold()
+
     @staticmethod
     def _is_description_like(text: str) -> bool:
         normalized = text.strip()
@@ -540,24 +658,45 @@ class FixupDialog(QDialog):
         return word_count >= 5 or len(normalized) >= 40
 
     def _find_description_like_keys(self, values: list[str]) -> set[str]:
-        candidates = [value.strip() for value in values if self._is_description_like(value)]
+        candidates = [
+            self._normalized_compare_text(value)
+            for value in values
+            if self._is_description_like(value)
+        ]
+        candidates = [value for value in candidates if value]
         if not candidates:
             return set()
         longest = max(candidates, key=len)
-        return {longest.casefold()}
+        return {self._normalized_compare_key(longest)}
+
+    def _find_description_like_index(self, values: list[str]) -> int | None:
+        best_index: int | None = None
+        best_length = -1
+        for index, value in enumerate(values):
+            normalized = self._normalized_compare_text(value)
+            if not self._is_description_like(normalized):
+                continue
+            if len(normalized) > best_length:
+                best_length = len(normalized)
+                best_index = index
+        return best_index
 
     def _is_protected_existing_text(self, text: str) -> bool:
         if self._has_proposed_description:
             return False
-        return text.strip().casefold() in self._protected_existing_keys
+        return self._normalized_compare_key(text) in self._protected_existing_keys
 
     def _append_unique_to_left(self, values: list[str]) -> None:
-        existing = {value.casefold() for value in self._current_texts(self.left_list)}
+        existing = {
+            self._normalized_compare_key(value)
+            for value in self._current_texts(self.left_list)
+            if self._normalized_compare_text(value)
+        }
         for value in values:
             normalized = value.strip()
             if not normalized:
                 continue
-            key = normalized.casefold()
+            key = self._normalized_compare_key(normalized)
             if key in existing:
                 continue
             existing.add(key)
@@ -572,7 +711,11 @@ class FixupDialog(QDialog):
         right_texts = self._current_texts(self.right_list)
         _, right_matches, _ = self._compute_matches(left_texts, right_texts)
 
-        existing_keys = {text.strip().casefold() for text in left_texts if text.strip()}
+        existing_keys = {
+            self._normalized_compare_key(text)
+            for text in left_texts
+            if self._normalized_compare_text(text)
+        }
 
         for right_row in rows:
             if right_row < 0 or right_row >= len(right_texts):
@@ -590,10 +733,10 @@ class FixupDialog(QDialog):
                     self.left_list.setItemWidget(left_item, None)
                 left_item.setText(proposed_text)
                 left_item.setData(ITEM_TEXT_ROLE, proposed_text)
-                existing_keys.add(proposed_text.casefold())
+                existing_keys.add(self._normalized_compare_key(proposed_text))
                 continue
 
-            key = proposed_text.casefold()
+            key = self._normalized_compare_key(proposed_text)
             if key not in existing_keys:
                 self._add_left_item(proposed_text)
                 existing_keys.add(key)
@@ -607,18 +750,48 @@ class FixupDialog(QDialog):
         has_right_items = self.right_list.count() > 0
         is_resolved = self._resolved
         has_local_changes = self._has_local_changes()
+        has_dialog_changes = self._has_dialog_state_changes()
         can_navigate_next = self.next_button.isEnabled()
         self.accept_button.setEnabled(has_right_items and not is_resolved)
         self.reject_button.setEnabled(not is_resolved)
         self.merge_button.setEnabled(has_local_changes and not is_resolved)
-        self.undo_button.setEnabled(self._undo_available or has_local_changes)
+        self.undo_button.setEnabled(self._undo_available or has_dialog_changes)
         self.accept_next_button.setEnabled(has_right_items and not is_resolved and can_navigate_next)
         self.reject_next_button.setEnabled(not is_resolved and can_navigate_next)
         self.merge_next_button.setEnabled(has_local_changes and not is_resolved and can_navigate_next)
 
     def _has_local_changes(self) -> bool:
-        current = [text.strip() for text in self.selected_annotations() if text.strip()]
-        return current != self._initial_annotations
+        current = [
+            self._normalized_compare_text(text)
+            for text in self.selected_annotations()
+            if self._normalized_compare_text(text)
+        ]
+        initial = [
+            self._normalized_compare_text(text)
+            for text in self._initial_annotations
+            if self._normalized_compare_text(text)
+        ]
+        return current != initial
+
+    def _has_proposed_changes(self) -> bool:
+        current = [
+            self._normalized_compare_text(text)
+            for text in self._current_texts(self.right_list)
+            if self._normalized_compare_text(text)
+        ]
+
+        initial_values = []
+        if self._normalized_compare_text(self._initial_proposed_description):
+            initial_values.append(self._normalized_compare_text(self._initial_proposed_description))
+        initial_values.extend(
+            self._normalized_compare_text(text)
+            for text in self._initial_proposed_tags
+            if self._normalized_compare_text(text)
+        )
+        return current != initial_values
+
+    def _has_dialog_state_changes(self) -> bool:
+        return self._has_local_changes() or self._has_proposed_changes()
 
     def _compute_matches(
         self,
@@ -631,7 +804,7 @@ class FixupDialog(QDialog):
 
         right_by_key: dict[str, list[int]] = {}
         for right_index, text in enumerate(right_texts):
-            right_by_key.setdefault(text.strip().casefold(), []).append(right_index)
+            right_by_key.setdefault(self._normalized_compare_key(text), []).append(right_index)
 
         protected_left_indexes: set[int] = {
             index
@@ -639,12 +812,23 @@ class FixupDialog(QDialog):
             if self._is_protected_existing_text(text)
         }
 
+        if self._has_proposed_description and right_texts:
+            left_description_index = self._find_description_like_index(left_texts)
+            if left_description_index is not None and left_description_index not in protected_left_indexes:
+                left_matches[left_description_index] = 0
+                right_matches[0] = left_description_index
+                right_match_kind[0] = "description"
+
         # Pass 1: exact matches
         for left_index, text in enumerate(left_texts):
             if left_index in protected_left_indexes:
                 continue
-            key = text.strip().casefold()
+            if left_index in left_matches:
+                continue
+            key = self._normalized_compare_key(text)
             candidates = right_by_key.get(key, [])
+            while candidates and candidates[0] in right_matches:
+                candidates.pop(0)
             if not candidates:
                 continue
             right_index = candidates.pop(0)
@@ -653,6 +837,9 @@ class FixupDialog(QDialog):
             right_match_kind[right_index] = "exact"
 
         # Pass 2: fuzzy matches
+        if self._exact_match_only_for_tags:
+            return (left_matches, right_matches, right_match_kind)
+
         for left_index, left_text in enumerate(left_texts):
             if left_index in protected_left_indexes:
                 continue
@@ -663,7 +850,11 @@ class FixupDialog(QDialog):
             for right_index, right_text in enumerate(right_texts):
                 if right_index in right_matches:
                     continue
-                ratio = SequenceMatcher(None, left_text.casefold(), right_text.casefold()).ratio()
+                ratio = SequenceMatcher(
+                    None,
+                    self._normalized_compare_text(left_text).casefold(),
+                    self._normalized_compare_text(right_text).casefold(),
+                ).ratio()
                 if ratio > best_ratio:
                     best_ratio = ratio
                     best_right = right_index
@@ -826,9 +1017,149 @@ class FixupDialog(QDialog):
             item.setData(DIFF_RANGES_ROLE, ranges)
             # Right widgets are refreshed centrally in _update_action_widgets.
 
-        self._update_action_widgets(left_texts, right_texts, left_matches, right_match_kind)
+        self._render_comparison_table(left_texts, right_texts, left_matches, right_matches, right_match_kind)
 
-        self._refresh_widget_item_sizes()
+    def _build_highlighted_html(self, text: str, ranges: list[tuple[int, int]]) -> str:
+        if not text:
+            return ""
+        if not ranges:
+            return ItemActionWidget._escape_html(text)
+
+        html_parts: list[str] = []
+        last_end = 0
+        for start, end in sorted(ranges):
+            if start > last_end:
+                html_parts.append(ItemActionWidget._escape_html(text[last_end:start]))
+            html_parts.append(
+                f'<span style="background-color: #fff3b3;">{ItemActionWidget._escape_html(text[start:end])}</span>'
+            )
+            last_end = end
+        if last_end < len(text):
+            html_parts.append(ItemActionWidget._escape_html(text[last_end:]))
+        return "".join(html_parts)
+
+    def _make_text_cell_label(self, text: str, ranges: list[tuple[int, int]]) -> QLabel:
+        label = QLabel(self)
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label.setTextFormat(Qt.TextFormat.RichText)
+        label.setText(self._build_highlighted_html(text, ranges))
+        return label
+
+    def _set_action_cell(
+        self,
+        row: int,
+        action_text: str,
+        callback: Callable[[], None] | None,
+    ) -> None:
+        action_host = QWidget(self.comparison_table)
+        action_layout = QHBoxLayout(action_host)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        if action_text == "✕":
+            action_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        elif action_text == "←":
+            action_layout.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        else:
+            action_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if action_text and callback is not None:
+            button = QPushButton(action_text, action_host)
+            button.setFixedWidth(self._action_button_width)
+            button.setFixedHeight(self._action_button_height)
+            if action_text == "✕":
+                button.setStyleSheet("QPushButton { color: red; font-weight: bold; padding: 2px; }")
+            button.clicked.connect(lambda _checked=False, cb=callback: cb())
+            action_layout.addWidget(button)
+        self.comparison_table.setCellWidget(row, 1, action_host)
+
+    def _update_action_column_metrics(self) -> None:
+        metrics = self.comparison_table.fontMetrics()
+        symbol_width = max(metrics.horizontalAdvance("←"), metrics.horizontalAdvance("✕"))
+        self._action_button_width = max(24, symbol_width + 16)
+        self._action_button_height = max(22, metrics.height() + 8)
+
+        action_col_width = self._action_button_width + 10
+        self.comparison_table.setColumnWidth(1, action_col_width)
+
+    def _render_comparison_table(
+        self,
+        left_texts: list[str],
+        right_texts: list[str],
+        left_matches: dict[int, int],
+        right_matches: dict[int, int],
+        right_match_kind: dict[int, str],
+    ) -> None:
+        self.comparison_table.setRowCount(0)
+        self._table_row_map = []
+
+        consumed_left_indexes: set[int] = set()
+        consumed_right_indexes: set[int] = set()
+
+        if self._has_proposed_description and right_texts:
+            description_left_index = right_matches.get(0)
+            self._table_row_map.append((description_left_index, 0))
+            consumed_right_indexes.add(0)
+            if description_left_index is not None:
+                consumed_left_indexes.add(description_left_index)
+
+        for left_index, left_text in enumerate(left_texts):
+            if left_index in consumed_left_indexes:
+                continue
+            right_index = left_matches.get(left_index)
+            self._table_row_map.append((left_index, right_index))
+            consumed_left_indexes.add(left_index)
+            if right_index is not None:
+                consumed_right_indexes.add(right_index)
+
+        for right_index in range(len(right_texts)):
+            if right_index in consumed_right_indexes or right_index in right_matches:
+                continue
+            self._table_row_map.append((None, right_index))
+
+        self.comparison_table.setRowCount(len(self._table_row_map))
+
+        for row, (left_index, right_index) in enumerate(self._table_row_map):
+            if left_index is not None:
+                left_item = self.left_list.item(left_index)
+                left_text = left_texts[left_index]
+                left_ranges = left_item.data(DIFF_RANGES_ROLE)
+                left_widget = self._make_text_cell_label(
+                    left_text,
+                    left_ranges if isinstance(left_ranges, list) else [],
+                )
+                self.comparison_table.setCellWidget(row, 0, left_widget)
+            else:
+                self.comparison_table.setItem(row, 0, QTableWidgetItem(""))
+
+            if right_index is not None:
+                right_item = self.right_list.item(right_index)
+                right_text = right_texts[right_index]
+                right_ranges = right_item.data(DIFF_RANGES_ROLE)
+                right_widget = self._make_text_cell_label(
+                    right_text,
+                    right_ranges if isinstance(right_ranges, list) else [],
+                )
+                self.comparison_table.setCellWidget(row, 2, right_widget)
+            else:
+                self.comparison_table.setItem(row, 2, QTableWidgetItem(""))
+
+            action_text = ""
+            callback: Callable[[], None] | None = None
+            if left_index is not None and right_index is not None:
+                if right_match_kind.get(right_index) != "exact":
+                    action_text = "←"
+                    callback = lambda idx=right_index: self._apply_proposed_rows([idx]) or self._refresh_button_state() or self._update_difference_highlights()
+            elif right_index is not None:
+                action_text = "←"
+                callback = lambda idx=right_index: self._apply_proposed_rows([idx]) or self._refresh_button_state() or self._update_difference_highlights()
+            elif left_index is not None:
+                left_text = left_texts[left_index]
+                if not self._is_protected_existing_text(left_text):
+                    action_text = "✕"
+                    callback = lambda value=left_text: self._remove_left_item(value)
+
+            self._set_action_cell(row, action_text, callback)
+
+        self.comparison_table.resizeRowsToContents()
 
     def accept_all(self) -> None:
         proposed_values = [value.strip() for value in self._current_texts(self.right_list) if value.strip()]
@@ -842,7 +1173,7 @@ class FixupDialog(QDialog):
         seen: set[str] = set()
 
         for value in preserved_values + proposed_values:
-            key = value.casefold()
+            key = self._normalized_compare_key(value)
             if key in seen:
                 continue
             seen.add(key)
@@ -858,11 +1189,11 @@ class FixupDialog(QDialog):
     def _move_item_from_right_to_left(self, text: str) -> None:
         """Move a specific item from right to left list."""
         normalized = text.strip()
+        normalized_key = self._normalized_compare_key(normalized)
         target_row = -1
         # Find corresponding row in right list
-        for i in range(self.right_list.count()):
-            item_widget = self.right_list.itemWidget(self.right_list.item(i))
-            if item_widget and item_widget.text.strip() == normalized:
+        for i, value in enumerate(self._current_texts(self.right_list)):
+            if self._normalized_compare_key(value) == normalized_key:
                 target_row = i
                 break
         if target_row < 0:
@@ -889,18 +1220,25 @@ class FixupDialog(QDialog):
         self._update_difference_highlights()
 
     def _remove_selected_left_items(self) -> None:
-        selected = self.left_list.selectedItems()
-        if not selected:
+        selected_rows = sorted({index.row() for index in self.comparison_table.selectedIndexes()}, reverse=True)
+        if not selected_rows:
             return
 
+        left_indexes_to_remove: list[int] = []
+        for row in selected_rows:
+            if row < 0 or row >= len(self._table_row_map):
+                continue
+            left_index, _ = self._table_row_map[row]
+            if left_index is not None:
+                left_indexes_to_remove.append(left_index)
+
         removed_any = False
-        for item in selected:
-            widget = self.left_list.itemWidget(item)
-            item_text = widget.text if widget else item.text()
+        for left_index in sorted(set(left_indexes_to_remove), reverse=True):
+            item = self.left_list.item(left_index)
+            item_text = item.text()
             if self._is_protected_existing_text(item_text):
                 continue
-            row = self.left_list.row(item)
-            removed = self.left_list.takeItem(row)
+            removed = self.left_list.takeItem(left_index)
             del removed
             removed_any = True
 
@@ -912,6 +1250,282 @@ class FixupDialog(QDialog):
 
     def selected_annotations(self) -> list[str]:
         return self._current_texts(self.left_list)
+
+    def _regenerate_timeout_seconds(self) -> float:
+        raw_value = self.regenerate_timeout_input.text().strip()
+        if not raw_value:
+            QMessageBox.warning(self, "Invalid timeout", "Enter timeout in seconds.")
+            raise OllamaError("Enter timeout in seconds.")
+
+        try:
+            timeout = int(raw_value)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid timeout", "Timeout must be a whole number of seconds.")
+            raise OllamaError("Timeout must be a whole number of seconds.") from exc
+
+        if timeout < 1:
+            QMessageBox.warning(self, "Invalid timeout", "Timeout must be at least 1 second.")
+            raise OllamaError("Timeout must be at least 1 second.")
+
+        return float(timeout)
+
+    def _regenerate_retry_count(self) -> int:
+        raw_value = self.regenerate_retry_input.text().strip()
+        try:
+            retries = int(raw_value)
+        except ValueError:
+            return 0
+        return max(0, retries)
+
+    def _update_regenerate_controls(self) -> None:
+        connected = bool(self._ollama_model_name)
+        working = self._regenerate_thread is not None
+        options_selected = (
+            self.regenerate_tags_checkbox.isChecked()
+            or self.regenerate_description_checkbox.isChecked()
+        )
+
+        self.regenerate_tags_checkbox.setEnabled(not working)
+        self.regenerate_description_checkbox.setEnabled(not working)
+        self.regenerate_timeout_input.setEnabled(not working)
+        self.regenerate_retry_input.setEnabled(not working)
+
+        if working:
+            self.regenerate_button.setEnabled(False)
+            self.regenerate_button.setText("Regenerating...")
+            return
+
+        self.regenerate_button.setText("Regenerate")
+        self.regenerate_button.setEnabled(connected and options_selected and self._image_path is not None)
+        if not connected:
+            self.regenerate_status_label.setText("Regenerate is disabled until an Ollama model is connected in the main window.")
+
+    def _set_proposed_annotations(
+        self,
+        description: str,
+        tags: list[str],
+        *,
+        exact_match_only_for_tags: bool = False,
+    ) -> None:
+        self.right_list.clear()
+        self._exact_match_only_for_tags = exact_match_only_for_tags
+        self._has_proposed_description = bool(description.strip())
+        if not self._has_proposed_description:
+            self._protected_existing_keys = self._find_description_like_keys(self._current_texts(self.left_list))
+        else:
+            self._protected_existing_keys = set()
+
+        if description.strip():
+            self._add_right_item(description.strip())
+        for tag in tags:
+            self._add_right_item(tag)
+
+        self._refresh_button_state()
+        self._update_difference_highlights()
+
+    def _restore_initial_proposed_annotations(self) -> None:
+        self.right_list.clear()
+        self._exact_match_only_for_tags = False
+        self._has_proposed_description = bool(self._initial_proposed_description)
+        if not self._has_proposed_description:
+            self._protected_existing_keys = self._find_description_like_keys(self._initial_annotations)
+        else:
+            self._protected_existing_keys = set()
+
+        if self._initial_proposed_description:
+            self._add_right_item(self._initial_proposed_description)
+        for tag in self._initial_proposed_tags:
+            self._add_right_item(tag)
+
+    def _create_regenerate_frame(self) -> QWidget:
+        frame = QFrame(self)
+        frame.setFrameShape(QFrame.Shape.StyledPanel)
+        frame.setFrameShadow(QFrame.Shadow.Sunken)
+
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        controls_row = QHBoxLayout()
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        controls_row.addWidget(self.regenerate_tags_checkbox)
+        controls_row.addWidget(self.regenerate_description_checkbox)
+        controls_row.addSpacing(12)
+        controls_row.addWidget(QLabel("Timeout", self))
+        controls_row.addWidget(self.regenerate_timeout_input)
+        controls_row.addSpacing(8)
+        controls_row.addWidget(QLabel("Retries", self))
+        controls_row.addWidget(self.regenerate_retry_input)
+        controls_row.addStretch(1)
+
+        layout.addLayout(controls_row)
+        layout.addWidget(self.regenerate_button, stretch=0)
+        layout.addWidget(self.regenerate_status_label, stretch=0)
+        return frame
+
+    def _regenerate_proposed_annotations(self) -> None:
+        if self._regenerate_thread is not None:
+            return
+        if self._image_path is None:
+            return
+        if not self.regenerate_tags_checkbox.isChecked() and not self.regenerate_description_checkbox.isChecked():
+            QMessageBox.information(self, "Nothing selected", "Enable Tags or Description before regenerating.")
+            return
+        if not self._ollama_model_name:
+            return
+
+        resize_warning = consume_resize_warning()
+        if resize_warning:
+            QMessageBox.warning(self, "Image resize disabled", resize_warning)
+
+        cancel_token = OllamaCancellation()
+        self._regenerate_cancel = cancel_token
+
+        def task(report_progress: Callable[[str], None]) -> object:
+            timeout = self._regenerate_timeout_seconds()
+            retry_count = self._regenerate_retry_count()
+            image_name = self._image_path.name
+            last_error: OllamaError | None = None
+
+            for attempt in range(retry_count + 1):
+                cancel_token.raise_if_cancelled()
+                attempt_start = time.monotonic()
+                if attempt == 0:
+                    report_progress(f"Regenerating {image_name}...")
+                else:
+                    report_progress(f"Regenerating {image_name} (retry {attempt}/{retry_count})...")
+
+                def remaining_timeout() -> float:
+                    elapsed = time.monotonic() - attempt_start
+                    remaining = timeout - elapsed
+                    if remaining <= 0:
+                        raise OllamaError(
+                            f"Timed out after {int(timeout)} seconds while regenerating annotations for {image_name}."
+                        )
+                    return remaining
+
+                try:
+                    description = ""
+                    tags: list[str] = []
+                    if self.regenerate_description_checkbox.isChecked():
+                        description = self._normalize_annotation(
+                            generate_description(
+                                self._ollama_server_url,
+                                self._ollama_model_name,
+                                self._image_path,
+                                timeout=remaining_timeout(),
+                                cancellation=cancel_token,
+                            ).strip()
+                        )
+                    if self.regenerate_tags_checkbox.isChecked():
+                        tags = self._dedupe_preserve_order(
+                            self._parse_regenerated_tags(
+                                generate_tags(
+                                    self._ollama_server_url,
+                                    self._ollama_model_name,
+                                    self._image_path,
+                                    timeout=remaining_timeout(),
+                                    cancellation=cancel_token,
+                                )
+                            )
+                        )
+
+                    if description or tags:
+                        return {"description": description, "tags": tags}
+                    last_error = OllamaError("Ollama returned no annotations.")
+                except OllamaCancelled:
+                    raise
+                except OllamaError as exc:
+                    last_error = exc
+
+            if last_error is not None:
+                raise last_error
+            raise OllamaError("Ollama returned no annotations.")
+
+        self._regenerate_thread = QThread(self)
+        self._regenerate_worker = RegenerateWorker(task)
+        self._regenerate_worker.moveToThread(self._regenerate_thread)
+        self._regenerate_thread.started.connect(self._regenerate_worker.run)
+        self._regenerate_worker.progress.connect(self.regenerate_status_label.setText)
+        self._regenerate_worker.finished.connect(self._on_regenerate_finished)
+        self._regenerate_worker.cancelled.connect(self._on_regenerate_cancelled)
+        self._regenerate_worker.failed.connect(self._on_regenerate_failed)
+        self._regenerate_worker.finished.connect(self._regenerate_thread.quit)
+        self._regenerate_worker.cancelled.connect(self._regenerate_thread.quit)
+        self._regenerate_worker.failed.connect(self._regenerate_thread.quit)
+        self._regenerate_thread.finished.connect(self._cleanup_regenerate_task)
+        self._update_regenerate_controls()
+        self._regenerate_thread.start()
+
+    def _parse_regenerated_tags(self, text: str) -> list[str]:
+        normalized = text.replace("\r", "").replace("\n", ",")
+        tags: list[str] = []
+        for part in normalized.split(","):
+            cleaned = self._normalize_annotation(part).strip()
+            if cleaned:
+                tags.append(cleaned)
+        return tags
+
+    def _dedupe_preserve_order(self, values: list[str]) -> list[str]:
+        unique_values: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            key = self._normalized_compare_key(value)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique_values.append(value.strip())
+        return unique_values
+
+    def _on_regenerate_finished(self, payload: object) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        description = str(data.get("description", "")).strip()
+        raw_tags = data.get("tags")
+        tags = [str(tag).strip() for tag in raw_tags] if isinstance(raw_tags, list) else []
+        tags = [tag for tag in tags if tag]
+
+        current_proposed = [text.strip() for text in self._current_texts(self.right_list) if text.strip()]
+        current_description = ""
+        current_tags: list[str] = []
+        if self._has_proposed_description and current_proposed:
+            current_description = current_proposed[0]
+            current_tags = current_proposed[1:]
+        else:
+            current_tags = current_proposed
+
+        regenerate_description = self.regenerate_description_checkbox.isChecked()
+        regenerate_tags = self.regenerate_tags_checkbox.isChecked()
+
+        final_description = description if regenerate_description else current_description
+        final_tags = tags if regenerate_tags else current_tags
+        exact_only_for_tags = True if regenerate_tags else self._exact_match_only_for_tags
+
+        self._set_proposed_annotations(
+            final_description,
+            final_tags,
+            exact_match_only_for_tags=exact_only_for_tags,
+        )
+        if description or tags:
+            self.regenerate_status_label.setText("Regenerated proposed annotations.")
+        else:
+            self.regenerate_status_label.setText("Ollama returned no annotations.")
+
+    def _on_regenerate_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "Regenerate failed", message)
+        self.regenerate_status_label.setText("Regenerate failed.")
+
+    def _on_regenerate_cancelled(self, message: str) -> None:
+        self.regenerate_status_label.setText(message or "Regeneration stopped.")
+
+    def _cleanup_regenerate_task(self) -> None:
+        if self._regenerate_worker is not None:
+            self._regenerate_worker.deleteLater()
+        if self._regenerate_thread is not None:
+            self._regenerate_thread.deleteLater()
+        self._regenerate_worker = None
+        self._regenerate_thread = None
+        self._regenerate_cancel = None
+        self._update_regenerate_controls()
 
     def _create_image_pane(self, image_path: Path | None) -> QWidget:
         pane = QWidget(self)
@@ -947,17 +1561,32 @@ class FixupDialog(QDialog):
 
         scroll.setWidget(image_label)
         pane_layout.addWidget(scroll, stretch=1)
+        pane_layout.addWidget(self._create_regenerate_frame(), stretch=0)
         return pane
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
-        self.right_list.itemSelectionChanged.connect(self._refresh_button_state)
-        self.left_list.itemSelectionChanged.connect(self._refresh_button_state)
+        self.comparison_table.itemSelectionChanged.connect(self._refresh_button_state)
+        self._update_action_column_metrics()
+        self._update_difference_highlights()
+        self.comparison_table.resizeRowsToContents()
         self._refresh_widget_item_sizes()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
+        self.comparison_table.resizeRowsToContents()
         self._refresh_widget_item_sizes()
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.ApplicationFontChange):
+            self._update_action_column_metrics()
+            self._update_difference_highlights()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._regenerate_cancel is not None:
+            self._regenerate_cancel.cancel()
+        super().closeEvent(event)
 
     def has_merged_changes(self) -> bool:
         return self._undo_available
@@ -976,6 +1605,8 @@ class FixupDialog(QDialog):
         self.left_list.clear()
         for text in self._initial_annotations:
             self._add_left_item(text)
+
+        self._restore_initial_proposed_annotations()
 
         self._refresh_button_state()
         self._update_difference_highlights()
@@ -999,7 +1630,7 @@ class FixupDialog(QDialog):
         return False
 
     def _undo_merge(self) -> None:
-        if not self._undo_available and not self._has_local_changes():
+        if not self._undo_available and not self._has_dialog_state_changes():
             return
 
         if self._undo_available:
@@ -1012,6 +1643,7 @@ class FixupDialog(QDialog):
         self._restore_initial_state()
         self._resolved = False
         self._undo_available = False
+        self.regenerate_status_label.setText("Restored original fixup state.")
         self._refresh_button_state()
 
     def _navigate_prev(self) -> None:
