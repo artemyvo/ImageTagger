@@ -160,6 +160,14 @@ DIFF_RANGES_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 ITEM_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 
 
+def strip_tag_list_prefix(tag: str) -> str:
+    """Remove one or more leading markdown list markers from a tag value."""
+    cleaned = tag.strip()
+    while cleaned.startswith("- "):
+        cleaned = cleaned[2:].lstrip()
+    return cleaned
+
+
 class DiffHighlightDelegate(QStyledItemDelegate):
     def _normalized_ranges(self, text: str, raw_ranges: object) -> list[tuple[int, int]]:
         if not isinstance(raw_ranges, list):
@@ -321,7 +329,11 @@ def parse_fixup_data(
     corrected_description_raw = "\n".join(line for line in sections["description"] if line.strip()).strip()
     corrected_description = sanitize_annotation(corrected_description_raw)
     tags_text = "\n".join(line.strip() for line in sections["tags"] if line.strip())
-    corrected_tags = parse_tags(tags_text)
+    corrected_tags = [
+        cleaned
+        for tag in parse_tags(tags_text)
+        if (cleaned := strip_tag_list_prefix(tag))
+    ]
 
     if not issues and not corrected_description and not corrected_tags:
         issues = content.strip()
@@ -363,9 +375,14 @@ class FixupDialog(QDialog):
         self.setWindowTitle(title_text or "Fixup")
         self.resize(1280, 640)
         self._apply_annotations = apply_annotations
+        self._normalize_annotation = normalize_annotation or (lambda text: text)
         self._initial_annotations = [tag.strip() for tag in current_tags if tag.strip()]
+        self._last_merged_annotations = list(self._initial_annotations)
         self._initial_proposed_description = fixup_data.corrected_description.strip()
-        self._initial_proposed_tags = [tag.strip() for tag in fixup_data.corrected_tags if tag.strip()]
+        self._initial_proposed_tags = self._drop_description_duplicate_tags(
+            self._initial_proposed_description,
+            [tag.strip() for tag in fixup_data.corrected_tags if tag.strip()],
+        )
         self._initial_fixup_content = initial_fixup_content
         self._clear_fixup = clear_fixup
         self._restore_fixup = restore_fixup
@@ -374,7 +391,6 @@ class FixupDialog(QDialog):
         self._has_proposed_description = bool(fixup_data.corrected_description)
         self._exact_match_only_for_tags = False
         self._protected_existing_keys: set[str] = set()
-        self._normalize_annotation = normalize_annotation or (lambda text: text)
         self._image_path = image_path
         self._ollama_server_url = ollama_server_url.strip()
         self._ollama_model_name = ollama_model_name.strip()
@@ -681,6 +697,21 @@ class FixupDialog(QDialog):
                 best_index = index
         return best_index
 
+    def _drop_description_duplicate_tags(self, description: str, tags: list[str]) -> list[str]:
+        description_key = self._normalized_compare_key(description)
+        if not description_key:
+            return [tag for tag in tags if tag.strip()]
+
+        filtered_tags: list[str] = []
+        for tag in tags:
+            normalized = tag.strip()
+            if not normalized:
+                continue
+            if self._normalized_compare_key(normalized) == description_key:
+                continue
+            filtered_tags.append(normalized)
+        return filtered_tags
+
     def _is_protected_existing_text(self, text: str) -> bool:
         if self._has_proposed_description:
             return False
@@ -702,6 +733,18 @@ class FixupDialog(QDialog):
             existing.add(key)
             self._add_left_item(normalized)
 
+    @staticmethod
+    def _strip_tag_list_prefix(tag: str) -> str:
+        """Remove a leading markdown list marker from a tag value."""
+        return strip_tag_list_prefix(tag)
+
+    def _normalize_proposed_text_for_merge(self, text: str, right_row: int) -> str:
+        normalized = text.strip()
+        # Row 0 is reserved for description when present; other proposed rows are tags.
+        if self._has_proposed_description and right_row == 0:
+            return normalized
+        return self._strip_tag_list_prefix(normalized)
+
     def _apply_proposed_rows(self, rows: list[int]) -> None:
         """Accept proposed rows by replacing matched existing items or appending new ones."""
         if not rows:
@@ -721,7 +764,7 @@ class FixupDialog(QDialog):
             if right_row < 0 or right_row >= len(right_texts):
                 continue
 
-            proposed_text = right_texts[right_row].strip()
+            proposed_text = self._normalize_proposed_text_for_merge(right_texts[right_row], right_row)
             if not proposed_text:
                 continue
 
@@ -754,11 +797,11 @@ class FixupDialog(QDialog):
         can_navigate_next = self.next_button.isEnabled()
         self.accept_button.setEnabled(has_right_items and not is_resolved)
         self.reject_button.setEnabled(not is_resolved)
-        self.merge_button.setEnabled(has_local_changes and not is_resolved)
+        self.merge_button.setEnabled(has_local_changes)
         self.undo_button.setEnabled(self._undo_available or has_dialog_changes)
         self.accept_next_button.setEnabled(has_right_items and not is_resolved and can_navigate_next)
         self.reject_next_button.setEnabled(not is_resolved and can_navigate_next)
-        self.merge_next_button.setEnabled(has_local_changes and not is_resolved and can_navigate_next)
+        self.merge_next_button.setEnabled(has_local_changes and can_navigate_next)
 
     def _has_local_changes(self) -> bool:
         current = [
@@ -766,12 +809,12 @@ class FixupDialog(QDialog):
             for text in self.selected_annotations()
             if self._normalized_compare_text(text)
         ]
-        initial = [
+        last_merged = [
             self._normalized_compare_text(text)
-            for text in self._initial_annotations
+            for text in self._last_merged_annotations
             if self._normalized_compare_text(text)
         ]
-        return current != initial
+        return current != last_merged
 
     def _has_proposed_changes(self) -> bool:
         current = [
@@ -1162,7 +1205,13 @@ class FixupDialog(QDialog):
         self.comparison_table.resizeRowsToContents()
 
     def accept_all(self) -> None:
-        proposed_values = [value.strip() for value in self._current_texts(self.right_list) if value.strip()]
+        proposed_values: list[str] = []
+        for index, value in enumerate(self._current_texts(self.right_list)):
+            if not value.strip():
+                continue
+            normalized = self._normalize_proposed_text_for_merge(value, index)
+            if normalized:
+                proposed_values.append(normalized)
         preserved_values = [
             value.strip()
             for value in self._current_texts(self.left_list)
@@ -1309,15 +1358,18 @@ class FixupDialog(QDialog):
     ) -> None:
         self.right_list.clear()
         self._exact_match_only_for_tags = exact_match_only_for_tags
-        self._has_proposed_description = bool(description.strip())
+        normalized_description = description.strip()
+        normalized_tags = self._drop_description_duplicate_tags(normalized_description, tags)
+
+        self._has_proposed_description = bool(normalized_description)
         if not self._has_proposed_description:
             self._protected_existing_keys = self._find_description_like_keys(self._current_texts(self.left_list))
         else:
             self._protected_existing_keys = set()
 
-        if description.strip():
-            self._add_right_item(description.strip())
-        for tag in tags:
+        if normalized_description:
+            self._add_right_item(normalized_description)
+        for tag in normalized_tags:
             self._add_right_item(tag)
 
         self._refresh_button_state()
@@ -1614,7 +1666,9 @@ class FixupDialog(QDialog):
     def _merge_without_close(self) -> bool:
         if self._apply_annotations is None:
             return False
-        self._apply_annotations(self.selected_annotations(), "Fixup merged + auto-saved")
+        current_annotations = list(self.selected_annotations())
+        self._apply_annotations(current_annotations, "Fixup merged + auto-saved")
+        self._last_merged_annotations = current_annotations
         self._undo_available = True
         return self._resolve_fixup()
 
@@ -1641,6 +1695,7 @@ class FixupDialog(QDialog):
             self._apply_annotations(list(self._initial_annotations), "Fixup undone + auto-saved")
 
         self._restore_initial_state()
+        self._last_merged_annotations = list(self._initial_annotations)
         self._resolved = False
         self._undo_available = False
         self.regenerate_status_label.setText("Restored original fixup state.")

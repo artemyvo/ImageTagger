@@ -237,7 +237,7 @@ _DEFAULT_TAGS_PROMPT = (
 
 _DEFAULT_DESCRIPTION_PROMPT = (
     "Analyze the image and write a single descriptive sentence that captures what is depicted. "
-    "Describe the content, mood, and key visual elements in detail. "
+    "Describe the content and key visual elements in detail. "
     "Return only the description sentence, nothing else. "
     "Do not use commas."
 )
@@ -258,6 +258,93 @@ _DEFAULT_VALIDATION_PROMPT = (
     "<corrected description without commas, or leave blank if no description is needed>\n"
     "Do not return JSON or any extra headings."
 )
+
+_PROMPT_DEFAULTS: dict[str, str] = {
+    "tagging": _DEFAULT_TAGS_PROMPT,
+    "description": _DEFAULT_DESCRIPTION_PROMPT,
+    "validation": _DEFAULT_VALIDATION_PROMPT,
+}
+
+_PROMPT_FILENAMES: dict[str, str] = {
+    "tagging": "tags_prompt.txt",
+    "description": "description_prompt.txt",
+    "validation": "validation_prompt.txt",
+}
+
+# In-memory overrides set via UI "Apply".
+_PROMPT_OVERRIDES: dict[str, str] = {}
+
+
+def _assert_prompt_kind(kind: str) -> None:
+    if kind not in _PROMPT_DEFAULTS:
+        raise OllamaError(f"Unknown prompt kind: {kind}")
+
+
+def get_default_prompt(kind: str) -> str:
+    _assert_prompt_kind(kind)
+    return _PROMPT_DEFAULTS[kind]
+
+
+def load_prompt_for_kind(kind: str) -> str:
+    _assert_prompt_kind(kind)
+    return _load_prompt(_PROMPT_FILENAMES[kind], _PROMPT_DEFAULTS[kind])
+
+
+def prompt_source_for_kind(kind: str) -> str:
+    _assert_prompt_kind(kind)
+    if kind in _PROMPT_OVERRIDES:
+        return "memory"
+
+    prompt_path = _PROMPTS_DIR / _PROMPT_FILENAMES[kind]
+    try:
+        prompt_path.read_text(encoding="utf-8")
+    except OSError:
+        return "default"
+    return "file"
+
+
+def set_prompt_override(kind: str, prompt: str) -> None:
+    _assert_prompt_kind(kind)
+    _PROMPT_OVERRIDES[kind] = prompt.strip()
+
+
+def clear_prompt_override(kind: str) -> None:
+    _assert_prompt_kind(kind)
+    _PROMPT_OVERRIDES.pop(kind, None)
+
+
+def save_prompt_for_kind(kind: str, prompt: str) -> str:
+    _assert_prompt_kind(kind)
+    text = prompt.strip()
+    try:
+        (_PROMPTS_DIR / _PROMPT_FILENAMES[kind]).write_text(text, encoding="utf-8")
+    except OSError as exc:
+        raise OllamaError(f"Could not save prompt file: {exc}") from exc
+    return text
+
+
+def reset_prompt_to_default(kind: str) -> str:
+    _assert_prompt_kind(kind)
+    default_text = _PROMPT_DEFAULTS[kind]
+    try:
+        (_PROMPTS_DIR / _PROMPT_FILENAMES[kind]).write_text(default_text, encoding="utf-8")
+    except OSError as exc:
+        raise OllamaError(f"Could not reset prompt file: {exc}") from exc
+    clear_prompt_override(kind)
+    return default_text
+
+
+def _active_prompt(kind: str) -> str:
+    _assert_prompt_kind(kind)
+    override = _PROMPT_OVERRIDES.get(kind)
+    if override is not None:
+        return override
+    return load_prompt_for_kind(kind)
+
+
+def active_prompt_for_kind(kind: str) -> str:
+    _assert_prompt_kind(kind)
+    return _active_prompt(kind)
 
 
 def _format_annotations_for_validation(annotations: str) -> str:
@@ -351,7 +438,7 @@ def generate_tags(
     timeout: float = DEFAULT_TIMEOUT,
     cancellation: OllamaCancellation | None = None,
 ) -> str:
-    prompt = _load_prompt("tags_prompt.txt", _DEFAULT_TAGS_PROMPT)
+    prompt = _active_prompt("tagging")
     return _generate_with_image(server, model, image_path, prompt, timeout=timeout, cancellation=cancellation)
 
 
@@ -362,7 +449,7 @@ def generate_description(
     timeout: float = DEFAULT_TIMEOUT,
     cancellation: OllamaCancellation | None = None,
 ) -> str:
-    prompt = _load_prompt("description_prompt.txt", _DEFAULT_DESCRIPTION_PROMPT)
+    prompt = _active_prompt("description")
     return _generate_with_image(server, model, image_path, prompt, timeout=timeout, cancellation=cancellation)
 
 
@@ -374,6 +461,6 @@ def validate_tags(
     timeout: float = DEFAULT_TIMEOUT,
     cancellation: OllamaCancellation | None = None,
 ) -> str:
-    prompt_template = _load_prompt("validation_prompt.txt", _DEFAULT_VALIDATION_PROMPT)
-    prompt = prompt_template.format(tags=_format_annotations_for_validation(tags))
+    prompt_template = _active_prompt("validation")
+    prompt = prompt_template.replace("{tags}", _format_annotations_for_validation(tags))
     return _generate_with_image(server, model, image_path, prompt, timeout=timeout, cancellation=cancellation)

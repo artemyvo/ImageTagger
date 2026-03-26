@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QSplitter,
     QStatusBar,
     QStyledItemDelegate,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -42,10 +43,14 @@ from imagetagger.merge_actions import (
     write_fixup_for_image,
 )
 from imagetagger.ollama import (
+    active_prompt_for_kind,
+    clear_prompt_override,
     configure_runtime,
     consume_resize_warning,
     DEFAULT_TIMEOUT,
     DEFAULT_OLLAMA_SERVER,
+    get_default_prompt,
+    load_prompt_for_kind,
     OllamaCancelled,
     OllamaCancellation,
     OllamaError,
@@ -53,7 +58,11 @@ from imagetagger.ollama import (
     generate_description,
     generate_tags,
     normalize_server_url,
+    prompt_source_for_kind,
+    save_prompt_for_kind,
+    set_prompt_override,
     validate_tags,
+    reset_prompt_to_default,
 )
 
 
@@ -254,6 +263,9 @@ class MainWindow(QMainWindow):
         self._validate_batch_skipped = 0
         self._ollama_action_name: str | None = None
         self._ollama_cancel: OllamaCancellation | None = None
+        self._right_splitter_initialized = False
+        self.prompt_editors: dict[str, QTextEdit] = {}
+        self.prompt_status_labels: dict[str, QLabel] = {}
 
         self.open_action: QAction | None = None
         self.refresh_action: QAction | None = None
@@ -320,6 +332,11 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
+        tags_panel = QWidget(self)
+        tags_layout = QVBoxLayout(tags_panel)
+        tags_layout.setContentsMargins(0, 0, 0, 0)
+        tags_layout.setSpacing(6)
+
         self.tag_input = QLineEdit(self)
         self.tag_input.setPlaceholderText("Type a tag and press Enter")
         self.tag_input.returnPressed.connect(self._add_tag_from_input)
@@ -350,6 +367,20 @@ class MainWindow(QMainWindow):
         self.remove_tag_action.setShortcut("Delete")
         self.remove_tag_action.triggered.connect(self._remove_selected_tags)
         self.tag_list.addAction(self.remove_tag_action)
+
+        tags_layout.addWidget(self.tag_input, stretch=0)
+        tags_layout.addWidget(self.tag_list, stretch=1)
+
+        controls_panel = QWidget(self)
+        controls_layout = QVBoxLayout(controls_panel)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+
+        self.controls_tabs = QTabWidget(self)
+        autotag_tab = QWidget(self)
+        autotag_layout = QVBoxLayout(autotag_tab)
+        autotag_layout.setContentsMargins(6, 6, 6, 6)
+        autotag_layout.setSpacing(6)
 
         self.ollama_server_input = QLineEdit(self)
         self.ollama_server_input.setPlaceholderText("http://127.0.0.1:11434")
@@ -412,14 +443,27 @@ class MainWindow(QMainWindow):
         buttons_row.addWidget(self.validate_button)
         buttons_row.addWidget(self.fixup_button)
 
-        right_layout.addWidget(self.tag_input, stretch=0)
-        right_layout.addWidget(self.tag_list, stretch=0)
-        right_layout.addStretch(1)
-        right_layout.addLayout(server_row)
-        right_layout.addLayout(model_row)
-        right_layout.addLayout(generate_options_row)
-        right_layout.addLayout(gen_row)
-        right_layout.addLayout(buttons_row)
+        autotag_layout.addLayout(server_row)
+        autotag_layout.addLayout(model_row)
+        autotag_layout.addLayout(generate_options_row)
+        autotag_layout.addLayout(gen_row)
+        autotag_layout.addLayout(buttons_row)
+        autotag_layout.addStretch(1)
+
+        self.controls_tabs.addTab(autotag_tab, "AutoTag")
+        self._add_prompt_tab("description", "Description")
+        self._add_prompt_tab("tagging", "Tagging")
+        self._add_prompt_tab("validation", "Validation")
+        controls_layout.addWidget(self.controls_tabs)
+
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.right_splitter.addWidget(tags_panel)
+        self.right_splitter.addWidget(controls_panel)
+        self.right_splitter.setChildrenCollapsible(False)
+        self.right_splitter.setStretchFactor(0, 2)
+        self.right_splitter.setStretchFactor(1, 1)
+
+        right_layout.addWidget(self.right_splitter)
 
         self.splitter.addWidget(self.left_panel)
         self.splitter.addWidget(self.center_panel)
@@ -441,6 +485,124 @@ class MainWindow(QMainWindow):
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         self.statusBar().addPermanentWidget(self.status_connection_label)
+
+    def _add_prompt_tab(self, kind: str, title: str) -> None:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        editor = QTextEdit(self)
+        editor.setAcceptRichText(False)
+        editor.setPlainText(load_prompt_for_kind(kind))
+        self.prompt_editors[kind] = editor
+        editor.textChanged.connect(lambda prompt_kind=kind: self._update_prompt_status(prompt_kind, edited=True))
+
+        status_label = QLabel(self)
+        self.prompt_status_labels[kind] = status_label
+
+        buttons_row = QHBoxLayout()
+        apply_button = QPushButton("Apply", self)
+        apply_button.clicked.connect(lambda _checked=False, prompt_kind=kind: self._apply_prompt_override(prompt_kind))
+        save_button = QPushButton("Save", self)
+        save_button.clicked.connect(lambda _checked=False, prompt_kind=kind: self._save_prompt_to_file(prompt_kind))
+        reset_button = QPushButton("Reset", self)
+        reset_button.clicked.connect(lambda _checked=False, prompt_kind=kind: self._reset_prompt_to_default(prompt_kind))
+        buttons_row.addWidget(apply_button)
+        buttons_row.addWidget(save_button)
+        buttons_row.addWidget(reset_button)
+        buttons_row.addStretch(1)
+
+        layout.addWidget(editor, stretch=1)
+        layout.addWidget(status_label, stretch=0)
+        layout.addLayout(buttons_row)
+
+        self.controls_tabs.addTab(tab, title)
+        self._update_prompt_status(kind)
+
+    def _update_prompt_status(self, kind: str, edited: bool = False) -> None:
+        label = self.prompt_status_labels.get(kind)
+        editor = self.prompt_editors.get(kind)
+        if label is None or editor is None:
+            return
+
+        source = prompt_source_for_kind(kind)
+        source_text = "Default (code)"
+        if source == "memory":
+            source_text = "Applied (memory override)"
+        elif source == "file":
+            source_text = "File"
+
+        suffix = ""
+        if edited:
+            current_text = editor.toPlainText().strip()
+            try:
+                active_text = active_prompt_for_kind(kind)
+            except OllamaError:
+                active_text = load_prompt_for_kind(kind)
+
+            if current_text != active_text:
+                suffix = " | Edited (not applied)"
+
+        if source == "file":
+            file_text = load_prompt_for_kind(kind)
+            if file_text == get_default_prompt(kind):
+                source_text = "File (default content)"
+
+        label.setText(f"Active source: {source_text}{suffix}")
+
+    def _prompt_title(self, kind: str) -> str:
+        if kind == "description":
+            return "Description"
+        if kind == "tagging":
+            return "Tagging"
+        if kind == "validation":
+            return "Validation"
+        return kind
+
+    def _prompt_editor_text(self, kind: str) -> str:
+        editor = self.prompt_editors.get(kind)
+        if editor is None:
+            raise OllamaError(f"Prompt editor for {kind} is not available.")
+        return editor.toPlainText().strip()
+
+    def _apply_prompt_override(self, kind: str) -> None:
+        try:
+            set_prompt_override(kind, self._prompt_editor_text(kind))
+        except OllamaError as exc:
+            QMessageBox.critical(self, "Apply prompt failed", str(exc))
+            return
+        self._update_prompt_status(kind)
+        self.statusBar().showMessage(f"Applied {self._prompt_title(kind)} prompt in memory")
+
+    def _save_prompt_to_file(self, kind: str) -> None:
+        try:
+            saved_text = save_prompt_for_kind(kind, self._prompt_editor_text(kind))
+        except OllamaError as exc:
+            QMessageBox.critical(self, "Save prompt failed", str(exc))
+            return
+
+        editor = self.prompt_editors.get(kind)
+        if editor is not None:
+            editor.setPlainText(saved_text)
+        self._update_prompt_status(kind)
+        self.statusBar().showMessage(f"Saved {self._prompt_title(kind)} prompt file")
+
+    def _reset_prompt_to_default(self, kind: str) -> None:
+        try:
+            default_text = reset_prompt_to_default(kind)
+            clear_prompt_override(kind)
+        except OllamaError as exc:
+            QMessageBox.critical(self, "Reset prompt failed", str(exc))
+            return
+
+        editor = self.prompt_editors.get(kind)
+        if editor is not None:
+            editor.setPlainText(default_text)
+        self._update_prompt_status(kind)
+        self.statusBar().showMessage(
+            f"Reset {self._prompt_title(kind)} prompt to code default"
+        )
 
     def _apply_config(self) -> None:
         font_point_size = self._cfg.get("font_point_size", 0)
@@ -1099,8 +1261,14 @@ class MainWindow(QMainWindow):
             self._update_ollama_controls()
 
     def _apply_tag_list_height(self) -> None:
-        half_height = max(180, self.height() // 2)
-        self.tag_list.setFixedHeight(half_height)
+        if self._right_splitter_initialized:
+            return
+
+        total_height = max(420, self.right_panel.height() if self.right_panel.height() > 0 else self.height())
+        top_height = max(180, int(total_height * 0.6))
+        bottom_height = max(180, total_height - top_height)
+        self.right_splitter.setSizes([top_height, bottom_height])
+        self._right_splitter_initialized = True
 
     def _on_item_loaded(self, payload: object) -> None:
         data = payload if isinstance(payload, dict) else {}
