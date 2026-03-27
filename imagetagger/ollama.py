@@ -14,8 +14,8 @@ from urllib.parse import urlparse
 DEFAULT_OLLAMA_SERVER = "http://127.0.0.1:11434"
 # Vision-capable LLMs can take a while on busy GPUs; keep this generous.
 DEFAULT_TIMEOUT = 300.0
-# Default to 5 MP; can be overridden from config.json.
-MAX_IMAGE_PIXELS_FOR_OLLAMA = 5_000_000
+# Default to 1 MP; can be overridden from config.json.
+MAX_IMAGE_PIXELS_FOR_OLLAMA = 1_000_000
 
 _resize_warning_lock = threading.Lock()
 _resize_warning_pending = False

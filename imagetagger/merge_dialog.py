@@ -781,7 +781,12 @@ class FixupDialog(QDialog):
 
             key = self._normalized_compare_key(proposed_text)
             if key not in existing_keys:
-                self._add_left_item(proposed_text)
+                if self._has_proposed_description and right_row == 0:
+                    item = QListWidgetItem(proposed_text)
+                    item.setData(DIFF_RANGES_ROLE, [])
+                    self.left_list.insertItem(0, item)
+                else:
+                    self._add_left_item(proposed_text)
                 existing_keys.add(key)
 
     def _remove_right_rows(self, rows: list[int]) -> None:
@@ -1131,6 +1136,9 @@ class FixupDialog(QDialog):
         right_matches: dict[int, int],
         right_match_kind: dict[int, str],
     ) -> None:
+        scrollbar = self.comparison_table.verticalScrollBar()
+        saved_scroll = scrollbar.value()
+
         self.comparison_table.setRowCount(0)
         self._table_row_map = []
 
@@ -1203,6 +1211,7 @@ class FixupDialog(QDialog):
             self._set_action_cell(row, action_text, callback)
 
         self.comparison_table.resizeRowsToContents()
+        scrollbar.setValue(min(saved_scroll, scrollbar.maximum()))
 
     def accept_all(self) -> None:
         proposed_values: list[str] = []

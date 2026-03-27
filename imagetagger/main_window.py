@@ -3,9 +3,12 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 import time
 from typing import Callable, List
+
+from PIL import Image, ImageCms, UnidentifiedImageError
 
 from PyQt6.QtCore import QEvent, QObject, QRect, QStringListModel, QThread, Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QIntValidator, QKeySequence, QPainter, QPixmap
@@ -84,10 +87,30 @@ class FolderLoadWorker(QObject):
     item_loaded = pyqtSignal(object)
     finished = pyqtSignal(int, str)
     failed = pyqtSignal(str)
+    icc_warning = pyqtSignal(str)
 
     def __init__(self, folder: Path) -> None:
         super().__init__()
         self.folder = folder
+
+    @staticmethod
+    def _has_invalid_icc_profile(image_path: Path) -> bool:
+        try:
+            with Image.open(image_path) as image:
+                raw_profile = image.info.get("icc_profile")
+                if not raw_profile:
+                    return False
+                if isinstance(raw_profile, str):
+                    raw_profile = raw_profile.encode("utf-8", errors="ignore")
+                if not isinstance(raw_profile, (bytes, bytearray)):
+                    return False
+
+                ImageCms.ImageCmsProfile(BytesIO(bytes(raw_profile)))
+                return False
+        except (OSError, ValueError, UnidentifiedImageError):
+            return False
+        except ImageCms.PyCMSError:
+            return True
 
     def run(self) -> None:
         try:
@@ -107,6 +130,9 @@ class FolderLoadWorker(QObject):
         self.progress.emit(0, total, 0)
 
         for index, image_path in enumerate(image_paths, start=1):
+            if self._has_invalid_icc_profile(image_path):
+                self.icc_warning.emit(str(image_path))
+
             text_path = image_path.with_suffix(".txt")
             text = ""
             if text_path.exists():
@@ -256,13 +282,18 @@ class MainWindow(QMainWindow):
         self._generate_batch_processed = 0
         self._generate_batch_updated = 0
         self._generate_batch_new_annotations = 0
+        self._generate_batch_started_at: float | None = None
+        self._generate_batch_retry_images = 0
         self._validate_batch_total = 0
         self._validate_batch_processed = 0
         self._validate_batch_clean = 0
         self._validate_batch_issues = 0
         self._validate_batch_skipped = 0
+        self._validate_batch_started_at: float | None = None
+        self._validate_batch_retry_images = 0
         self._ollama_action_name: str | None = None
         self._ollama_cancel: OllamaCancellation | None = None
+        self._icc_warning_paths: list[str] = []
         self._right_splitter_initialized = False
         self.prompt_editors: dict[str, QTextEdit] = {}
         self.prompt_status_labels: dict[str, QLabel] = {}
@@ -276,6 +307,7 @@ class MainWindow(QMainWindow):
         self.ollama_model_name = ""
         self.status_connection_label: QLabel | None = None
         self._pending_selection_path: Path | None = None
+        self._root_directory: Path | None = None
 
         self._cfg = _config.load()
 
@@ -313,6 +345,18 @@ class MainWindow(QMainWindow):
         self.select_all_images_action.setShortcut("Ctrl+A")
         self.select_all_images_action.triggered.connect(self._select_all_images)
         self.list_widget.addAction(self.select_all_images_action)
+
+        self.jump_first_fixup_action = QAction("Jump to First Fixup", self)
+        self.jump_first_fixup_action.setShortcut("Alt+F")
+        self.jump_first_fixup_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.jump_first_fixup_action.triggered.connect(self._jump_to_first_fixup)
+        self.list_widget.addAction(self.jump_first_fixup_action)
+
+        self.jump_last_fixup_action = QAction("Jump to Last Fixup", self)
+        self.jump_last_fixup_action.setShortcut("Alt+L")
+        self.jump_last_fixup_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.jump_last_fixup_action.triggered.connect(self._jump_to_last_fixup)
+        self.list_widget.addAction(self.jump_last_fixup_action)
 
         self.center_panel = QWidget(self)
         center_layout = QVBoxLayout(self.center_panel)
@@ -966,6 +1010,34 @@ class MainWindow(QMainWindow):
 
         return None
 
+    def _find_fixup_index(self, reverse: bool = False) -> int | None:
+        if not self.records:
+            return None
+
+        indices = range(len(self.records) - 1, -1, -1) if reverse else range(len(self.records))
+        for index in indices:
+            item = self.list_widget.item(index)
+            if item is not None and item.isHidden():
+                continue
+            record = self.records[index]
+            if existing_fixup_path_for_image(record.image_path) is not None:
+                return index
+        return None
+
+    def _jump_to_first_fixup(self) -> None:
+        index = self._find_fixup_index(reverse=False)
+        if index is None:
+            self.statusBar().showMessage("No fixup image found in the current list")
+            return
+        self.list_widget.setCurrentRow(index)
+
+    def _jump_to_last_fixup(self) -> None:
+        index = self._find_fixup_index(reverse=True)
+        if index is None:
+            self.statusBar().showMessage("No fixup image found in the current list")
+            return
+        self.list_widget.setCurrentRow(index)
+
     def _move_image_selection(self, direction: int) -> bool:
         if direction not in (-1, 1):
             return False
@@ -1176,7 +1248,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("A folder is already loading")
             return
 
-        folder = self._active_directory()
+        folder = self._root_directory
         if folder is None:
             QMessageBox.information(self, "No folder selected", "Open a folder before refreshing it.")
             return
@@ -1200,7 +1272,9 @@ class MainWindow(QMainWindow):
         return Path(folder)
 
     def load_directory(self, folder: Path, restore_selection: Path | None = None) -> None:
+        self._root_directory = folder
         self._pending_selection_path = restore_selection
+        self._icc_warning_paths = []
         self.records = []
         self.known_tags.clear()
         self.tag_counts.clear()
@@ -1220,6 +1294,7 @@ class MainWindow(QMainWindow):
         self._loader_thread.started.connect(self._loader_worker.run)
         self._loader_worker.item_loaded.connect(self._on_item_loaded)
         self._loader_worker.progress.connect(self._on_load_progress)
+        self._loader_worker.icc_warning.connect(self._on_icc_warning_detected)
         self._loader_worker.finished.connect(self._on_load_finished)
         self._loader_worker.failed.connect(self._on_load_failed)
         self._loader_worker.finished.connect(self._loader_thread.quit)
@@ -1296,6 +1371,14 @@ class MainWindow(QMainWindow):
             f"Processed {processed} images of {total}, {percent}% done"
         )
 
+    def _on_icc_warning_detected(self, image_path: str) -> None:
+        normalized = image_path.strip()
+        if not normalized:
+            return
+        if normalized not in self._icc_warning_paths:
+            self._icc_warning_paths.append(normalized)
+        self.statusBar().showMessage(f"Warning: invalid ICC profile in {Path(normalized).name}")
+
     def _on_load_finished(self, total: int, folder: str) -> None:
         self._set_loading_state(False)
         self._refresh_tag_completions()
@@ -1303,12 +1386,27 @@ class MainWindow(QMainWindow):
         self._restore_selection_after_load()
         if self.records:
             self.statusBar().showMessage(f"Loaded {len(self.records)} images from {folder}")
+            if self._icc_warning_paths:
+                affected = len(self._icc_warning_paths)
+                preview_lines = [Path(path).name for path in self._icc_warning_paths[:10]]
+                details = "\n".join(preview_lines)
+                if affected > 10:
+                    details += f"\n... and {affected - 10} more"
+                QMessageBox.warning(
+                    self,
+                    "Invalid ICC profiles detected",
+                    "Some images contain invalid ICC profiles.\n"
+                    "These images may trigger stderr warnings and should be fixed before downstream use.\n\n"
+                    f"Affected images ({affected}):\n{details}",
+                )
         else:
             self.statusBar().showMessage("No supported images found in selected folder")
+        self._icc_warning_paths = []
 
     def _on_load_failed(self, message: str) -> None:
         self._set_loading_state(False)
         self._pending_selection_path = None
+        self._icc_warning_paths = []
         QMessageBox.critical(self, "Folder load failed", message)
         self.statusBar().showMessage("Folder load failed")
 
@@ -1655,9 +1753,12 @@ class MainWindow(QMainWindow):
                 record = self.records[record_index]
                 image_name = record.image_path.name
                 generated_items: list[str] = []
+                image_retried = False
 
                 for attempt in range(retry_count + 1):
                     cancel_token.raise_if_cancelled()
+                    if attempt > 0:
+                        image_retried = True
 
                     attempt_start = time.monotonic()
 
@@ -1742,6 +1843,7 @@ class MainWindow(QMainWindow):
                         "kind": "generate_item",
                         "index": record_index,
                         "items": generated_items,
+                        "retried": image_retried,
                         "position": position,
                         "total": total,
                     }
@@ -1754,6 +1856,8 @@ class MainWindow(QMainWindow):
         self._generate_batch_processed = 0
         self._generate_batch_updated = 0
         self._generate_batch_new_annotations = 0
+        self._generate_batch_started_at = time.monotonic()
+        self._generate_batch_retry_images = 0
 
         self._start_ollama_task(
             task=generate_task,
@@ -1795,51 +1899,85 @@ class MainWindow(QMainWindow):
             report_item: Callable[[object], None],
         ) -> object:
             timeout = self._ollama_timeout_seconds()
+            retry_count = self._ollama_retry_count()
             total = len(annotated_records)
 
             for position, (record_index, annotations) in enumerate(annotated_records, start=1):
                 record = self.records[record_index]
-                image_start = time.monotonic()
                 image_name = record.image_path.name
+                image_retried = False
+                validation_result = ""
 
-                print(
-                    f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_start image={image_name}",
-                    flush=True,
-                )
+                for attempt in range(retry_count + 1):
+                    cancel_token.raise_if_cancelled()
+                    if attempt > 0:
+                        image_retried = True
 
-                def remaining_timeout() -> float:
-                    elapsed = time.monotonic() - image_start
-                    remaining = timeout - elapsed
-                    if remaining <= 0:
-                        raise OllamaError(
-                            f"Timed out after {int(timeout)} seconds while validating annotations for {record.image_path.name}."
+                    attempt_start = time.monotonic()
+
+                    if attempt == 0:
+                        print(
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_start image={image_name}",
+                            flush=True,
                         )
-                    return remaining
+                        report_progress(
+                            f"Validate: processing {position}/{total} - {record.image_path.name}"
+                        )
+                    else:
+                        print(
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_retry image={image_name} attempt={attempt + 1}/{retry_count + 1}",
+                            flush=True,
+                        )
+                        report_progress(
+                            f"Validate: retry {attempt}/{retry_count} - {position}/{total} - {record.image_path.name}"
+                        )
 
-                report_progress(
-                    f"Validate: processing {position}/{total} - {record.image_path.name}"
-                )
-                report_item(
-                    {
-                        "kind": "validate_item",
-                        "index": record_index,
-                        "result": validate_tags(
+                    def remaining_timeout(_start=attempt_start) -> float:
+                        elapsed = time.monotonic() - _start
+                        remaining = timeout - elapsed
+                        if remaining <= 0:
+                            raise OllamaError(
+                                f"Timed out after {int(timeout)} seconds while validating annotations for {record.image_path.name}."
+                            )
+                        return remaining
+
+                    try:
+                        validation_result = validate_tags(
                             self.ollama_server_url,
                             self.ollama_model_name,
                             record.image_path,
                             annotations,
                             timeout=remaining_timeout(),
                             cancellation=cancel_token,
-                        ),
+                        )
+                    except OllamaCancelled:
+                        raise
+                    except OllamaError:
+                        elapsed_seconds = time.monotonic() - attempt_start
+                        print(
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
+                            flush=True,
+                        )
+                        if attempt >= retry_count:
+                            raise
+                        continue
+
+                    elapsed_seconds = time.monotonic() - attempt_start
+                    print(
+                        f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_done image={image_name} elapsed_s={elapsed_seconds:.2f}",
+                        flush=True,
+                    )
+                    break
+
+                report_item(
+                    {
+                        "kind": "validate_item",
+                        "index": record_index,
+                        "result": validation_result,
+                        "retried": image_retried,
                         "position": position,
                         "total": total,
                     }
-                )
-
-                elapsed_seconds = time.monotonic() - image_start
-                print(
-                    f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_done image={image_name} elapsed_s={elapsed_seconds:.2f}",
-                    flush=True,
                 )
 
             report_progress(f"Validate: finalizing {total}/{total}")
@@ -1856,6 +1994,8 @@ class MainWindow(QMainWindow):
         self._validate_batch_clean = 0
         self._validate_batch_issues = 0
         self._validate_batch_skipped = skipped_without_annotations
+        self._validate_batch_started_at = time.monotonic()
+        self._validate_batch_retry_images = 0
 
         self._start_ollama_task(
             task=validate_task,
@@ -1938,7 +2078,68 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Stopping validation...")
         self._ollama_cancel.cancel()
 
+    def _format_duration(self, seconds: float) -> str:
+        total_seconds = max(0, int(seconds))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _batch_progress_details(
+        self,
+        processed: int,
+        total: int,
+        started_at: float | None,
+        retry_images: int,
+    ) -> str:
+        if started_at is None:
+            return f" | elapsed --:-- | est --:-- | retried images {retry_images}"
+
+        elapsed = max(0.0, time.monotonic() - started_at)
+        if processed > 0:
+            remaining = max(0, total - processed)
+            average_per_image = elapsed / processed
+            estimated_remaining = average_per_image * remaining
+            estimated_text = self._format_duration(estimated_remaining)
+        else:
+            estimated_text = "--:--"
+
+        return (
+            f" | elapsed {self._format_duration(elapsed)}"
+            f" | est {estimated_text}"
+            f" | retried images {retry_images}"
+        )
+
     def _on_ollama_task_progress(self, message: str) -> None:
+        if self._ollama_action_name == "Generate" and (
+            message.startswith("Generate: processing")
+            or message.startswith("Generate: retry")
+            or message.startswith("Generate: finalizing")
+        ):
+            details = self._batch_progress_details(
+                self._generate_batch_processed,
+                self._generate_batch_total,
+                self._generate_batch_started_at,
+                self._generate_batch_retry_images,
+            )
+            self.statusBar().showMessage(f"{message}{details}")
+            return
+
+        if self._ollama_action_name == "Validate" and (
+            message.startswith("Validate: processing")
+            or message.startswith("Validate: retry")
+            or message.startswith("Validate: finalizing")
+        ):
+            details = self._batch_progress_details(
+                self._validate_batch_processed,
+                self._validate_batch_total,
+                self._validate_batch_started_at,
+                self._validate_batch_retry_images,
+            )
+            self.statusBar().showMessage(f"{message}{details}")
+            return
+
         self.statusBar().showMessage(message)
 
     def _on_ollama_task_cancelled(self, message: str) -> None:
@@ -1996,6 +2197,7 @@ class MainWindow(QMainWindow):
         if kind == "generate_item":
             raw_index = payload.get("index")
             raw_items = payload.get("items")
+            raw_retried = payload.get("retried")
             raw_position = payload.get("position")
             raw_total = payload.get("total")
 
@@ -2008,6 +2210,8 @@ class MainWindow(QMainWindow):
 
             updated, added = self._apply_generated_items_to_record(raw_index, items)
             self._generate_batch_processed += 1
+            if isinstance(raw_retried, bool) and raw_retried:
+                self._generate_batch_retry_images += 1
             if updated:
                 self._generate_batch_updated += 1
                 self._generate_batch_new_annotations += added
@@ -2015,8 +2219,14 @@ class MainWindow(QMainWindow):
                 self._refresh_tag_completions()
 
             if isinstance(raw_position, int) and isinstance(raw_total, int) and raw_total > 0:
+                details = self._batch_progress_details(
+                    self._generate_batch_processed,
+                    self._generate_batch_total,
+                    self._generate_batch_started_at,
+                    self._generate_batch_retry_images,
+                )
                 self.statusBar().showMessage(
-                    f"Generate: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name}"
+                    f"Generate: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name}{details}"
                 )
             return
 
@@ -2025,6 +2235,7 @@ class MainWindow(QMainWindow):
 
         raw_index = payload.get("index")
         raw_result = payload.get("result")
+        raw_retried = payload.get("retried")
         raw_position = payload.get("position")
         raw_total = payload.get("total")
 
@@ -2035,14 +2246,22 @@ class MainWindow(QMainWindow):
 
         outcome = self._apply_validation_result_to_record(raw_index, str(raw_result or ""))
         self._validate_batch_processed += 1
+        if isinstance(raw_retried, bool) and raw_retried:
+            self._validate_batch_retry_images += 1
         if outcome == "clean":
             self._validate_batch_clean += 1
         elif outcome == "issues":
             self._validate_batch_issues += 1
 
         if isinstance(raw_position, int) and isinstance(raw_total, int) and raw_total > 0:
+            details = self._batch_progress_details(
+                self._validate_batch_processed,
+                self._validate_batch_total,
+                self._validate_batch_started_at,
+                self._validate_batch_retry_images,
+            )
             self.statusBar().showMessage(
-                f"Validate: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name}"
+                f"Validate: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name}{details}"
             )
 
     def _on_ollama_task_finished(
@@ -2266,11 +2485,15 @@ class MainWindow(QMainWindow):
         self._generate_batch_processed = 0
         self._generate_batch_updated = 0
         self._generate_batch_new_annotations = 0
+        self._generate_batch_started_at = None
+        self._generate_batch_retry_images = 0
         self._validate_batch_total = 0
         self._validate_batch_processed = 0
         self._validate_batch_clean = 0
         self._validate_batch_issues = 0
         self._validate_batch_skipped = 0
+        self._validate_batch_started_at = None
+        self._validate_batch_retry_images = 0
         self._ollama_action_name = None
         self._ollama_cancel = None
         self._update_ollama_controls()
