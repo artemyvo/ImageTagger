@@ -1271,7 +1271,48 @@ class MainWindow(QMainWindow):
 
         return Path(folder)
 
+    def _find_image_name_collision(self, folder: Path) -> tuple[Path, Path] | None:
+        """Return the first pair of image files that would map to the same .txt path."""
+        try:
+            image_paths = sorted(
+                [
+                    p
+                    for p in folder.rglob("*")
+                    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+                ],
+                key=lambda p: p.relative_to(folder).as_posix().lower(),
+            )
+        except OSError as exc:
+            QMessageBox.critical(self, "Folder load failed", f"Failed to read folder: {exc}")
+            return None
+
+        seen_by_txt_path: dict[str, Path] = {}
+        for image_path in image_paths:
+            txt_key = str(image_path.with_suffix(".txt")).casefold()
+            existing = seen_by_txt_path.get(txt_key)
+            if existing is None:
+                seen_by_txt_path[txt_key] = image_path
+                continue
+
+            if existing.suffix.lower() != image_path.suffix.lower():
+                return existing, image_path
+
+        return None
+
     def load_directory(self, folder: Path, restore_selection: Path | None = None) -> None:
+        collision = self._find_image_name_collision(folder)
+        if collision is not None:
+            first, second = collision
+            QMessageBox.warning(
+                self,
+                "Duplicate image names detected",
+                "Two image files have the same name with different extensions, which would "
+                "collide on the same .txt description file.\n\n"
+                f"Filename: {first.stem}\n"
+                f"Files:\n- {first}\n- {second}",
+            )
+            return
+
         self._root_directory = folder
         self._pending_selection_path = restore_selection
         self._icc_warning_paths = []

@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -259,6 +260,67 @@ class DiffHighlightDelegate(QStyledItemDelegate):
         return size
 
 
+class EditableDiffDelegate(DiffHighlightDelegate):
+    _CLOSED_BY_DELEGATE_PROP = "_closed_by_editable_diff_delegate"
+
+    def _resize_editor(self, editor: QTextEdit) -> None:
+        margins = editor.contentsMargins()
+        document = editor.document()
+        document.setTextWidth(max(20.0, editor.viewport().width()))
+        doc_height = int(document.size().height())
+        frame = editor.frameWidth() * 2
+        vertical_margins = margins.top() + margins.bottom()
+        min_height = editor.fontMetrics().lineSpacing() + 10
+        editor.setFixedHeight(max(min_height, doc_height + frame + vertical_margins + 4))
+
+    def createEditor(self, parent, option, index):  # type: ignore[override]
+        editor = QTextEdit(parent)
+        editor.setAcceptRichText(False)
+        editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        editor.setFrameStyle(0)
+        editor.installEventFilter(self)
+        editor.textChanged.connect(lambda: self._resize_editor(editor))
+        return editor
+
+    def setEditorData(self, editor, index) -> None:  # type: ignore[override]
+        if isinstance(editor, QTextEdit):
+            editor.setPlainText(index.data(Qt.ItemDataRole.EditRole) or "")
+            self._resize_editor(editor)
+            editor.selectAll()
+
+    def setModelData(self, editor, model, index) -> None:  # type: ignore[override]
+        if isinstance(editor, QTextEdit):
+            model.setData(index, editor.toPlainText(), Qt.ItemDataRole.EditRole)
+
+    def updateEditorGeometry(self, editor, option, index) -> None:  # type: ignore[override]
+        if isinstance(editor, QTextEdit):
+            editor.setGeometry(option.rect)
+            self._resize_editor(editor)
+
+    def eventFilter(self, editor, event) -> bool:
+        if isinstance(editor, QTextEdit):
+            if event.type() == QEvent.Type.KeyPress:
+                key = event.key()
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    editor.setProperty(self._CLOSED_BY_DELEGATE_PROP, True)
+                    self.commitData.emit(editor)
+                    self.closeEditor.emit(editor, QStyledItemDelegate.EndEditHint.SubmitModelCache)
+                    return True
+                if key == Qt.Key.Key_Escape:
+                    editor.setProperty(self._CLOSED_BY_DELEGATE_PROP, True)
+                    self.closeEditor.emit(editor, QStyledItemDelegate.EndEditHint.RevertModelCache)
+                    return True
+            if event.type() == QEvent.Type.FocusOut:
+                if bool(editor.property(self._CLOSED_BY_DELEGATE_PROP)):
+                    return True
+                editor.setProperty(self._CLOSED_BY_DELEGATE_PROP, True)
+                self.commitData.emit(editor)
+                self.closeEditor.emit(editor, QStyledItemDelegate.EndEditHint.SubmitModelCache)
+                return True
+        return super().eventFilter(editor, event)
+
+
 class ScalableImageLabel(QLabel):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -391,12 +453,14 @@ class FixupDialog(QDialog):
         self._has_proposed_description = bool(fixup_data.corrected_description)
         self._exact_match_only_for_tags = False
         self._protected_existing_keys: set[str] = set()
+        self._updating_comparison_table = False
         self._image_path = image_path
         self._ollama_server_url = ollama_server_url.strip()
         self._ollama_model_name = ollama_model_name.strip()
         self._regenerate_thread: QThread | None = None
         self._regenerate_worker: RegenerateWorker | None = None
         self._regenerate_cancel: OllamaCancellation | None = None
+        self._discard_regenerate_result = False
 
         self.left_list = QListWidget(self)
         self.left_list.setItemDelegate(DiffHighlightDelegate(self.left_list))
@@ -438,13 +502,18 @@ class FixupDialog(QDialog):
         self.comparison_table.setWordWrap(True)
         self.comparison_table.verticalHeader().setVisible(False)
         self.comparison_table.setAlternatingRowColors(True)
-        self.comparison_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.comparison_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self.comparison_table.setItemDelegateForColumn(0, EditableDiffDelegate(self.comparison_table))
         self.comparison_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.comparison_table.setMouseTracking(False)
         self.comparison_table.viewport().setMouseTracking(False)
         self.comparison_table.setStyleSheet(
             "QTableWidget::item:hover { background-color: transparent; }"
         )
+        self.comparison_table.itemChanged.connect(self._on_comparison_item_changed)
         header = self.comparison_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
@@ -544,6 +613,7 @@ class FixupDialog(QDialog):
         self.next_button.clicked.connect(self._navigate_next)
 
         for button in (
+            self.regenerate_button,
             self.accept_button,
             self.reject_button,
             self.merge_button,
@@ -624,14 +694,47 @@ class FixupDialog(QDialog):
             if self._normalized_compare_text(text)
         }
         if normalized_new_key in existing_keys:
+            self._select_existing_tag_row(normalized_new_key)
             self.left_tag_input.selectAll()
             return
 
         self._add_left_item(new_tag)
         self.left_tag_input.clear()
         QTimer.singleShot(0, self.left_tag_input.clear)
+        QTimer.singleShot(0, self.left_tag_input.setFocus)
         self._refresh_button_state()
         self._update_difference_highlights()
+
+    def _select_existing_tag_row(self, normalized_key: str) -> None:
+        if not normalized_key:
+            return
+
+        target_left_index: int | None = None
+        for index, text in enumerate(self._current_texts(self.left_list)):
+            if self._normalized_compare_key(text) == normalized_key:
+                target_left_index = index
+                break
+
+        if target_left_index is None:
+            return
+
+        target_row: int | None = None
+        for row, (left_index, _right_index) in enumerate(self._table_row_map):
+            if left_index == target_left_index:
+                target_row = row
+                break
+
+        if target_row is None:
+            return
+
+        self.comparison_table.clearSelection()
+        self.comparison_table.selectRow(target_row)
+        self.comparison_table.setCurrentCell(target_row, 0)
+        model_index = self.comparison_table.model().index(target_row, 0)
+        self.comparison_table.scrollTo(
+            model_index,
+            QAbstractItemView.ScrollHint.PositionAtCenter,
+        )
 
     def _add_right_item(self, text: str) -> None:
         """Add item to right list with accept button."""
@@ -799,14 +902,17 @@ class FixupDialog(QDialog):
         is_resolved = self._resolved
         has_local_changes = self._has_local_changes()
         has_dialog_changes = self._has_dialog_state_changes()
+        regenerate_in_progress = self._regenerate_thread is not None
         can_navigate_next = self.next_button.isEnabled()
-        self.accept_button.setEnabled(has_right_items and not is_resolved)
-        self.reject_button.setEnabled(not is_resolved)
-        self.merge_button.setEnabled(has_local_changes)
-        self.undo_button.setEnabled(self._undo_available or has_dialog_changes)
-        self.accept_next_button.setEnabled(has_right_items and not is_resolved and can_navigate_next)
-        self.reject_next_button.setEnabled(not is_resolved and can_navigate_next)
-        self.merge_next_button.setEnabled(has_local_changes and can_navigate_next)
+        self.accept_button.setEnabled(has_right_items and not is_resolved and not regenerate_in_progress)
+        self.reject_button.setEnabled(not is_resolved and not regenerate_in_progress)
+        self.merge_button.setEnabled(has_local_changes and not regenerate_in_progress)
+        self.undo_button.setEnabled((self._undo_available or has_dialog_changes) and not regenerate_in_progress)
+        self.accept_next_button.setEnabled(
+            has_right_items and not is_resolved and can_navigate_next and not regenerate_in_progress
+        )
+        self.reject_next_button.setEnabled(not is_resolved and can_navigate_next and not regenerate_in_progress)
+        self.merge_next_button.setEnabled(has_local_changes and can_navigate_next and not regenerate_in_progress)
 
     def _has_local_changes(self) -> bool:
         current = [
@@ -1139,79 +1245,116 @@ class FixupDialog(QDialog):
         scrollbar = self.comparison_table.verticalScrollBar()
         saved_scroll = scrollbar.value()
 
-        self.comparison_table.setRowCount(0)
-        self._table_row_map = []
+        self._updating_comparison_table = True
+        try:
+            self.comparison_table.setRowCount(0)
+            self._table_row_map = []
 
-        consumed_left_indexes: set[int] = set()
-        consumed_right_indexes: set[int] = set()
+            consumed_left_indexes: set[int] = set()
+            consumed_right_indexes: set[int] = set()
 
-        if self._has_proposed_description and right_texts:
-            description_left_index = right_matches.get(0)
-            self._table_row_map.append((description_left_index, 0))
-            consumed_right_indexes.add(0)
-            if description_left_index is not None:
-                consumed_left_indexes.add(description_left_index)
+            if self._has_proposed_description and right_texts:
+                description_left_index = right_matches.get(0)
+                self._table_row_map.append((description_left_index, 0))
+                consumed_right_indexes.add(0)
+                if description_left_index is not None:
+                    consumed_left_indexes.add(description_left_index)
 
-        for left_index, left_text in enumerate(left_texts):
-            if left_index in consumed_left_indexes:
-                continue
-            right_index = left_matches.get(left_index)
-            self._table_row_map.append((left_index, right_index))
-            consumed_left_indexes.add(left_index)
-            if right_index is not None:
-                consumed_right_indexes.add(right_index)
+            for left_index, left_text in enumerate(left_texts):
+                if left_index in consumed_left_indexes:
+                    continue
+                right_index = left_matches.get(left_index)
+                self._table_row_map.append((left_index, right_index))
+                consumed_left_indexes.add(left_index)
+                if right_index is not None:
+                    consumed_right_indexes.add(right_index)
 
-        for right_index in range(len(right_texts)):
-            if right_index in consumed_right_indexes or right_index in right_matches:
-                continue
-            self._table_row_map.append((None, right_index))
+            for right_index in range(len(right_texts)):
+                if right_index in consumed_right_indexes or right_index in right_matches:
+                    continue
+                self._table_row_map.append((None, right_index))
 
-        self.comparison_table.setRowCount(len(self._table_row_map))
+            self.comparison_table.setRowCount(len(self._table_row_map))
 
-        for row, (left_index, right_index) in enumerate(self._table_row_map):
-            if left_index is not None:
-                left_item = self.left_list.item(left_index)
-                left_text = left_texts[left_index]
-                left_ranges = left_item.data(DIFF_RANGES_ROLE)
-                left_widget = self._make_text_cell_label(
-                    left_text,
-                    left_ranges if isinstance(left_ranges, list) else [],
-                )
-                self.comparison_table.setCellWidget(row, 0, left_widget)
-            else:
-                self.comparison_table.setItem(row, 0, QTableWidgetItem(""))
+            for row, (left_index, right_index) in enumerate(self._table_row_map):
+                if left_index is not None:
+                    left_item = self.left_list.item(left_index)
+                    left_text = left_texts[left_index]
+                    left_ranges = left_item.data(DIFF_RANGES_ROLE)
+                    table_item = QTableWidgetItem(left_text)
+                    flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+                    if not self._is_protected_existing_text(left_text):
+                        flags |= Qt.ItemFlag.ItemIsEditable
+                    table_item.setFlags(flags)
+                    table_item.setData(
+                        DIFF_RANGES_ROLE,
+                        left_ranges if isinstance(left_ranges, list) else [],
+                    )
+                    self.comparison_table.setItem(row, 0, table_item)
+                else:
+                    placeholder_item = QTableWidgetItem("")
+                    placeholder_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                    self.comparison_table.setItem(row, 0, placeholder_item)
 
-            if right_index is not None:
-                right_item = self.right_list.item(right_index)
-                right_text = right_texts[right_index]
-                right_ranges = right_item.data(DIFF_RANGES_ROLE)
-                right_widget = self._make_text_cell_label(
-                    right_text,
-                    right_ranges if isinstance(right_ranges, list) else [],
-                )
-                self.comparison_table.setCellWidget(row, 2, right_widget)
-            else:
-                self.comparison_table.setItem(row, 2, QTableWidgetItem(""))
+                if right_index is not None:
+                    right_item = self.right_list.item(right_index)
+                    right_text = right_texts[right_index]
+                    right_ranges = right_item.data(DIFF_RANGES_ROLE)
+                    right_widget = self._make_text_cell_label(
+                        right_text,
+                        right_ranges if isinstance(right_ranges, list) else [],
+                    )
+                    self.comparison_table.setCellWidget(row, 2, right_widget)
+                else:
+                    self.comparison_table.setItem(row, 2, QTableWidgetItem(""))
 
-            action_text = ""
-            callback: Callable[[], None] | None = None
-            if left_index is not None and right_index is not None:
-                if right_match_kind.get(right_index) != "exact":
+                action_text = ""
+                callback: Callable[[], None] | None = None
+                if left_index is not None and right_index is not None:
+                    if right_match_kind.get(right_index) != "exact":
+                        action_text = "←"
+                        callback = lambda idx=right_index: self._apply_proposed_rows([idx]) or self._refresh_button_state() or self._update_difference_highlights()
+                elif right_index is not None:
                     action_text = "←"
                     callback = lambda idx=right_index: self._apply_proposed_rows([idx]) or self._refresh_button_state() or self._update_difference_highlights()
-            elif right_index is not None:
-                action_text = "←"
-                callback = lambda idx=right_index: self._apply_proposed_rows([idx]) or self._refresh_button_state() or self._update_difference_highlights()
-            elif left_index is not None:
-                left_text = left_texts[left_index]
-                if not self._is_protected_existing_text(left_text):
-                    action_text = "✕"
-                    callback = lambda value=left_text: self._remove_left_item(value)
+                elif left_index is not None:
+                    left_text = left_texts[left_index]
+                    if not self._is_protected_existing_text(left_text):
+                        action_text = "✕"
+                        callback = lambda value=left_text: self._remove_left_item(value)
 
-            self._set_action_cell(row, action_text, callback)
+                self._set_action_cell(row, action_text, callback)
+        finally:
+            self._updating_comparison_table = False
 
         self.comparison_table.resizeRowsToContents()
         scrollbar.setValue(min(saved_scroll, scrollbar.maximum()))
+
+    def _on_comparison_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_comparison_table:
+            return
+        if item.column() != 0:
+            return
+
+        row = item.row()
+        if row < 0 or row >= len(self._table_row_map):
+            return
+
+        left_index, _right_index = self._table_row_map[row]
+        if left_index is None or left_index < 0 or left_index >= self.left_list.count():
+            return
+
+        new_text = item.text().strip()
+        if not new_text:
+            removed = self.left_list.takeItem(left_index)
+            del removed
+        else:
+            left_item = self.left_list.item(left_index)
+            left_item.setText(new_text)
+            left_item.setData(ITEM_TEXT_ROLE, new_text)
+
+        self._refresh_button_state()
+        self._update_difference_highlights()
 
     def accept_all(self) -> None:
         proposed_values: list[str] = []
@@ -1441,6 +1584,7 @@ class FixupDialog(QDialog):
 
         cancel_token = OllamaCancellation()
         self._regenerate_cancel = cancel_token
+        self._discard_regenerate_result = False
 
         def task(report_progress: Callable[[str], None]) -> object:
             timeout = self._regenerate_timeout_seconds()
@@ -1539,6 +1683,10 @@ class FixupDialog(QDialog):
         return unique_values
 
     def _on_regenerate_finished(self, payload: object) -> None:
+        if self._discard_regenerate_result:
+            self.regenerate_status_label.setText("Regeneration discarded.")
+            return
+
         data = payload if isinstance(payload, dict) else {}
         description = str(data.get("description", "")).strip()
         raw_tags = data.get("tags")
@@ -1576,7 +1724,16 @@ class FixupDialog(QDialog):
         self.regenerate_status_label.setText("Regenerate failed.")
 
     def _on_regenerate_cancelled(self, message: str) -> None:
+        if self._discard_regenerate_result:
+            self.regenerate_status_label.setText("Regeneration discarded.")
+            return
         self.regenerate_status_label.setText(message or "Regeneration stopped.")
+
+    def _cancel_regenerate(self, *, discard_result: bool = True) -> None:
+        if discard_result:
+            self._discard_regenerate_result = True
+        if self._regenerate_cancel is not None:
+            self._regenerate_cancel.cancel()
 
     def _cleanup_regenerate_task(self) -> None:
         if self._regenerate_worker is not None:
@@ -1587,6 +1744,7 @@ class FixupDialog(QDialog):
         self._regenerate_thread = None
         self._regenerate_cancel = None
         self._update_regenerate_controls()
+        self._refresh_button_state()
 
     def _create_image_pane(self, image_path: Path | None) -> QWidget:
         pane = QWidget(self)
@@ -1645,8 +1803,7 @@ class FixupDialog(QDialog):
             self._update_difference_highlights()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self._regenerate_cancel is not None:
-            self._regenerate_cancel.cancel()
+        self._cancel_regenerate(discard_result=True)
         super().closeEvent(event)
 
     def has_merged_changes(self) -> bool:
@@ -1711,9 +1868,11 @@ class FixupDialog(QDialog):
         self._refresh_button_state()
 
     def _navigate_prev(self) -> None:
+        self._cancel_regenerate(discard_result=True)
         self.done(self.NAVIGATE_PREV_CODE)
 
     def _navigate_next(self) -> None:
+        self._cancel_regenerate(discard_result=True)
         self.done(self.NAVIGATE_NEXT_CODE)
 
     def _accept_and_next(self) -> None:

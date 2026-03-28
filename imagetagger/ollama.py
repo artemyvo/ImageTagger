@@ -217,11 +217,11 @@ def fetch_models(server: str, timeout: float = 5.0) -> list[str]:
 # Prompt loading
 # ---------------------------------------------------------------------------
 
-_PROMPTS_DIR = Path(__file__).parent.parent
+_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
 def _load_prompt(filename: str, default: str) -> str:
-    """Return prompt text from *filename* in the workspace root, or *default*."""
+    """Return prompt text from *filename* in the prompts directory, or *default*."""
     try:
         return (_PROMPTS_DIR / filename).read_text(encoding="utf-8").strip()
     except OSError:
@@ -317,6 +317,7 @@ def save_prompt_for_kind(kind: str, prompt: str) -> str:
     _assert_prompt_kind(kind)
     text = prompt.strip()
     try:
+        _PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
         (_PROMPTS_DIR / _PROMPT_FILENAMES[kind]).write_text(text, encoding="utf-8")
     except OSError as exc:
         raise OllamaError(f"Could not save prompt file: {exc}") from exc
@@ -327,6 +328,7 @@ def reset_prompt_to_default(kind: str) -> str:
     _assert_prompt_kind(kind)
     default_text = _PROMPT_DEFAULTS[kind]
     try:
+        _PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
         (_PROMPTS_DIR / _PROMPT_FILENAMES[kind]).write_text(default_text, encoding="utf-8")
     except OSError as exc:
         raise OllamaError(f"Could not reset prompt file: {exc}") from exc
