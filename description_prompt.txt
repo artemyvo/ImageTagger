@@ -1,1 +1,0 @@
-Analyze the image and write a single descriptive sentence that captures what is depicted. Describe the content and key visual elements in detail. Return only the description sentence, nothing else. Do not use commas.
