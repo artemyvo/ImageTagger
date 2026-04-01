@@ -8,7 +8,7 @@ from typing import Callable
 from pathlib import Path
 
 from PyQt6.QtCore import QEvent, QObject, Qt, QSize, QStringListModel, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QIntValidator, QKeySequence, QPixmap, QPainter, QPalette, QTextCharFormat, QTextCursor, QTextDocument
+from PyQt6.QtGui import QAction, QColor, QDoubleValidator, QIntValidator, QKeySequence, QPixmap, QPainter, QPalette, QTextCharFormat, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -40,6 +40,7 @@ from imagetagger.ollama import (
     OllamaCancellation,
     OllamaCancelled,
     OllamaError,
+    configure_runtime,
     consume_resize_warning,
     generate_description,
     generate_tags,
@@ -431,6 +432,7 @@ class FixupDialog(QDialog):
         regenerate_description_enabled: bool = True,
         regenerate_timeout_seconds: int = 300,
         regenerate_retry_count: int = 3,
+        regenerate_max_resolution_mpx: float = 5.0,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -454,6 +456,7 @@ class FixupDialog(QDialog):
         self._exact_match_only_for_tags = False
         self._protected_existing_keys: set[str] = set()
         self._updating_comparison_table = False
+        self._pending_edit_refresh = False
         self._image_path = image_path
         self._ollama_server_url = ollama_server_url.strip()
         self._ollama_model_name = ollama_model_name.strip()
@@ -475,6 +478,11 @@ class FixupDialog(QDialog):
         self.remove_left_tag_action.triggered.connect(self._remove_selected_left_items)
         self.left_list.addAction(self.remove_left_tag_action)
         self.addAction(self.remove_left_tag_action)
+
+        self.merge_and_next_alt_action = QAction("Merge and Next", self)
+        self.merge_and_next_alt_action.setShortcut(QKeySequence("Alt+Return"))
+        self.merge_and_next_alt_action.triggered.connect(self._merge_and_next)
+        self.addAction(self.merge_and_next_alt_action)
 
         self.left_tag_input = QLineEdit(self)
         self.left_tag_input.setPlaceholderText("Type a tag and press Enter")
@@ -514,7 +522,16 @@ class FixupDialog(QDialog):
             "QTableWidget::item:hover { background-color: transparent; }"
         )
         self.comparison_table.itemChanged.connect(self._on_comparison_item_changed)
+        self.comparison_table.installEventFilter(self)
         header = self.comparison_table.horizontalHeader()
+        header.setStyleSheet(
+            "QHeaderView::section {"
+            "  background-color: #d0d0d0;"
+            "  padding: 4px;"
+            "  font-weight: bold;"
+            "  border: 1px solid #aaa;"
+            "}"
+        )
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
@@ -540,6 +557,19 @@ class FixupDialog(QDialog):
         self.regenerate_retry_input.setValidator(QIntValidator(0, 10, self))
         self.regenerate_retry_input.setText(str(max(0, int(regenerate_retry_count))))
         self.regenerate_retry_input.setMaximumWidth(60)
+
+        self.regenerate_max_resolution_input = QLineEdit(self)
+        max_resolution_validator = QDoubleValidator(0.01, 1000.0, 3, self)
+        max_resolution_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self.regenerate_max_resolution_input.setValidator(max_resolution_validator)
+        try:
+            max_resolution_value = float(regenerate_max_resolution_mpx)
+            if max_resolution_value <= 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            max_resolution_value = 5.0
+        self.regenerate_max_resolution_input.setText(self._format_mpx(max_resolution_value))
+        self.regenerate_max_resolution_input.setMaximumWidth(80)
 
         self.regenerate_button = QPushButton("Regenerate", self)
         self.regenerate_button.clicked.connect(self._regenerate_proposed_annotations)
@@ -597,7 +627,7 @@ class FixupDialog(QDialog):
 
         self.merge_next_button = QPushButton("Merge and Next", self)
         self.merge_next_button.setShortcut(QKeySequence("Alt+Shift+M"))
-        self.merge_next_button.setToolTip("Apply current merged annotations and go to next item (Alt+Shift+M)")
+        self.merge_next_button.setToolTip("Apply current merged annotations and go to next item (Alt+Shift+M, Alt+Enter)")
         self.merge_next_button.clicked.connect(self._merge_and_next)
 
         self.prev_button = QPushButton("Prev", self)
@@ -1330,6 +1360,19 @@ class FixupDialog(QDialog):
         self.comparison_table.resizeRowsToContents()
         scrollbar.setValue(min(saved_scroll, scrollbar.maximum()))
 
+    def _schedule_refresh_after_edit(self) -> None:
+        if self._pending_edit_refresh:
+            return
+
+        self._pending_edit_refresh = True
+
+        def _run_refresh() -> None:
+            self._pending_edit_refresh = False
+            self._refresh_button_state()
+            self._update_difference_highlights()
+
+        QTimer.singleShot(0, _run_refresh)
+
     def _on_comparison_item_changed(self, item: QTableWidgetItem) -> None:
         if self._updating_comparison_table:
             return
@@ -1353,8 +1396,7 @@ class FixupDialog(QDialog):
             left_item.setText(new_text)
             left_item.setData(ITEM_TEXT_ROLE, new_text)
 
-        self._refresh_button_state()
-        self._update_difference_highlights()
+        self._schedule_refresh_after_edit()
 
     def accept_all(self) -> None:
         proposed_values: list[str] = []
@@ -1420,10 +1462,42 @@ class FixupDialog(QDialog):
         self._refresh_button_state()
         self._update_difference_highlights()
 
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self.comparison_table and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Left:
+                selected_rows = sorted({index.row() for index in self.comparison_table.selectedIndexes()})
+                right_indexes: list[int] = []
+                for row in selected_rows:
+                    if row < 0 or row >= len(self._table_row_map):
+                        continue
+                    _left_index, right_index = self._table_row_map[row]
+                    if right_index is None:
+                        continue
+                    cell_widget = self.comparison_table.cellWidget(row, 1)
+                    if cell_widget is not None:
+                        for btn in cell_widget.findChildren(QPushButton):
+                            if btn.text() == "←":
+                                right_indexes.append(right_index)
+                                break
+                if right_indexes:
+                    current_row = self.comparison_table.currentRow()
+                    self._apply_proposed_rows(right_indexes)
+                    self._refresh_button_state()
+                    self._update_difference_highlights()
+                    new_row_count = self.comparison_table.rowCount()
+                    if new_row_count > 0 and current_row >= 0:
+                        target_row = min(current_row, new_row_count - 1)
+                        self.comparison_table.setCurrentCell(target_row, 0)
+                    return True
+        return super().eventFilter(watched, event)
+
     def _remove_selected_left_items(self) -> None:
         selected_rows = sorted({index.row() for index in self.comparison_table.selectedIndexes()}, reverse=True)
         if not selected_rows:
             return
+
+        # Remember the topmost selected row so we can restore focus after rebuild.
+        min_selected_row = selected_rows[-1]
 
         left_indexes_to_remove: list[int] = []
         for row in selected_rows:
@@ -1448,6 +1522,13 @@ class FixupDialog(QDialog):
 
         self._refresh_button_state()
         self._update_difference_highlights()
+
+        # After the table is rebuilt, activate the row that followed the deleted
+        # selection (or the new last row if everything deleted was at the end).
+        new_row_count = self.comparison_table.rowCount()
+        if new_row_count > 0:
+            target_row = min(min_selected_row, new_row_count - 1)
+            self.comparison_table.setCurrentCell(target_row, 0)
 
     def selected_annotations(self) -> list[str]:
         return self._current_texts(self.left_list)
@@ -1478,6 +1559,31 @@ class FixupDialog(QDialog):
             return 0
         return max(0, retries)
 
+    @staticmethod
+    def _format_mpx(value: float) -> str:
+        normalized = f"{float(value):.3f}".rstrip("0").rstrip(".")
+        if "." not in normalized:
+            normalized += ".0"
+        return normalized
+
+    def _regenerate_max_resolution_mpx(self) -> float:
+        raw_value = self.regenerate_max_resolution_input.text().strip()
+        if not raw_value:
+            QMessageBox.warning(self, "Invalid query downscale", "Enter query downscale in megapixels.")
+            raise OllamaError("Enter query downscale in megapixels.")
+
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid query downscale", "Query downscale must be a number.")
+            raise OllamaError("Query downscale must be a number.") from exc
+
+        if value <= 0:
+            QMessageBox.warning(self, "Invalid query downscale", "Query downscale must be greater than 0.")
+            raise OllamaError("Query downscale must be greater than 0.")
+
+        return value
+
     def _update_regenerate_controls(self) -> None:
         connected = bool(self._ollama_model_name)
         working = self._regenerate_thread is not None
@@ -1490,6 +1596,7 @@ class FixupDialog(QDialog):
         self.regenerate_description_checkbox.setEnabled(not working)
         self.regenerate_timeout_input.setEnabled(not working)
         self.regenerate_retry_input.setEnabled(not working)
+        self.regenerate_max_resolution_input.setEnabled(not working)
 
         if working:
             self.regenerate_button.setEnabled(False)
@@ -1560,6 +1667,10 @@ class FixupDialog(QDialog):
         controls_row.addSpacing(8)
         controls_row.addWidget(QLabel("Retries", self))
         controls_row.addWidget(self.regenerate_retry_input)
+        controls_row.addSpacing(8)
+        controls_row.addWidget(QLabel("Query downscale", self))
+        controls_row.addWidget(self.regenerate_max_resolution_input)
+        controls_row.addWidget(QLabel("(MPx)", self))
         controls_row.addStretch(1)
 
         layout.addLayout(controls_row)
@@ -1577,6 +1688,12 @@ class FixupDialog(QDialog):
             return
         if not self._ollama_model_name:
             return
+
+        try:
+            max_resolution_mpx = self._regenerate_max_resolution_mpx()
+        except OllamaError:
+            return
+        configure_runtime(max_image_pixels=max(1, int(max_resolution_mpx * 1_000_000)))
 
         resize_warning = consume_resize_warning()
         if resize_warning:

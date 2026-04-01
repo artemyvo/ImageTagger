@@ -11,7 +11,7 @@ from typing import Callable, List
 from PIL import Image, ImageCms, UnidentifiedImageError
 
 from PyQt6.QtCore import QEvent, QObject, QRect, QStringListModel, QThread, Qt, QSize, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QIntValidator, QKeySequence, QPainter, QPixmap
+from PyQt6.QtGui import QAction, QColor, QDoubleValidator, QFont, QIcon, QImage, QImageReader, QIntValidator, QKeySequence, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -80,6 +80,233 @@ class ImageRecord:
     image_path: Path
     text_path: Path
     text: str
+
+
+class FilterSyntaxError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _FilterToken:
+    kind: str
+    value: str
+    position: int
+
+
+class _FilterNode:
+    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
+        raise NotImplementedError()
+
+
+@dataclass(frozen=True)
+class _NamedFilterNode(_FilterNode):
+    name: str
+
+    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
+        predicate = runtime.named_filters.get(self.name.casefold())
+        if predicate is None:
+            return False
+        return predicate(record)
+
+
+@dataclass(frozen=True)
+class _TagFilterNode(_FilterNode):
+    tag: str
+
+    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
+        return runtime.tag_filter(record, self.tag)
+
+
+@dataclass(frozen=True)
+class _FreetextFilterNode(_FilterNode):
+    text: str
+
+    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
+        return runtime.freetext_filter(record, self.text)
+
+
+@dataclass(frozen=True)
+class _AndFilterNode(_FilterNode):
+    left: _FilterNode
+    right: _FilterNode
+
+    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
+        return self.left.evaluate(record, runtime) and self.right.evaluate(record, runtime)
+
+
+@dataclass(frozen=True)
+class _OrFilterNode(_FilterNode):
+    left: _FilterNode
+    right: _FilterNode
+
+    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
+        return self.left.evaluate(record, runtime) or self.right.evaluate(record, runtime)
+
+
+@dataclass
+class _FilterRuntime:
+    named_filters: dict[str, Callable[[ImageRecord], bool]]
+    tag_filter: Callable[[ImageRecord, str], bool]
+    freetext_filter: Callable[[ImageRecord, str], bool]
+
+
+def _tokenize_filter_expression(expression: str) -> list[_FilterToken]:
+    tokens: list[_FilterToken] = []
+    index = 0
+    length = len(expression)
+
+    while index < length:
+        char = expression[index]
+
+        if char.isspace():
+            index += 1
+            continue
+
+        if char in "&|()":
+            tokens.append(_FilterToken(kind=char, value=char, position=index))
+            index += 1
+            continue
+
+        if char == '"':
+            start = index
+            index += 1
+            value_chars: list[str] = []
+            while index < length:
+                current = expression[index]
+                if current == "\\":
+                    index += 1
+                    if index >= length:
+                        raise FilterSyntaxError(f"Unfinished escape sequence at position {start + 1}.")
+                    value_chars.append(expression[index])
+                    index += 1
+                    continue
+                if current == '"':
+                    index += 1
+                    break
+                value_chars.append(current)
+                index += 1
+            else:
+                raise FilterSyntaxError(f"Missing closing quote for tag at position {start + 1}.")
+
+            tokens.append(_FilterToken(kind="STRING", value="".join(value_chars), position=start))
+            continue
+
+        if char == "'":
+            start = index
+            index += 1
+            value_chars: list[str] = []
+            while index < length:
+                current = expression[index]
+                if current == "\\":
+                    index += 1
+                    if index >= length:
+                        raise FilterSyntaxError(f"Unfinished escape sequence at position {start + 1}.")
+                    value_chars.append(expression[index])
+                    index += 1
+                    continue
+                if current == "'":
+                    index += 1
+                    break
+                value_chars.append(current)
+                index += 1
+            else:
+                raise FilterSyntaxError(f"Missing closing quote for freetext at position {start + 1}.")
+
+            tokens.append(_FilterToken(kind="FREETEXT", value="".join(value_chars), position=start))
+            continue
+
+        start = index
+        while index < length and (not expression[index].isspace()) and expression[index] not in "&|()\"":
+            index += 1
+
+        value = expression[start:index]
+        if not value:
+            raise FilterSyntaxError(f"Unexpected character at position {start + 1}.")
+        tokens.append(_FilterToken(kind="NAME", value=value, position=start))
+
+    return tokens
+
+
+def _parse_filter_expression(expression: str) -> _FilterNode | None:
+    tokens = _tokenize_filter_expression(expression)
+    if not tokens:
+        return None
+
+    position = 0
+
+    def _peek() -> _FilterToken | None:
+        if position >= len(tokens):
+            return None
+        return tokens[position]
+
+    def _consume(expected_kind: str | None = None) -> _FilterToken:
+        nonlocal position
+        token = _peek()
+        if token is None:
+            raise FilterSyntaxError("Unexpected end of filter expression.")
+        if expected_kind is not None and token.kind != expected_kind:
+            raise FilterSyntaxError(
+                f"Expected '{expected_kind}' at position {token.position + 1}, got '{token.value}'."
+            )
+        position += 1
+        return token
+
+    def _parse_primary() -> _FilterNode:
+        token = _peek()
+        if token is None:
+            raise FilterSyntaxError("Unexpected end of filter expression.")
+
+        if token.kind == "(":
+            _consume("(")
+            nested = _parse_or_expression()
+            closing = _peek()
+            if closing is None or closing.kind != ")":
+                at = token.position + 1 if closing is None else closing.position + 1
+                raise FilterSyntaxError(f"Missing ')' for group near position {at}.")
+            _consume(")")
+            return nested
+
+        if token.kind == "NAME":
+            _consume("NAME")
+            return _NamedFilterNode(name=token.value)
+
+        if token.kind == "STRING":
+            _consume("STRING")
+            return _TagFilterNode(tag=token.value)
+
+        if token.kind == "FREETEXT":
+            _consume("FREETEXT")
+            return _FreetextFilterNode(text=token.value)
+
+        raise FilterSyntaxError(f"Unexpected token '{token.value}' at position {token.position + 1}.")
+
+    def _parse_and_expression() -> _FilterNode:
+        node = _parse_primary()
+        while True:
+            token = _peek()
+            if token is None or token.kind != "&":
+                break
+            _consume("&")
+            node = _AndFilterNode(left=node, right=_parse_primary())
+        return node
+
+    def _parse_or_expression() -> _FilterNode:
+        node = _parse_and_expression()
+        while True:
+            token = _peek()
+            if token is None or token.kind != "|":
+                break
+            _consume("|")
+            node = _OrFilterNode(left=node, right=_parse_and_expression())
+        return node
+
+    parsed = _parse_or_expression()
+    trailing = _peek()
+    if trailing is not None:
+        raise FilterSyntaxError(
+            f"Unexpected token '{trailing.value}' at position {trailing.position + 1}."
+        )
+    return parsed
 
 
 class FolderLoadWorker(QObject):
@@ -331,7 +558,7 @@ class MainWindow(QMainWindow):
         self.list_widget.currentRowChanged.connect(self.on_selection_changed)
 
         self.filter_input = QLineEdit(self)
-        self.filter_input.setPlaceholderText("Filter (type 'fixup')")
+        self.filter_input.setPlaceholderText("Filter (fixup, \"tag\", 'text', &, |, parentheses)")
         self.filter_input.textChanged.connect(self._apply_image_filter)
 
         self.left_panel = QWidget(self)
@@ -449,6 +676,13 @@ class MainWindow(QMainWindow):
         self.ollama_retry_input.setText("3")
         self.ollama_retry_input.setMaximumWidth(60)
 
+        self.ollama_max_resolution_input = QLineEdit(self)
+        max_resolution_validator = QDoubleValidator(0.01, 1000.0, 3, self)
+        max_resolution_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self.ollama_max_resolution_input.setValidator(max_resolution_validator)
+        self.ollama_max_resolution_input.setText("5.0")
+        self.ollama_max_resolution_input.setMaximumWidth(80)
+
         server_row = QHBoxLayout()
         server_row.addWidget(self.ollama_server_input, stretch=1)
         server_row.addWidget(self.ollama_fetch_button)
@@ -472,6 +706,10 @@ class MainWindow(QMainWindow):
         generate_options_row.addSpacing(8)
         generate_options_row.addWidget(QLabel("Retries", self))
         generate_options_row.addWidget(self.ollama_retry_input)
+        generate_options_row.addSpacing(8)
+        generate_options_row.addWidget(QLabel("Query downscale", self))
+        generate_options_row.addWidget(self.ollama_max_resolution_input)
+        generate_options_row.addWidget(QLabel("(MPx)", self))
         generate_options_row.addStretch(1)
 
         gen_row = QHBoxLayout()
@@ -498,6 +736,7 @@ class MainWindow(QMainWindow):
         self._add_prompt_tab("description", "Description")
         self._add_prompt_tab("tagging", "Tagging")
         self._add_prompt_tab("validation", "Validation")
+        self._add_known_tags_tab()
         controls_layout.addWidget(self.controls_tabs)
 
         self.right_splitter = QSplitter(Qt.Orientation.Vertical, self)
@@ -563,6 +802,21 @@ class MainWindow(QMainWindow):
 
         self.controls_tabs.addTab(tab, title)
         self._update_prompt_status(kind)
+
+    def _add_known_tags_tab(self) -> None:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self.known_tags_list = QListWidget(self)
+        self.known_tags_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.known_tags_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        layout.addWidget(self.known_tags_list, stretch=1)
+
+        self.controls_tabs.addTab(tab, "Tags")
+        self._refresh_known_tags_list()
 
     def _update_prompt_status(self, kind: str, edited: bool = False) -> None:
         label = self.prompt_status_labels.get(kind)
@@ -660,9 +914,13 @@ class MainWindow(QMainWindow):
 
         max_resolution_mpx = self._cfg.get("ollama_max_resolution_mpx", 5)
         try:
-            max_pixels = int(float(max_resolution_mpx) * 1_000_000)
+            max_resolution_value = float(max_resolution_mpx)
+            if max_resolution_value <= 0:
+                raise ValueError()
         except (TypeError, ValueError):
-            max_pixels = 5_000_000
+            max_resolution_value = 5.0
+        self.ollama_max_resolution_input.setText(self._format_mpx(max_resolution_value))
+        max_pixels = max(1, int(max_resolution_value * 1_000_000))
         configure_runtime(max_image_pixels=max_pixels)
 
         if server:
@@ -854,6 +1112,40 @@ class MainWindow(QMainWindow):
             return 0
         return max(0, retries)
 
+    @staticmethod
+    def _format_mpx(value: float) -> str:
+        normalized = f"{float(value):.3f}".rstrip("0").rstrip(".")
+        if "." not in normalized:
+            normalized += ".0"
+        return normalized
+
+    def _ollama_max_resolution_mpx_value(self, show_message: bool = True) -> float:
+        raw_value = self.ollama_max_resolution_input.text().strip()
+        if not raw_value:
+            if show_message:
+                QMessageBox.warning(self, "Invalid query downscale", "Enter query downscale in megapixels.")
+            raise OllamaError("Enter query downscale in megapixels.")
+
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            if show_message:
+                QMessageBox.warning(self, "Invalid query downscale", "Query downscale must be a number.")
+            raise OllamaError("Query downscale must be a number.") from exc
+
+        if value <= 0:
+            if show_message:
+                QMessageBox.warning(self, "Invalid query downscale", "Query downscale must be greater than 0.")
+            raise OllamaError("Query downscale must be greater than 0.")
+
+        return value
+
+    def _apply_query_downscale_setting(self) -> float:
+        max_resolution_mpx = self._ollama_max_resolution_mpx_value()
+        max_pixels = max(1, int(max_resolution_mpx * 1_000_000))
+        configure_runtime(max_image_pixels=max_pixels)
+        return max_resolution_mpx
+
     def _update_ollama_controls(self) -> None:
         connected = bool(self.ollama_model_name.strip())
         if connected:
@@ -924,13 +1216,51 @@ class MainWindow(QMainWindow):
             self.list_widget.setCurrentRow(first_visible_row)
         self._ignore_selection_sync = False
 
-    def _is_fixup_filter_enabled(self) -> bool:
-        return self.filter_input.text().strip().casefold() == "fixup"
-
     def _record_matches_filter(self, record: ImageRecord) -> bool:
-        if not self._is_fixup_filter_enabled():
+        expression = self.filter_input.text().strip()
+        if not expression:
             return True
-        return existing_fixup_path_for_image(record.image_path) is not None
+
+        try:
+            parsed = _parse_filter_expression(expression)
+        except FilterSyntaxError:
+            return True
+
+        if parsed is None:
+            return True
+
+        runtime = self._build_filter_runtime()
+        return parsed.evaluate(record, runtime)
+
+    def _build_filter_runtime(self, tag_cache: dict[Path, set[str]] | None = None) -> _FilterRuntime:
+        named_filters: dict[str, Callable[[ImageRecord], bool]] = {
+            "fixup": lambda record: existing_fixup_path_for_image(record.image_path) is not None,
+        }
+        return _FilterRuntime(
+            named_filters=named_filters,
+            tag_filter=lambda record, tag: self._record_has_tag(record, tag, tag_cache=tag_cache),
+            freetext_filter=lambda record, text: self._record_contains_freetext(record, text),
+        )
+
+    def _record_has_tag(self, record: ImageRecord, tag: str, tag_cache: dict[Path, set[str]] | None = None) -> bool:
+        normalized = self._sanitize_annotation_text(tag).casefold()
+        if not normalized:
+            return False
+
+        if tag_cache is not None:
+            cached = tag_cache.get(record.image_path)
+            if cached is None:
+                cached = {item.casefold() for item in self._parse_tags(record.text)}
+                tag_cache[record.image_path] = cached
+            return normalized in cached
+
+        return normalized in {item.casefold() for item in self._parse_tags(record.text)}
+
+    def _record_contains_freetext(self, record: ImageRecord, text: str) -> bool:
+        query = text.casefold().strip()
+        if not query:
+            return False
+        return query in record.text.casefold()
 
     def _first_visible_row(self) -> int:
         for row in range(self.list_widget.count()):
@@ -939,16 +1269,65 @@ class MainWindow(QMainWindow):
                 return row
         return -1
 
+    def _visible_record_count(self) -> int:
+        visible = 0
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item is not None and not item.isHidden():
+                visible += 1
+        return visible
+
+    def _visible_position_for_row(self, row: int) -> int:
+        if row < 0:
+            return -1
+
+        position = 0
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item is None or item.isHidden():
+                continue
+            position += 1
+            if i == row:
+                return position
+        return -1
+
+    def _filtered_total_status_text(self, selected_row: int | None = None) -> str:
+        visible = self._visible_record_count()
+        total = len(self.records)
+        if selected_row is None:
+            return f"({visible} of {total})"
+
+        position = self._visible_position_for_row(selected_row)
+        if position > 0:
+            return f"({position} of {visible}, total {total})"
+        return f"({visible} of {total})"
+
     def _apply_image_filter(self, _text: str | None = None) -> None:
         selected_path: Path | None = None
         if 0 <= self.current_index < len(self.records):
             selected_path = self.records[self.current_index].image_path
 
+        expression = self.filter_input.text().strip()
+        parsed: _FilterNode | None = None
+        runtime: _FilterRuntime | None = None
+
+        if expression:
+            try:
+                parsed = _parse_filter_expression(expression)
+            except FilterSyntaxError as exc:
+                self.statusBar().showMessage(f"Invalid filter: {exc}")
+            else:
+                tag_cache: dict[Path, set[str]] = {}
+                runtime = self._build_filter_runtime(tag_cache=tag_cache)
+
         for row, record in enumerate(self.records):
             item = self.list_widget.item(row)
             if item is None:
                 continue
-            item.setHidden(not self._record_matches_filter(record))
+            is_match = True
+            if parsed is not None and runtime is not None:
+                is_match = parsed.evaluate(record, runtime)
+            item.setHidden(not is_match)
 
         if selected_path is not None:
             for row, record in enumerate(self.records):
@@ -967,6 +1346,7 @@ class MainWindow(QMainWindow):
         self.list_widget.clearSelection()
         self.current_index = -1
         self._update_fixup_button_state()
+        self.statusBar().showMessage(f"{self._filtered_total_status_text()} no images match filter")
 
     def _on_fixup_state_changed(self, image_path: Path | None = None) -> None:
         if image_path is None:
@@ -976,8 +1356,7 @@ class MainWindow(QMainWindow):
                 if record.image_path == image_path:
                     self._update_list_item_preview(index)
                     break
-        if self._is_fixup_filter_enabled():
-            self._apply_image_filter()
+        self._apply_image_filter()
         self._update_fixup_button_state()
 
     def _update_fixup_button_state(self) -> None:
@@ -1138,6 +1517,11 @@ class MainWindow(QMainWindow):
         if record is None:
             return
 
+        try:
+            regenerate_max_resolution_mpx = self._apply_query_downscale_setting()
+        except OllamaError:
+            return
+
         initial_fixup_record_indices = [
             i for i, item in enumerate(self.records)
             if existing_fixup_path_for_image(item.image_path) is not None
@@ -1159,16 +1543,18 @@ class MainWindow(QMainWindow):
         except ValueError:
             regenerate_retry_count = 0
 
-        def _capture_regenerate_settings(values: dict[str, int | bool]) -> None:
+        def _capture_regenerate_settings(values: dict[str, int | float | bool]) -> None:
             nonlocal regenerate_tags_enabled
             nonlocal regenerate_description_enabled
             nonlocal regenerate_timeout_seconds
             nonlocal regenerate_retry_count
+            nonlocal regenerate_max_resolution_mpx
 
             tags_enabled = values.get("tags_enabled")
             description_enabled = values.get("description_enabled")
             timeout_seconds = values.get("timeout_seconds")
             retry_count = values.get("retry_count")
+            max_resolution_mpx = values.get("max_resolution_mpx")
 
             if isinstance(tags_enabled, bool):
                 regenerate_tags_enabled = tags_enabled
@@ -1178,6 +1564,10 @@ class MainWindow(QMainWindow):
                 regenerate_timeout_seconds = max(1, timeout_seconds)
             if isinstance(retry_count, int):
                 regenerate_retry_count = max(0, retry_count)
+            if isinstance(max_resolution_mpx, (int, float)) and max_resolution_mpx > 0:
+                regenerate_max_resolution_mpx = float(max_resolution_mpx)
+                self.ollama_max_resolution_input.setText(self._format_mpx(regenerate_max_resolution_mpx))
+                configure_runtime(max_image_pixels=max(1, int(regenerate_max_resolution_mpx * 1_000_000)))
 
         while True:
             record = self._current_record()
@@ -1218,6 +1608,7 @@ class MainWindow(QMainWindow):
                 regenerate_description_enabled=regenerate_description_enabled,
                 regenerate_timeout_seconds=regenerate_timeout_seconds,
                 regenerate_retry_count=regenerate_retry_count,
+                regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
                 save_regenerate_settings=_capture_regenerate_settings,
             )
 
@@ -1368,6 +1759,7 @@ class MainWindow(QMainWindow):
         self.ollama_model_combo.setEnabled(not loading and self._ollama_thread is None)
         self.ollama_timeout_input.setEnabled(not loading and self._ollama_thread is None)
         self.ollama_retry_input.setEnabled(not loading and self._ollama_thread is None)
+        self.ollama_max_resolution_input.setEnabled(not loading and self._ollama_thread is None)
         self.ollama_use_button.setEnabled(not loading and self._ollama_thread is None)
         self.fixup_button.setEnabled(False)
         if loading:
@@ -1544,6 +1936,8 @@ class MainWindow(QMainWindow):
         if index < 0 or index >= len(self.records):
             self.current_index = -1
             self._update_fixup_button_state()
+            if self.records:
+                self.statusBar().showMessage(self._filtered_total_status_text())
             return
 
         self.current_index = index
@@ -1555,7 +1949,7 @@ class MainWindow(QMainWindow):
         self._populate_tag_list(tags)
         self.tag_input.clear()
         self._update_fixup_button_state()
-        self.statusBar().showMessage(f"({index + 1} of {len(self.records)}) {record.image_path}")
+        self.statusBar().showMessage(f"{self._filtered_total_status_text(selected_row=index)} {record.image_path}")
 
     def _show_image(self, image_path: Path) -> None:
         pixmap = QPixmap(str(image_path))
@@ -1589,6 +1983,20 @@ class MainWindow(QMainWindow):
             self._cfg["last_selected_image"] = str(record.image_path)
         else:
             self._cfg.pop("last_selected_image", None)
+
+        configured_downscale = self._cfg.get("ollama_max_resolution_mpx", 5)
+        try:
+            fallback_value = float(configured_downscale)
+            if fallback_value <= 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            fallback_value = 5.0
+
+        try:
+            self._cfg["ollama_max_resolution_mpx"] = self._ollama_max_resolution_mpx_value(show_message=False)
+        except OllamaError:
+            self._cfg["ollama_max_resolution_mpx"] = fallback_value
+
         _config.save(self._cfg)
         super().closeEvent(event)
 
@@ -1654,6 +2062,16 @@ class MainWindow(QMainWindow):
     def _refresh_tag_completions(self) -> None:
         suggestions = self._sorted_tag_suggestions()
         self.tag_suggestions_model.setStringList(suggestions)
+        self._refresh_known_tags_list()
+
+    def _refresh_known_tags_list(self) -> None:
+        if not hasattr(self, "known_tags_list"):
+            return
+
+        self.known_tags_list.clear()
+        for tag in self._sorted_tag_suggestions():
+            count = self.tag_counts.get(tag, 0)
+            self.known_tags_list.addItem(f"{tag} ({count})")
 
     def _add_tag_from_input(self) -> None:
         if self.current_index < 0 or self.current_index >= len(self.records):
@@ -1768,6 +2186,11 @@ class MainWindow(QMainWindow):
     def generate_with_ollama(self) -> None:
         if self._ollama_thread is not None and self._ollama_action_name == "Generate":
             self._request_stop_generation()
+            return
+
+        try:
+            self._apply_query_downscale_setting()
+        except OllamaError:
             return
 
         selected_indexes = self._selected_record_indexes()
@@ -1911,6 +2334,11 @@ class MainWindow(QMainWindow):
     def validate_tags_with_ollama(self) -> None:
         if self._ollama_thread is not None and self._ollama_action_name == "Validate":
             self._request_stop_validation()
+            return
+
+        try:
+            self._apply_query_downscale_setting()
+        except OllamaError:
             return
 
         selected_indexes = self._selected_record_indexes()
@@ -2073,6 +2501,7 @@ class MainWindow(QMainWindow):
         self.ollama_model_combo.setEnabled(False)
         self.ollama_timeout_input.setEnabled(False)
         self.ollama_retry_input.setEnabled(False)
+        self.ollama_max_resolution_input.setEnabled(False)
         self.ollama_use_button.setEnabled(False)
         self._ollama_action_name = action_name
         self._ollama_cancel = cancel_token
@@ -2543,6 +2972,7 @@ class MainWindow(QMainWindow):
         self.ollama_model_combo.setEnabled(True)
         self.ollama_timeout_input.setEnabled(True)
         self.ollama_retry_input.setEnabled(True)
+        self.ollama_max_resolution_input.setEnabled(True)
         self.ollama_use_button.setEnabled(True)
         self._update_fixup_button_state()
 

@@ -67,7 +67,8 @@ def open_fixup_dialog_for_image(
     regenerate_description_enabled: bool = True,
     regenerate_timeout_seconds: int = 300,
     regenerate_retry_count: int = 3,
-    save_regenerate_settings: Callable[[dict[str, int | bool]], None] | None = None,
+    regenerate_max_resolution_mpx: float = 5.0,
+    save_regenerate_settings: Callable[[dict[str, int | float | bool]], None] | None = None,
 ) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
     fixup_path = existing_fixup_path_for_image(image_path)
     if fixup_path is None:
@@ -125,6 +126,7 @@ def open_fixup_dialog_for_image(
         regenerate_description_enabled=regenerate_description_enabled,
         regenerate_timeout_seconds=regenerate_timeout_seconds,
         regenerate_retry_count=regenerate_retry_count,
+        regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
         parent=parent,
     )
 
@@ -134,13 +136,25 @@ def open_fixup_dialog_for_image(
         width = initial_geometry.get("width")
         height = initial_geometry.get("height")
         if all(isinstance(value, int) for value in (x, y, width, height)) and width > 0 and height > 0:
-            dialog.setGeometry(x, y, width, height)
+            screen = dialog.screen()
+            available = screen.availableGeometry() if screen is not None else None
+            if available is None:
+                dialog.setGeometry(x, y, width, height)
+            else:
+                clamped_width = min(width, available.width())
+                clamped_height = min(height, available.height())
+                max_x = available.left() + max(0, available.width() - clamped_width)
+                max_y = available.top() + max(0, available.height() - clamped_height)
+                clamped_x = min(max(x, available.left()), max_x)
+                clamped_y = min(max(y, available.top()), max_y)
+                dialog.setGeometry(clamped_x, clamped_y, clamped_width, clamped_height)
 
     result = dialog.exec()
 
     if save_regenerate_settings is not None:
         timeout_raw = dialog.regenerate_timeout_input.text().strip()
         retry_raw = dialog.regenerate_retry_input.text().strip()
+        max_resolution_raw = dialog.regenerate_max_resolution_input.text().strip()
         try:
             timeout_value = int(timeout_raw) if timeout_raw else max(1, int(regenerate_timeout_seconds))
         except ValueError:
@@ -149,6 +163,17 @@ def open_fixup_dialog_for_image(
             retry_value = int(retry_raw) if retry_raw else max(0, int(regenerate_retry_count))
         except ValueError:
             retry_value = max(0, int(regenerate_retry_count))
+        try:
+            max_resolution_value = float(max_resolution_raw) if max_resolution_raw else float(regenerate_max_resolution_mpx)
+            if max_resolution_value <= 0:
+                raise ValueError()
+        except (TypeError, ValueError):
+            try:
+                max_resolution_value = float(regenerate_max_resolution_mpx)
+                if max_resolution_value <= 0:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                max_resolution_value = 5.0
 
         save_regenerate_settings(
             {
@@ -156,6 +181,7 @@ def open_fixup_dialog_for_image(
                 "description_enabled": dialog.regenerate_description_checkbox.isChecked(),
                 "timeout_seconds": max(1, timeout_value),
                 "retry_count": max(0, retry_value),
+                "max_resolution_mpx": max_resolution_value,
             }
         )
 
