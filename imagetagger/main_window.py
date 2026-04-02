@@ -697,11 +697,23 @@ class MainWindow(QMainWindow):
         self.filter_input.setPlaceholderText("Filter (fixup, \"tag\", 'text', &, |, parentheses)")
         self.filter_input.textChanged.connect(self._apply_image_filter)
 
+        self.filter_help_button = QPushButton("?", self)
+        self.filter_help_button.setFixedWidth(26)
+        self.filter_help_button.setToolTip("Show filter syntax help")
+        self.filter_help_button.clicked.connect(self._show_filter_rules_dialog)
+
+        filter_row = QWidget(self)
+        filter_row_layout = QHBoxLayout(filter_row)
+        filter_row_layout.setContentsMargins(0, 0, 0, 0)
+        filter_row_layout.setSpacing(6)
+        filter_row_layout.addWidget(self.filter_input, stretch=1)
+        filter_row_layout.addWidget(self.filter_help_button, stretch=0)
+
         self.left_panel = QWidget(self)
         left_layout = QVBoxLayout(self.left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
-        left_layout.addWidget(self.filter_input, stretch=0)
+        left_layout.addWidget(filter_row, stretch=0)
         left_layout.addWidget(self.list_widget, stretch=1)
 
         self.select_all_images_action = QAction("Select All Images", self)
@@ -1367,6 +1379,22 @@ class MainWindow(QMainWindow):
 
         runtime = self._build_filter_runtime()
         return parsed.evaluate(record, runtime)
+
+    def _show_filter_rules_dialog(self) -> None:
+        rules_text = (
+            "Filter rules:\n\n"
+            "- fixup: show images with fixup files\n"
+            "- \"tag\": match an exact tag\n"
+            "- 'text': match free text inside annotation content\n"
+            "- &: AND operator\n"
+            "- |: OR operator\n"
+            "- ( ... ): group expressions\n\n"
+            "Examples:\n"
+            "- fixup & \"landscape\"\n"
+            "- \"portrait\" | 'sunset'\n"
+            "- (fixup & \"animal\") | 'night'"
+        )
+        QMessageBox.information(self, "Filter rules", rules_text)
 
     def _build_filter_runtime(self, tag_cache: dict[Path, set[str]] | None = None) -> _FilterRuntime:
         named_filters: dict[str, Callable[[ImageRecord], bool]] = {

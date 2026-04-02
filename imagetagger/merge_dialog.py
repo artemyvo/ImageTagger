@@ -488,6 +488,26 @@ class FixupDialog(QDialog):
         self.merge_and_next_alt_action.triggered.connect(self._merge_and_next)
         self.addAction(self.merge_and_next_alt_action)
 
+        self.focus_tag_input_action = QAction("Focus Tag Input", self)
+        self.focus_tag_input_action.setShortcut(QKeySequence("Alt+T"))
+        self.focus_tag_input_action.triggered.connect(self._focus_left_tag_input)
+        self.addAction(self.focus_tag_input_action)
+
+        self.undo_alt_action = QAction("Undo", self)
+        self.undo_alt_action.setShortcut(QKeySequence("Alt+U"))
+        self.undo_alt_action.triggered.connect(self._undo_merge)
+        self.addAction(self.undo_alt_action)
+
+        self.prev_actionable_row_action = QAction("Previous Actionable Row", self)
+        self.prev_actionable_row_action.setShortcut(QKeySequence("Alt+Up"))
+        self.prev_actionable_row_action.triggered.connect(self._activate_previous_actionable_row)
+        self.addAction(self.prev_actionable_row_action)
+
+        self.next_actionable_row_action = QAction("Next Actionable Row", self)
+        self.next_actionable_row_action.setShortcut(QKeySequence("Alt+Down"))
+        self.next_actionable_row_action.triggered.connect(self._activate_next_actionable_row)
+        self.addAction(self.next_actionable_row_action)
+
         self.left_tag_input = QLineEdit(self)
         self.left_tag_input.setPlaceholderText("Type a tag and press Enter")
         self.left_tag_input.returnPressed.connect(self._add_left_tag_from_input)
@@ -508,7 +528,7 @@ class FixupDialog(QDialog):
 
         self.comparison_table = QTableWidget(self)
         self.comparison_table.setColumnCount(3)
-        self.comparison_table.setHorizontalHeaderLabels(["Existing", "", "Proposed"])
+        self.comparison_table.setHorizontalHeaderLabels(["Current", "", "Proposed"])
         self.comparison_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.comparison_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.comparison_table.setWordWrap(True)
@@ -604,10 +624,6 @@ class FixupDialog(QDialog):
         self.accept_button.setToolTip("Accept all proposed rows and merge")
         self.accept_button.clicked.connect(self._accept_all_without_close)
 
-        self.reject_button = QPushButton("Reject", self)
-        self.reject_button.setToolTip("Reject this fixup")
-        self.reject_button.clicked.connect(self._reject_without_close)
-
         self.merge_button = QPushButton("Merge", self)
         self.merge_button.setToolTip("Apply current merged annotations")
         self.merge_button.clicked.connect(self._merge_without_close)
@@ -617,17 +633,9 @@ class FixupDialog(QDialog):
         self.undo_button.setToolTip("Undo the last merge or local changes")
         self.undo_button.clicked.connect(self._undo_merge)
 
-        self.accept_next_button = QPushButton("Accept and Next", self)
-        self.accept_next_button.setToolTip("Accept all proposed rows, merge, and go to next item")
-        self.accept_next_button.clicked.connect(self._accept_and_next)
-
-        self.reject_next_button = QPushButton("Reject and Next", self)
-        self.reject_next_button.setToolTip("Reject this fixup and go to next item")
-        self.reject_next_button.clicked.connect(self._reject_and_next)
-
         self.merge_next_button = QPushButton("Merge and Next", self)
         self.merge_next_button.setShortcut(QKeySequence("Alt+Enter"))
-        self.merge_next_button.setToolTip("Apply current merged annotations and go to next item (Alt+Enter)")
+        self.merge_next_button.setToolTip("Apply current annotations and go to next item, even with no local edits (Alt+Enter)")
         self.merge_next_button.clicked.connect(self._merge_and_next)
 
         self.prev_button = QPushButton("Prev", self)
@@ -645,11 +653,8 @@ class FixupDialog(QDialog):
         for button in (
             self.regenerate_button,
             self.accept_button,
-            self.reject_button,
             self.merge_button,
             self.undo_button,
-            self.accept_next_button,
-            self.reject_next_button,
             self.merge_next_button,
             self.prev_button,
             self.next_button,
@@ -683,12 +688,9 @@ class FixupDialog(QDialog):
         button_row = QHBoxLayout()
         button_row.addWidget(self.prev_button)
         button_row.addWidget(self.accept_button)
-        button_row.addWidget(self.reject_button)
         button_row.addWidget(self.merge_button)
         button_row.addWidget(self.undo_button)
         button_row.addStretch(1)
-        button_row.addWidget(self.accept_next_button)
-        button_row.addWidget(self.reject_next_button)
         button_row.addWidget(self.merge_next_button)
         button_row.addWidget(self.next_button)
 
@@ -697,6 +699,7 @@ class FixupDialog(QDialog):
         layout.addWidget(splitter, stretch=1)
         layout.addLayout(button_row)
 
+        self._update_merge_next_button_presentation()
         self._refresh_button_state()
         self._update_difference_highlights()
         self._refresh_widget_item_sizes()
@@ -734,6 +737,10 @@ class FixupDialog(QDialog):
         QTimer.singleShot(0, self.left_tag_input.setFocus)
         self._refresh_button_state()
         self._update_difference_highlights()
+
+    def _focus_left_tag_input(self) -> None:
+        self.left_tag_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.left_tag_input.selectAll()
 
     def _select_existing_tag_row(self, normalized_key: str) -> None:
         if not normalized_key:
@@ -951,6 +958,49 @@ class FixupDialog(QDialog):
             target_row = min(max(0, self._last_action_table_row), row_count - 1)
         return self._select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
 
+    def _activate_last_comparison_row(self) -> bool:
+        row_count = self.comparison_table.rowCount()
+        if row_count <= 0:
+            return False
+
+        return self._select_comparison_row(row_count - 1, Qt.FocusReason.ShortcutFocusReason)
+
+    def _row_needs_addressing(self, row: int) -> bool:
+        if row < 0 or row >= self.comparison_table.rowCount():
+            return False
+
+        action_host = self.comparison_table.cellWidget(row, 1)
+        if action_host is None:
+            return False
+
+        for btn in action_host.findChildren(QPushButton):
+            if btn.text() in ("←", "✕"):
+                return True
+        return False
+
+    def _activate_adjacent_actionable_row(self, step: int) -> bool:
+        row_count = self.comparison_table.rowCount()
+        if row_count <= 0:
+            return False
+
+        current_row = self.comparison_table.currentRow()
+        if current_row < 0:
+            current_row = -1 if step > 0 else row_count
+
+        row = current_row + step
+        while 0 <= row < row_count:
+            if self._row_needs_addressing(row):
+                return self._select_comparison_row(row, Qt.FocusReason.ShortcutFocusReason)
+            row += step
+
+        return False
+
+    def _activate_previous_actionable_row(self) -> None:
+        self._activate_adjacent_actionable_row(-1)
+
+    def _activate_next_actionable_row(self) -> None:
+        self._activate_adjacent_actionable_row(1)
+
     def _merge_proposed_row_from_table(self, table_row: int, right_index: int) -> None:
         self._remember_last_action_table_row(table_row)
         self._apply_proposed_rows([right_index])
@@ -966,22 +1016,29 @@ class FixupDialog(QDialog):
             item = self.right_list.takeItem(row)
             del item
 
+    def _update_merge_next_button_presentation(self) -> None:
+        if self.next_button.isEnabled():
+            self.merge_next_button.setText("Merge and Next")
+            self.merge_next_button.setToolTip(
+                "Apply current annotations and go to next item, even with no local edits (Alt+Enter)"
+            )
+            self.merge_and_next_alt_action.setText("Merge and Next")
+        else:
+            self.merge_next_button.setText("Merge")
+            self.merge_next_button.setToolTip("Apply current annotations and resolve this fixup (Alt+Enter)")
+            self.merge_and_next_alt_action.setText("Merge")
+
     def _refresh_button_state(self) -> None:
         has_right_items = self.right_list.count() > 0
         is_resolved = self._resolved
         has_local_changes = self._has_local_changes()
         has_dialog_changes = self._has_dialog_state_changes()
         regenerate_in_progress = self._regenerate_thread is not None
-        can_navigate_next = self.next_button.isEnabled()
+        self._update_merge_next_button_presentation()
         self.accept_button.setEnabled(has_right_items and not is_resolved and not regenerate_in_progress)
-        self.reject_button.setEnabled(not is_resolved and not regenerate_in_progress)
         self.merge_button.setEnabled(has_local_changes and not regenerate_in_progress)
         self.undo_button.setEnabled((self._undo_available or has_dialog_changes) and not regenerate_in_progress)
-        self.accept_next_button.setEnabled(
-            has_right_items and not is_resolved and can_navigate_next and not regenerate_in_progress
-        )
-        self.reject_next_button.setEnabled(not is_resolved and can_navigate_next and not regenerate_in_progress)
-        self.merge_next_button.setEnabled(has_local_changes and can_navigate_next and not regenerate_in_progress)
+        self.merge_next_button.setEnabled(not regenerate_in_progress)
 
     def _has_local_changes(self) -> bool:
         current = [
@@ -1040,7 +1097,9 @@ class FixupDialog(QDialog):
             if left_description_index is not None and left_description_index not in protected_left_indexes:
                 left_matches[left_description_index] = 0
                 right_matches[0] = left_description_index
-                right_match_kind[0] = "description"
+                left_description_key = self._normalized_compare_key(left_texts[left_description_index])
+                right_description_key = self._normalized_compare_key(right_texts[0])
+                right_match_kind[0] = "exact" if left_description_key == right_description_key else "description"
 
         # Pass 1: exact matches
         for left_index, text in enumerate(left_texts):
@@ -1534,6 +1593,10 @@ class FixupDialog(QDialog):
                         target_row = min(current_row, new_row_count - 1)
                         self._select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
                     return True
+            if event.key() == Qt.Key.Key_Home and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                return self._activate_first_comparison_row()
+            if event.key() == Qt.Key.Key_End and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                return self._activate_last_comparison_row()
 
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
             if event.modifiers() != Qt.KeyboardModifier.NoModifier:
@@ -1567,6 +1630,34 @@ class FixupDialog(QDialog):
                 if self._activate_adjacent_row_for_last_action(step):
                     return True
                 if event.key() == Qt.Key.Key_Down and self._activate_first_comparison_row():
+                    return True
+
+        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End):
+            if event.modifiers() != Qt.KeyboardModifier.NoModifier:
+                return super().eventFilter(watched, event)
+
+            activate_row = self._activate_first_comparison_row if event.key() == Qt.Key.Key_Home else self._activate_last_comparison_row
+            left_input_empty = not self.left_tag_input.text().strip()
+
+            focused = self.focusWidget()
+            if focused is None:
+                if activate_row():
+                    return True
+                return super().eventFilter(watched, event)
+
+            if focused is self.left_tag_input:
+                if left_input_empty and activate_row():
+                    return True
+                return super().eventFilter(watched, event)
+
+            if focused is self.comparison_table or self.comparison_table.isAncestorOf(focused):
+                return super().eventFilter(watched, event)
+
+            if isinstance(focused, (QLineEdit, QTextEdit, QAbstractItemView, QPushButton, QCheckBox)):
+                return super().eventFilter(watched, event)
+
+            if self.isAncestorOf(focused):
+                if activate_row():
                     return True
 
         return super().eventFilter(watched, event)
@@ -1910,7 +2001,22 @@ class FixupDialog(QDialog):
         regenerate_tags = self.regenerate_tags_checkbox.isChecked()
 
         final_description = description if regenerate_description else current_description
-        final_tags = tags if regenerate_tags else current_tags
+        if regenerate_tags:
+            existing_keys = {
+                self._normalized_compare_key(tag)
+                for tag in current_tags
+                if self._normalized_compare_key(tag)
+            }
+            appended_tags: list[str] = []
+            for tag in tags:
+                key = self._normalized_compare_key(tag)
+                if not key or key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                appended_tags.append(tag)
+            final_tags = current_tags + appended_tags
+        else:
+            final_tags = current_tags
         exact_only_for_tags = True if regenerate_tags else self._exact_match_only_for_tags
 
         self._set_proposed_annotations(
@@ -2056,13 +2162,6 @@ class FixupDialog(QDialog):
         self.accept_all()
         return self._merge_without_close()
 
-    def _reject_without_close(self) -> bool:
-        if self._resolve_fixup():
-            self._undo_available = True
-            self._refresh_button_state()
-            return True
-        return False
-
     def _undo_merge(self) -> None:
         if not self._undo_available and not self._has_dialog_state_changes():
             return
@@ -2089,14 +2188,6 @@ class FixupDialog(QDialog):
         self._cancel_regenerate(discard_result=True)
         self.done(self.NAVIGATE_NEXT_CODE)
 
-    def _accept_and_next(self) -> None:
-        if self._accept_all_without_close():
-            self._navigate_next()
-
-    def _reject_and_next(self) -> None:
-        if self._reject_without_close():
-            self._navigate_next()
-
     def _merge_and_next(self) -> None:
-        if self._merge_without_close():
+        if self._merge_without_close() and self.next_button.isEnabled():
             self._navigate_next()
