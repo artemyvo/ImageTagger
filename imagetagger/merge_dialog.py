@@ -457,6 +457,7 @@ class FixupDialog(QDialog):
         self._protected_existing_keys: set[str] = set()
         self._updating_comparison_table = False
         self._pending_edit_refresh = False
+        self._last_action_table_row: int | None = None
         self._image_path = image_path
         self._ollama_server_url = ollama_server_url.strip()
         self._ollama_model_name = ollama_model_name.strip()
@@ -464,6 +465,7 @@ class FixupDialog(QDialog):
         self._regenerate_worker: RegenerateWorker | None = None
         self._regenerate_cancel: OllamaCancellation | None = None
         self._discard_regenerate_result = False
+        self._global_key_filter_installed = False
 
         self.left_list = QListWidget(self)
         self.left_list.setItemDelegate(DiffHighlightDelegate(self.left_list))
@@ -480,7 +482,9 @@ class FixupDialog(QDialog):
         self.addAction(self.remove_left_tag_action)
 
         self.merge_and_next_alt_action = QAction("Merge and Next", self)
-        self.merge_and_next_alt_action.setShortcut(QKeySequence("Alt+Return"))
+        self.merge_and_next_alt_action.setShortcuts(
+            [QKeySequence("Alt+Enter"), QKeySequence("Alt+Return")]
+        )
         self.merge_and_next_alt_action.triggered.connect(self._merge_and_next)
         self.addAction(self.merge_and_next_alt_action)
 
@@ -571,7 +575,9 @@ class FixupDialog(QDialog):
         self.regenerate_max_resolution_input.setText(self._format_mpx(max_resolution_value))
         self.regenerate_max_resolution_input.setMaximumWidth(80)
 
-        self.regenerate_button = QPushButton("Regenerate", self)
+        self.regenerate_button = QPushButton("&Regenerate", self)
+        self.regenerate_button.setShortcut(QKeySequence("Alt+R"))
+        self.regenerate_button.setToolTip("Regenerate proposed annotations (Alt+R)")
         self.regenerate_button.clicked.connect(self._regenerate_proposed_annotations)
 
         self.regenerate_status_label = QLabel(self)
@@ -595,39 +601,33 @@ class FixupDialog(QDialog):
             self._add_right_item(tag)
 
         self.accept_button = QPushButton("Accept", self)
-        self.accept_button.setShortcut(QKeySequence("Alt+A"))
-        self.accept_button.setToolTip("Accept all proposed rows and merge (Alt+A)")
+        self.accept_button.setToolTip("Accept all proposed rows and merge")
         self.accept_button.clicked.connect(self._accept_all_without_close)
 
         self.reject_button = QPushButton("Reject", self)
-        self.reject_button.setShortcut(QKeySequence("Alt+R"))
-        self.reject_button.setToolTip("Reject this fixup (Alt+R)")
+        self.reject_button.setToolTip("Reject this fixup")
         self.reject_button.clicked.connect(self._reject_without_close)
 
         self.merge_button = QPushButton("Merge", self)
-        self.merge_button.setShortcut(QKeySequence("Alt+M"))
-        self.merge_button.setToolTip("Apply current merged annotations (Alt+M)")
+        self.merge_button.setToolTip("Apply current merged annotations")
         self.merge_button.clicked.connect(self._merge_without_close)
 
         self.undo_button = QPushButton("Undo", self)
         self.undo_button.setEnabled(False)
-        self.undo_button.setShortcut(QKeySequence("Alt+U"))
-        self.undo_button.setToolTip("Undo the last merge or local changes (Alt+U)")
+        self.undo_button.setToolTip("Undo the last merge or local changes")
         self.undo_button.clicked.connect(self._undo_merge)
 
         self.accept_next_button = QPushButton("Accept and Next", self)
-        self.accept_next_button.setShortcut(QKeySequence("Alt+Shift+A"))
-        self.accept_next_button.setToolTip("Accept all proposed rows, merge, and go to next item (Alt+Shift+A)")
+        self.accept_next_button.setToolTip("Accept all proposed rows, merge, and go to next item")
         self.accept_next_button.clicked.connect(self._accept_and_next)
 
         self.reject_next_button = QPushButton("Reject and Next", self)
-        self.reject_next_button.setShortcut(QKeySequence("Alt+Shift+R"))
-        self.reject_next_button.setToolTip("Reject this fixup and go to next item (Alt+Shift+R)")
+        self.reject_next_button.setToolTip("Reject this fixup and go to next item")
         self.reject_next_button.clicked.connect(self._reject_and_next)
 
         self.merge_next_button = QPushButton("Merge and Next", self)
-        self.merge_next_button.setShortcut(QKeySequence("Alt+Shift+M"))
-        self.merge_next_button.setToolTip("Apply current merged annotations and go to next item (Alt+Shift+M, Alt+Enter)")
+        self.merge_next_button.setShortcut(QKeySequence("Alt+Enter"))
+        self.merge_next_button.setToolTip("Apply current merged annotations and go to next item (Alt+Enter)")
         self.merge_next_button.clicked.connect(self._merge_and_next)
 
         self.prev_button = QPushButton("Prev", self)
@@ -921,6 +921,45 @@ class FixupDialog(QDialog):
                 else:
                     self._add_left_item(proposed_text)
                 existing_keys.add(key)
+
+    def _remember_last_action_table_row(self, row: int) -> None:
+        if 0 <= row < len(self._table_row_map):
+            self._last_action_table_row = row
+
+    def _select_comparison_row(self, row: int, focus_reason: Qt.FocusReason) -> bool:
+        row_count = self.comparison_table.rowCount()
+        if row < 0 or row >= row_count:
+            return False
+
+        self.comparison_table.setFocus(focus_reason)
+        self.comparison_table.clearSelection()
+        self.comparison_table.setCurrentCell(row, 0)
+        self.comparison_table.selectRow(row)
+        return True
+
+    def _activate_adjacent_row_for_last_action(self, step: int) -> bool:
+        if self._last_action_table_row is None:
+            return False
+
+        row_count = self.comparison_table.rowCount()
+        if row_count <= 0:
+            return False
+
+        if step < 0:
+            target_row = min(max(0, self._last_action_table_row - 1), row_count - 1)
+        else:
+            target_row = min(max(0, self._last_action_table_row), row_count - 1)
+        return self._select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
+
+    def _merge_proposed_row_from_table(self, table_row: int, right_index: int) -> None:
+        self._remember_last_action_table_row(table_row)
+        self._apply_proposed_rows([right_index])
+        self._refresh_button_state()
+        self._update_difference_highlights()
+
+    def _remove_left_item_from_table(self, table_row: int, text: str) -> None:
+        self._remember_last_action_table_row(table_row)
+        self._remove_left_item(text)
 
     def _remove_right_rows(self, rows: list[int]) -> None:
         for row in sorted(rows, reverse=True):
@@ -1343,15 +1382,15 @@ class FixupDialog(QDialog):
                 if left_index is not None and right_index is not None:
                     if right_match_kind.get(right_index) != "exact":
                         action_text = "←"
-                        callback = lambda idx=right_index: self._apply_proposed_rows([idx]) or self._refresh_button_state() or self._update_difference_highlights()
+                        callback = lambda table_row=row, idx=right_index: self._merge_proposed_row_from_table(table_row, idx)
                 elif right_index is not None:
                     action_text = "←"
-                    callback = lambda idx=right_index: self._apply_proposed_rows([idx]) or self._refresh_button_state() or self._update_difference_highlights()
+                    callback = lambda table_row=row, idx=right_index: self._merge_proposed_row_from_table(table_row, idx)
                 elif left_index is not None:
                     left_text = left_texts[left_index]
                     if not self._is_protected_existing_text(left_text):
                         action_text = "✕"
-                        callback = lambda value=left_text: self._remove_left_item(value)
+                        callback = lambda table_row=row, value=left_text: self._remove_left_item_from_table(table_row, value)
 
                 self._set_action_cell(row, action_text, callback)
         finally:
@@ -1442,6 +1481,11 @@ class FixupDialog(QDialog):
         if target_row < 0:
             return
 
+        for table_row, (_left_index, right_index) in enumerate(self._table_row_map):
+            if right_index == target_row:
+                self._remember_last_action_table_row(table_row)
+                break
+
         self._apply_proposed_rows([target_row])
         self._refresh_button_state()
         self._update_difference_highlights()
@@ -1481,14 +1525,50 @@ class FixupDialog(QDialog):
                                 break
                 if right_indexes:
                     current_row = self.comparison_table.currentRow()
+                    self._remember_last_action_table_row(current_row)
                     self._apply_proposed_rows(right_indexes)
                     self._refresh_button_state()
                     self._update_difference_highlights()
                     new_row_count = self.comparison_table.rowCount()
                     if new_row_count > 0 and current_row >= 0:
                         target_row = min(current_row, new_row_count - 1)
-                        self.comparison_table.setCurrentCell(target_row, 0)
+                        self._select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
                     return True
+
+        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            if event.modifiers() != Qt.KeyboardModifier.NoModifier:
+                return super().eventFilter(watched, event)
+
+            step = -1 if event.key() == Qt.Key.Key_Up else 1
+            left_input_empty = not self.left_tag_input.text().strip()
+
+            focused = self.focusWidget()
+            if focused is None:
+                if self._activate_adjacent_row_for_last_action(step):
+                    return True
+                if event.key() == Qt.Key.Key_Down and self._activate_first_comparison_row():
+                    return True
+                return super().eventFilter(watched, event)
+
+            if focused is self.left_tag_input:
+                if left_input_empty and self._activate_adjacent_row_for_last_action(step):
+                    return True
+                if event.key() == Qt.Key.Key_Down and left_input_empty and self._activate_first_comparison_row():
+                    return True
+                return super().eventFilter(watched, event)
+
+            if focused is self.comparison_table or self.comparison_table.isAncestorOf(focused):
+                return super().eventFilter(watched, event)
+
+            if isinstance(focused, (QLineEdit, QTextEdit, QAbstractItemView, QPushButton, QCheckBox)):
+                return super().eventFilter(watched, event)
+
+            if self.isAncestorOf(focused):
+                if self._activate_adjacent_row_for_last_action(step):
+                    return True
+                if event.key() == Qt.Key.Key_Down and self._activate_first_comparison_row():
+                    return True
+
         return super().eventFilter(watched, event)
 
     def _remove_selected_left_items(self) -> None:
@@ -1529,6 +1609,13 @@ class FixupDialog(QDialog):
         if new_row_count > 0:
             target_row = min(min_selected_row, new_row_count - 1)
             self.comparison_table.setCurrentCell(target_row, 0)
+
+    def _activate_first_comparison_row(self) -> bool:
+        row_count = self.comparison_table.rowCount()
+        if row_count <= 0:
+            return False
+
+        return self._select_comparison_row(0, Qt.FocusReason.ShortcutFocusReason)
 
     def selected_annotations(self) -> list[str]:
         return self._current_texts(self.left_list)
@@ -1603,7 +1690,7 @@ class FixupDialog(QDialog):
             self.regenerate_button.setText("Regenerating...")
             return
 
-        self.regenerate_button.setText("Regenerate")
+        self.regenerate_button.setText("&Regenerate")
         self.regenerate_button.setEnabled(connected and options_selected and self._image_path is not None)
         if not connected:
             self.regenerate_status_label.setText("Regenerate is disabled until an Ollama model is connected in the main window.")
@@ -1902,6 +1989,11 @@ class FixupDialog(QDialog):
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
+        if not self._global_key_filter_installed:
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+                self._global_key_filter_installed = True
         self.comparison_table.itemSelectionChanged.connect(self._refresh_button_state)
         self._update_action_column_metrics()
         self._update_difference_highlights()
@@ -1920,6 +2012,11 @@ class FixupDialog(QDialog):
             self._update_difference_highlights()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._global_key_filter_installed:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+            self._global_key_filter_installed = False
         self._cancel_regenerate(discard_result=True)
         super().closeEvent(event)
 

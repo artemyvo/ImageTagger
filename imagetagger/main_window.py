@@ -4,9 +4,12 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
+import os
 from pathlib import Path
+import threading
 import time
 from typing import Callable, List
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageCms, UnidentifiedImageError
 
@@ -39,6 +42,7 @@ from PyQt6.QtWidgets import (
 
 from imagetagger import config as _config
 from imagetagger.annotations import parse_tags_text, sanitize_annotation_text
+from imagetagger.io_utils import atomic_write_text
 from imagetagger.merge_actions import (
     clear_fixup_files_for_image,
     existing_fixup_path_for_image,
@@ -315,10 +319,22 @@ class FolderLoadWorker(QObject):
     finished = pyqtSignal(int, str)
     failed = pyqtSignal(str)
     icc_warning = pyqtSignal(str)
+    scan_ready = pyqtSignal(int)
+    collision_detected = pyqtSignal(str, str)
 
-    def __init__(self, folder: Path) -> None:
+    def __init__(self, folder: Path, max_thread_cap: int = 8) -> None:
         super().__init__()
         self.folder = folder
+        self._max_thread_cap = max(1, int(max_thread_cap))
+        self._cancelled = False
+        self._allow_processing = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self._allow_processing.set()
+
+    def allow_processing(self) -> None:
+        self._allow_processing.set()
 
     @staticmethod
     def _has_invalid_icc_profile(image_path: Path) -> bool:
@@ -339,7 +355,13 @@ class FolderLoadWorker(QObject):
         except ImageCms.PyCMSError:
             return True
 
-    def run(self) -> None:
+    def _scan_folder(self) -> tuple[list[Path], tuple[Path, Path] | None]:
+        """
+        Scan the folder once, returning sorted image paths and the first collision (if any).
+
+        Collision definition: two image files that would map to the same `.txt` file
+        (same stem after suffix replacement), but with different image extensions.
+        """
         try:
             image_paths = sorted(
                 [
@@ -350,48 +372,162 @@ class FolderLoadWorker(QObject):
                 key=lambda p: p.relative_to(self.folder).as_posix().lower(),
             )
         except OSError as exc:
+            raise exc
+
+        seen_by_txt_path: dict[str, Path] = {}
+        for image_path in image_paths:
+            txt_key = str(image_path.with_suffix(".txt")).casefold()
+            existing = seen_by_txt_path.get(txt_key)
+            if existing is None:
+                seen_by_txt_path[txt_key] = image_path
+                continue
+
+            if existing.suffix.lower() != image_path.suffix.lower():
+                return image_paths, (existing, image_path)
+
+        return image_paths, None
+
+    @staticmethod
+    def _thumbnail_rgba_bytes(image_path: Path) -> tuple[dict | None, bool]:
+        """
+        Build a small RGBA thumbnail using Pillow.
+
+        Returns: (thumbnail_payload, icc_invalid)
+        where thumbnail_payload is dict(width, height, bytes, bytes_per_line) suitable for
+        reconstructing a QImage on the GUI thread.
+        """
+        try:
+            img = Image.open(image_path)
+        except (OSError, UnidentifiedImageError):
+            return None, False
+
+        with img:
+            # Validate ICC profile using the raw ICC bytes (if present).
+            raw_profile = img.info.get("icc_profile")
+            icc_invalid = False
+            if raw_profile:
+                if isinstance(raw_profile, str):
+                    raw_profile = raw_profile.encode("utf-8", errors="ignore")
+                if isinstance(raw_profile, (bytes, bytearray)):
+                    try:
+                        ImageCms.ImageCmsProfile(BytesIO(bytes(raw_profile)))
+                    except ImageCms.PyCMSError:
+                        icc_invalid = True
+
+            # Pillow doesn't auto-apply EXIF orientation, so we transpose to match Qt behavior.
+            try:
+                from PIL import ImageOps
+
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                # If exif_transpose fails, fall back to the original decoded orientation.
+                pass
+
+            # Downscale aggressively to 96x96-ish so we don't decode full-size into memory.
+            thumb = img.convert("RGBA")
+            thumb.thumbnail((THUMB_SIZE.width(), THUMB_SIZE.height()), resample=Image.Resampling.LANCZOS)
+
+            rgba_bytes = thumb.tobytes()
+            width, height = thumb.size
+            bytes_per_line = width * 4
+            return (
+                {
+                    "width": width,
+                    "height": height,
+                    "bytes": rgba_bytes,
+                    "bytes_per_line": bytes_per_line,
+                },
+                icc_invalid,
+            )
+
+    def run(self) -> None:
+        try:
+            image_paths, collision = self._scan_folder()
+        except OSError as exc:
             self.failed.emit(f"Failed to read folder: {exc}")
+            return
+        if self._cancelled:
+            return
+
+        if collision is not None:
+            first, second = collision
+            self.collision_detected.emit(str(first), str(second))
             return
 
         total = len(image_paths)
+        self.scan_ready.emit(total)
         self.progress.emit(0, total, 0)
 
-        for index, image_path in enumerate(image_paths, start=1):
-            if self._has_invalid_icc_profile(image_path):
-                self.icc_warning.emit(str(image_path))
+        # Wait until the GUI thread resets its state and is ready for results.
+        while not self._allow_processing.is_set():
+            if self._cancelled:
+                return
+            self._allow_processing.wait(timeout=0.05)
 
+        if total == 0:
+            self.finished.emit(0, str(self.folder))
+            return
+
+        processed = 0
+
+        # Use a bounded worker pool to utilize multiple cores while avoiding huge memory spikes.
+        max_workers = max(1, (os.cpu_count() or 1) - 1)
+        # Cap to keep decoding and UI payloads bounded.
+        max_workers = min(max_workers, self._max_thread_cap)
+        chunk_size = 64
+
+        def process_one(image_path: Path) -> dict:
             text_path = image_path.with_suffix(".txt")
-            text = ""
-            if text_path.exists():
-                try:
-                    text = text_path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    text = ""
-
-            thumb = QImage()
-            reader = QImageReader(str(image_path))
-            reader.setAutoTransform(True)
-            image = reader.read()
-            if not image.isNull():
-                thumb = image.scaled(
-                    THUMB_SIZE,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
+            try:
+                text = (
+                    text_path.read_text(encoding="utf-8", errors="replace")
+                    if text_path.exists()
+                    else ""
                 )
+            except OSError:
+                text = ""
 
-            self.item_loaded.emit(
-                {
-                    "image_path": str(image_path),
-                    "text_path": str(text_path),
-                    "text": text,
-                    "thumbnail": thumb,
-                }
-            )
+            thumb_payload, icc_invalid = self._thumbnail_rgba_bytes(image_path)
+            return {
+                "image_path": str(image_path),
+                "text_path": str(text_path),
+                "text": text,
+                "thumbnail": thumb_payload,
+                "icc_invalid": icc_invalid,
+            }
 
-            percent = int((index / total) * 100) if total else 100
-            self.progress.emit(index, total, percent)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            try:
+                for chunk_start in range(0, total, chunk_size):
+                    if self._cancelled:
+                        break
 
-        self.finished.emit(total, str(self.folder))
+                    chunk = image_paths[chunk_start : chunk_start + chunk_size]
+                    for result in executor.map(process_one, chunk):
+                        if self._cancelled:
+                            break
+                        processed += 1
+
+                        if result.get("icc_invalid"):
+                            self.icc_warning.emit(result["image_path"])
+
+                        # Keep emitted payload small; thumbnail bytes are only ~96x96 RGBA.
+                        self.item_loaded.emit(
+                            {
+                                "image_path": result["image_path"],
+                                "text_path": result["text_path"],
+                                "text": result["text"],
+                                "thumbnail": result["thumbnail"],
+                            }
+                        )
+
+                        percent = int((processed / total) * 100) if total else 100
+                        self.progress.emit(processed, total, percent)
+            except Exception as exc:
+                self.failed.emit(f"Failed while processing folder: {exc}")
+                return
+
+        self.finished.emit(processed, str(self.folder))
 
 
 class OllamaTaskWorker(QObject):
@@ -1691,39 +1827,23 @@ class MainWindow(QMainWindow):
         return None
 
     def load_directory(self, folder: Path, restore_selection: Path | None = None) -> None:
-        collision = self._find_image_name_collision(folder)
-        if collision is not None:
-            first, second = collision
-            QMessageBox.warning(
-                self,
-                "Duplicate image names detected",
-                "Two image files have the same name with different extensions, which would "
-                "collide on the same .txt description file.\n\n"
-                f"Filename: {first.stem}\n"
-                f"Files:\n- {first}\n- {second}",
-            )
-            return
-
-        self._root_directory = folder
-        self._pending_selection_path = restore_selection
-        self._icc_warning_paths = []
-        self.records = []
-        self.known_tags.clear()
-        self.tag_counts.clear()
-        self.list_widget.clear()
-        self.image_label.setText("No image selected")
-        self.tag_input.clear()
-        self.tag_list.clear()
-        self.current_index = -1
-        self._refresh_tag_completions()
-
         self._set_loading_state(True)
+        self.statusBar().showMessage("Scanning folder...")
+        self._pending_selection_path = restore_selection
+
+        try:
+            max_thread_cap = int(self._cfg.get("directory_loader_max_threads", 8))
+        except (TypeError, ValueError):
+            max_thread_cap = 8
+        max_thread_cap = max(1, max_thread_cap)
 
         self._loader_thread = QThread(self)
-        self._loader_worker = FolderLoadWorker(folder)
+        self._loader_worker = FolderLoadWorker(folder, max_thread_cap=max_thread_cap)
         self._loader_worker.moveToThread(self._loader_thread)
 
         self._loader_thread.started.connect(self._loader_worker.run)
+        self._loader_worker.scan_ready.connect(self._on_scan_ready)
+        self._loader_worker.collision_detected.connect(self._on_collision_detected)
         self._loader_worker.item_loaded.connect(self._on_item_loaded)
         self._loader_worker.progress.connect(self._on_load_progress)
         self._loader_worker.icc_warning.connect(self._on_icc_warning_detected)
@@ -1734,6 +1854,45 @@ class MainWindow(QMainWindow):
         self._loader_thread.finished.connect(self._cleanup_loader)
 
         self._loader_thread.start()
+
+    def _on_scan_ready(self, total: int) -> None:
+        folder = self._loader_worker.folder if self._loader_worker is not None else None
+        if folder is None:
+            return
+
+        self._root_directory = folder
+        self._icc_warning_paths = []
+        self.records = []
+        self.known_tags.clear()
+        self.tag_counts.clear()
+        self.list_widget.clear()
+        self.image_label.setText("No image selected")
+        self.tag_input.clear()
+        self.tag_list.clear()
+        self.current_index = -1
+
+        # Tag completions depend on known tags, which we compute after load settles.
+        self._refresh_tag_completions()
+
+        self.statusBar().showMessage(f"Loading {total} images...")
+        self._loader_worker.allow_processing()
+
+    def _on_collision_detected(self, first: str, second: str) -> None:
+        self.statusBar().showMessage("Duplicate images detected")
+        self._set_loading_state(False)
+        if self._loader_worker is not None:
+            self._loader_worker.cancel()
+        if self._loader_thread is not None and self._loader_thread.isRunning():
+            self._loader_thread.quit()
+
+        QMessageBox.warning(
+            self,
+            "Duplicate image names detected",
+            "Two image files have the same name with different extensions, which would "
+            "collide on the same .txt description file.\n\n"
+            f"Filename: {Path(first).stem}\n"
+            f"Files:\n- {first}\n- {second}",
+        )
 
     def _add_list_item(self, record: ImageRecord, thumbnail: QImage | None = None) -> None:
         title = self._build_list_item_title(record)
@@ -1783,8 +1942,26 @@ class MainWindow(QMainWindow):
         image_path_str = str(data.get("image_path", "")).strip()
         text_path_str = str(data.get("text_path", "")).strip()
         text = str(data.get("text", ""))
-        thumbnail = data.get("thumbnail")
-        thumb_image = thumbnail if isinstance(thumbnail, QImage) else None
+        thumb_payload = data.get("thumbnail")
+        thumb_image: QImage | None = None
+        if isinstance(thumb_payload, dict):
+            try:
+                b = thumb_payload.get("bytes")
+                width = int(thumb_payload.get("width", 0))
+                height = int(thumb_payload.get("height", 0))
+                bytes_per_line = int(thumb_payload.get("bytes_per_line", width * 4))
+                if b is not None and width > 0 and height > 0 and bytes_per_line > 0:
+                    qimage = QImage(
+                        b,
+                        width,
+                        height,
+                        bytes_per_line,
+                        QImage.Format.Format_RGBA8888,
+                    )
+                    # Detach from the underlying bytes buffer to avoid lifetime issues.
+                    thumb_image = qimage.copy()
+            except Exception:
+                thumb_image = None
 
         if not image_path_str or not text_path_str:
             return
@@ -1794,9 +1971,6 @@ class MainWindow(QMainWindow):
 
         record = ImageRecord(image_path=image_path, text_path=text_path, text=text)
         self.records.append(record)
-        parsed_tags = self._parse_tags(text)
-        self.known_tags.update(parsed_tags)
-        self.tag_counts.update(parsed_tags)
         self._add_list_item(record, thumb_image)
 
     def _on_load_progress(self, processed: int, total: int, percent: int) -> None:
@@ -1814,6 +1988,8 @@ class MainWindow(QMainWindow):
 
     def _on_load_finished(self, total: int, folder: str) -> None:
         self._set_loading_state(False)
+        # Compute tag completions after the list has populated (tags settle after load).
+        self._rebuild_known_tags_from_records()
         self._refresh_tag_completions()
         self._apply_tag_list_height()
         self._restore_selection_after_load()
@@ -1977,6 +2153,18 @@ class MainWindow(QMainWindow):
             self._show_image(self.records[self.current_index].image_path)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if self._ollama_cancel is not None:
+            self._ollama_cancel.cancel()
+        if self._loader_worker is not None:
+            self._loader_worker.cancel()
+
+        if self._loader_thread is not None and self._loader_thread.isRunning():
+            self._loader_thread.quit()
+            self._loader_thread.wait(2000)
+        if self._ollama_thread is not None and self._ollama_thread.isRunning():
+            self._ollama_thread.quit()
+            self._ollama_thread.wait(2000)
+
         self._save_main_window_geometry()
         record = self._current_record()
         if record is not None:
@@ -2175,7 +2363,7 @@ class MainWindow(QMainWindow):
 
     def _write_record_text(self, record: ImageRecord, status_prefix: str) -> bool:
         try:
-            record.text_path.write_text(record.text, encoding="utf-8")
+            atomic_write_text(record.text_path, record.text, encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "Save failed", f"Could not save text file:\n{exc}")
             return False

@@ -14,6 +14,7 @@ _DEFAULTS: dict = {
     "ollama_max_resolution_mpx": 5,
     "merge_dialog_geometry": {},
     "font_point_size": 0,
+    "directory_loader_max_threads": 8,
 }
 
 

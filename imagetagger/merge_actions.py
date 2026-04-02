@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Literal
 
-from PyQt6.QtWidgets import QDialog, QMessageBox, QWidget
+from PyQt6.QtWidgets import QDialog, QMessageBox, QStyle, QWidget
 
+from imagetagger.io_utils import atomic_write_text
 from imagetagger.merge_dialog import FixupDialog, parse_fixup_data
 
 
@@ -30,7 +31,7 @@ def existing_fixup_path_for_image(image_path: Path) -> Path | None:
 
 def write_fixup_for_image(image_path: Path, content: str) -> Path:
     fixup_path = fixup_path_for_image(image_path)
-    fixup_path.write_text(content.strip() + "\n", encoding="utf-8")
+    atomic_write_text(fixup_path, content.strip() + "\n", encoding="utf-8")
     return fixup_path
 
 
@@ -96,7 +97,7 @@ def open_fixup_dialog_for_image(
 
     def restore_fixup(original_content: str) -> bool:
         try:
-            fixup_path.write_text(original_content, encoding="utf-8")
+            atomic_write_text(fixup_path, original_content, encoding="utf-8")
         except OSError as exc:
             QMessageBox.warning(parent, "Fixup restore failed", f"Could not restore fixup file:\n{exc}")
             show_status("Undo failed: could not restore .fixup")
@@ -146,7 +147,13 @@ def open_fixup_dialog_for_image(
                 max_x = available.left() + max(0, available.width() - clamped_width)
                 max_y = available.top() + max(0, available.height() - clamped_height)
                 clamped_x = min(max(x, available.left()), max_x)
-                clamped_y = min(max(y, available.top()), max_y)
+
+                # Keep enough top inset so native title-bar controls remain reachable.
+                title_bar_height = dialog.style().pixelMetric(QStyle.PixelMetric.PM_TitleBarHeight, None, dialog)
+                if title_bar_height <= 0:
+                    title_bar_height = 32
+                min_y = min(available.top() + title_bar_height, max_y)
+                clamped_y = min(max(y, min_y), max_y)
                 dialog.setGeometry(clamped_x, clamped_y, clamped_width, clamped_height)
 
     result = dialog.exec()
