@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from difflib import SequenceMatcher
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import sys
 import time
 from typing import Callable
 
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QCompleter,
     QDialog,
+    QFileDialog,
     QFrame,
     QHeaderView,
     QHBoxLayout,
@@ -23,6 +25,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QMenu,
     QPushButton,
     QScrollArea,
     QSplitter,
@@ -44,6 +47,12 @@ from imagetagger.ollama import (
     consume_resize_warning,
     generate_description,
     generate_tags,
+)
+from imagetagger.external_editors import (
+    ExternalEditor,
+    discover_graphics_editors,
+    launch_image_in_editor,
+    launch_image_in_system_default,
 )
 
 
@@ -131,6 +140,7 @@ class FixupData:
     issues: str
     corrected_description: str
     corrected_tags: list[str]
+    search_matches: list[str] = field(default_factory=list)
 
 
 class RegenerateWorker(QObject):
@@ -160,6 +170,7 @@ class RegenerateWorker(QObject):
 
 DIFF_RANGES_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 ITEM_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 2
+IS_SEARCH_MATCH_ROLE = int(Qt.ItemDataRole.UserRole) + 3
 
 
 def strip_tag_list_prefix(tag: str) -> str:
@@ -168,6 +179,19 @@ def strip_tag_list_prefix(tag: str) -> str:
     while cleaned.startswith("- "):
         cleaned = cleaned[2:].lstrip()
     return cleaned
+
+
+def _normalize_fixup_section_entry(value: str) -> str:
+    """Normalize entry by stripping whitespace and leading dash."""
+    text = value.strip()
+    if text.startswith("- "):
+        text = text[2:].strip()
+    return text
+
+
+def _normalize_search_match_entry(value: str, sanitize_annotation: Callable[[str], str]) -> str:
+    normalized = sanitize_annotation(_normalize_fixup_section_entry(value)).strip()
+    return normalized.lower()
 
 
 class DiffHighlightDelegate(QStyledItemDelegate):
@@ -360,7 +384,7 @@ def parse_fixup_data(
     parse_tags: Callable[[str], list[str]],
     sanitize_annotation: Callable[[str], str],
 ) -> FixupData:
-    sections: dict[str, list[str]] = {"issues": [], "tags": [], "description": []}
+    sections: dict[str, list[str]] = {"issues": [], "tags": [], "description": [], "ai_find": []}
     current_section = "issues"
 
     for raw_line in content.splitlines():
@@ -386,6 +410,12 @@ def parse_fixup_data(
             if inline_content:
                 sections["description"].append(inline_content)
             continue
+        if upper_line.startswith("AI_FIND_MATCHES:"):
+            current_section = "ai_find"
+            inline_content = line[16:].strip()  # Content after "AI_FIND_MATCHES:"
+            if inline_content:
+                sections["ai_find"].append(inline_content)
+            continue
         sections[current_section].append(raw_line.rstrip())
 
     issues = "\n".join(line for line in sections["issues"] if line.strip()).strip()
@@ -397,6 +427,17 @@ def parse_fixup_data(
         for tag in parse_tags(tags_text)
         if (cleaned := strip_tag_list_prefix(tag))
     ]
+    
+    search_matches = []
+    seen_search_matches: set[str] = set()
+    for line in sections["ai_find"]:
+        normalized_match = _normalize_search_match_entry(line, sanitize_annotation)
+        if not normalized_match:
+            continue
+        if normalized_match in seen_search_matches:
+            continue
+        seen_search_matches.add(normalized_match)
+        search_matches.append(normalized_match)
 
     if not issues and not corrected_description and not corrected_tags:
         issues = content.strip()
@@ -405,6 +446,7 @@ def parse_fixup_data(
         issues=issues,
         corrected_description=corrected_description,
         corrected_tags=corrected_tags,
+        search_matches=search_matches,
     )
 
 
@@ -447,6 +489,7 @@ class FixupDialog(QDialog):
             self._initial_proposed_description,
             [tag.strip() for tag in fixup_data.corrected_tags if tag.strip()],
         )
+        self._initial_search_matches = [query.strip() for query in fixup_data.search_matches if query.strip()]
         self._initial_fixup_content = initial_fixup_content
         self._clear_fixup = clear_fixup
         self._restore_fixup = restore_fixup
@@ -466,6 +509,8 @@ class FixupDialog(QDialog):
         self._regenerate_cancel: OllamaCancellation | None = None
         self._discard_regenerate_result = False
         self._global_key_filter_installed = False
+        self._search_matches = fixup_data.search_matches or []
+        self._detected_external_editors: list[ExternalEditor] | None = None
 
         self.left_list = QListWidget(self)
         self.left_list.setItemDelegate(DiffHighlightDelegate(self.left_list))
@@ -619,6 +664,8 @@ class FixupDialog(QDialog):
             self._add_right_item(fixup_data.corrected_description)
         for tag in fixup_data.corrected_tags:
             self._add_right_item(tag)
+        for search_query in fixup_data.search_matches:
+            self._add_search_match_item(search_query)
 
         self.accept_button = QPushButton("Accept", self)
         self.accept_button.setToolTip("Accept all proposed rows and merge")
@@ -738,6 +785,31 @@ class FixupDialog(QDialog):
         self._refresh_button_state()
         self._update_difference_highlights()
 
+    def _add_search_match_to_tags(self, search_query: str) -> None:
+        """Add search query to current tags (left list) and remove from search matches."""
+        normalized = search_query.strip()
+        if not normalized:
+            return
+        
+        current_tags = self._current_texts(self.left_list)
+        normalized_key = self._normalized_compare_key(normalized)
+        existing_keys = {self._normalized_compare_key(tag) for tag in current_tags}
+        
+        if normalized_key not in existing_keys:
+            self._add_left_item(normalized)
+        
+        # Remove the search match item from right list
+        for i in range(self.right_list.count() - 1, -1, -1):
+            item = self.right_list.item(i)
+            if item and item.data(IS_SEARCH_MATCH_ROLE):
+                item_text = item.text().strip()
+                if self._normalized_compare_key(item_text) == normalized_key:
+                    self.right_list.takeItem(i)
+                    break
+        
+        self._refresh_button_state()
+        self._update_difference_highlights()
+
     def _focus_left_tag_input(self) -> None:
         self.left_tag_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
         self.left_tag_input.selectAll()
@@ -781,6 +853,18 @@ class FixupDialog(QDialog):
         item = QListWidgetItem(normalized)
         item.setData(DIFF_RANGES_ROLE, [])
         item.setData(ITEM_TEXT_ROLE, normalized)
+        self.right_list.addItem(item)
+
+    def _add_search_match_item(self, search_query: str) -> None:
+        """Add search match item to right list (marked as search match)."""
+        normalized = search_query.strip()
+        if not normalized:
+            return
+        
+        item = QListWidgetItem(normalized)
+        item.setData(DIFF_RANGES_ROLE, [])
+        item.setData(ITEM_TEXT_ROLE, normalized)
+        item.setData(IS_SEARCH_MATCH_ROLE, True)
         self.right_list.addItem(item)
 
     def _current_texts(self, list_widget: QListWidget) -> list[str]:
@@ -1068,6 +1152,11 @@ class FixupDialog(QDialog):
             for text in self._initial_proposed_tags
             if self._normalized_compare_text(text)
         )
+        initial_values.extend(
+            self._normalized_compare_text(text)
+            for text in self._initial_search_matches
+            if self._normalized_compare_text(text)
+        )
         return current != initial_values
 
     def _has_dialog_state_changes(self) -> bool:
@@ -1077,13 +1166,20 @@ class FixupDialog(QDialog):
         self,
         left_texts: list[str],
         right_texts: list[str],
+        search_match_indexes: set[int] | None = None,
     ) -> tuple[dict[int, int], dict[int, int], dict[int, str]]:
+        if search_match_indexes is None:
+            search_match_indexes = set()
+        
         left_matches: dict[int, int] = {}
         right_matches: dict[int, int] = {}
         right_match_kind: dict[int, str] = {}
 
         right_by_key: dict[str, list[int]] = {}
         for right_index, text in enumerate(right_texts):
+            # Skip search match items from being matched
+            if right_index in search_match_indexes:
+                continue
             right_by_key.setdefault(self._normalized_compare_key(text), []).append(right_index)
 
         protected_left_indexes: set[int] = {
@@ -1095,11 +1191,14 @@ class FixupDialog(QDialog):
         if self._has_proposed_description and right_texts:
             left_description_index = self._find_description_like_index(left_texts)
             if left_description_index is not None and left_description_index not in protected_left_indexes:
-                left_matches[left_description_index] = 0
-                right_matches[0] = left_description_index
-                left_description_key = self._normalized_compare_key(left_texts[left_description_index])
-                right_description_key = self._normalized_compare_key(right_texts[0])
-                right_match_kind[0] = "exact" if left_description_key == right_description_key else "description"
+                # Don't match description with search match items
+                description_right_index = 0
+                if description_right_index not in search_match_indexes:
+                    left_matches[left_description_index] = 0
+                    right_matches[0] = left_description_index
+                    left_description_key = self._normalized_compare_key(left_texts[left_description_index])
+                    right_description_key = self._normalized_compare_key(right_texts[0])
+                    right_match_kind[0] = "exact" if left_description_key == right_description_key else "description"
 
         # Pass 1: exact matches
         for left_index, text in enumerate(left_texts):
@@ -1130,6 +1229,9 @@ class FixupDialog(QDialog):
             best_right = -1
             best_ratio = 0.0
             for right_index, right_text in enumerate(right_texts):
+                # Skip search match items from being matched
+                if right_index in search_match_indexes:
+                    continue
                 if right_index in right_matches:
                     continue
                 ratio = SequenceMatcher(
@@ -1254,7 +1356,13 @@ class FixupDialog(QDialog):
             else:
                 right_texts.append(item.text())
 
-        left_matches, right_matches, right_match_kind = self._compute_matches(left_texts, right_texts)
+        # Identify search match items to exclude from matching
+        search_match_indexes: set[int] = set()
+        for right_index, item in enumerate(right_items):
+            if item and item.data(IS_SEARCH_MATCH_ROLE):
+                search_match_indexes.add(right_index)
+
+        left_matches, right_matches, right_match_kind = self._compute_matches(left_texts, right_texts, search_match_indexes)
 
         def ranges_for_diff(left_text: str, right_text: str) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
             left_ranges: list[tuple[int, int]] = []
@@ -1438,13 +1546,25 @@ class FixupDialog(QDialog):
 
                 action_text = ""
                 callback: Callable[[], None] | None = None
-                if left_index is not None and right_index is not None:
-                    if right_match_kind.get(right_index) != "exact":
+                
+                # Check if right item is a search match and use magnifying glass
+                if right_index is not None:
+                    right_item = self.right_list.item(right_index)
+                    is_search_match = right_item.data(IS_SEARCH_MATCH_ROLE) if right_item else False
+                    
+                    if is_search_match:
+                        # For search matches, add magnifying glass button to add to current tags
+                        action_text = "🔍"
+                        right_text = right_texts[right_index]
+                        callback = lambda idx=right_index, text=right_text: self._add_search_match_to_tags(text)
+                    elif left_index is not None:
+                        if right_match_kind.get(right_index) != "exact":
+                            action_text = "←"
+                            callback = lambda table_row=row, idx=right_index: self._merge_proposed_row_from_table(table_row, idx)
+                    else:
+                        # Right-only item (not exact match): use arrow to import
                         action_text = "←"
                         callback = lambda table_row=row, idx=right_index: self._merge_proposed_row_from_table(table_row, idx)
-                elif right_index is not None:
-                    action_text = "←"
-                    callback = lambda table_row=row, idx=right_index: self._merge_proposed_row_from_table(table_row, idx)
                 elif left_index is not None:
                     left_text = left_texts[left_index]
                     if not self._is_protected_existing_text(left_text):
@@ -1566,9 +1686,14 @@ class FixupDialog(QDialog):
         self._update_difference_highlights()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self.comparison_table and event.type() == QEvent.Type.KeyPress:
+        comparison_table = getattr(self, "comparison_table", None)
+        left_tag_input = getattr(self, "left_tag_input", None)
+        if comparison_table is None or left_tag_input is None:
+            return super().eventFilter(watched, event)
+
+        if watched is comparison_table and event.type() == QEvent.Type.KeyPress:
             if event.key() == Qt.Key.Key_Left:
-                selected_rows = sorted({index.row() for index in self.comparison_table.selectedIndexes()})
+                selected_rows = sorted({index.row() for index in comparison_table.selectedIndexes()})
                 right_indexes: list[int] = []
                 for row in selected_rows:
                     if row < 0 or row >= len(self._table_row_map):
@@ -1576,19 +1701,19 @@ class FixupDialog(QDialog):
                     _left_index, right_index = self._table_row_map[row]
                     if right_index is None:
                         continue
-                    cell_widget = self.comparison_table.cellWidget(row, 1)
+                    cell_widget = comparison_table.cellWidget(row, 1)
                     if cell_widget is not None:
                         for btn in cell_widget.findChildren(QPushButton):
                             if btn.text() == "←":
                                 right_indexes.append(right_index)
                                 break
                 if right_indexes:
-                    current_row = self.comparison_table.currentRow()
+                    current_row = comparison_table.currentRow()
                     self._remember_last_action_table_row(current_row)
                     self._apply_proposed_rows(right_indexes)
                     self._refresh_button_state()
                     self._update_difference_highlights()
-                    new_row_count = self.comparison_table.rowCount()
+                    new_row_count = comparison_table.rowCount()
                     if new_row_count > 0 and current_row >= 0:
                         target_row = min(current_row, new_row_count - 1)
                         self._select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
@@ -1603,7 +1728,7 @@ class FixupDialog(QDialog):
                 return super().eventFilter(watched, event)
 
             step = -1 if event.key() == Qt.Key.Key_Up else 1
-            left_input_empty = not self.left_tag_input.text().strip()
+            left_input_empty = not left_tag_input.text().strip()
 
             focused = self.focusWidget()
             if focused is None:
@@ -1613,14 +1738,14 @@ class FixupDialog(QDialog):
                     return True
                 return super().eventFilter(watched, event)
 
-            if focused is self.left_tag_input:
+            if focused is left_tag_input:
                 if left_input_empty and self._activate_adjacent_row_for_last_action(step):
                     return True
                 if event.key() == Qt.Key.Key_Down and left_input_empty and self._activate_first_comparison_row():
                     return True
                 return super().eventFilter(watched, event)
 
-            if focused is self.comparison_table or self.comparison_table.isAncestorOf(focused):
+            if focused is comparison_table or comparison_table.isAncestorOf(focused):
                 return super().eventFilter(watched, event)
 
             if isinstance(focused, (QLineEdit, QTextEdit, QAbstractItemView, QPushButton, QCheckBox)):
@@ -1637,7 +1762,7 @@ class FixupDialog(QDialog):
                 return super().eventFilter(watched, event)
 
             activate_row = self._activate_first_comparison_row if event.key() == Qt.Key.Key_Home else self._activate_last_comparison_row
-            left_input_empty = not self.left_tag_input.text().strip()
+            left_input_empty = not left_tag_input.text().strip()
 
             focused = self.focusWidget()
             if focused is None:
@@ -1645,12 +1770,12 @@ class FixupDialog(QDialog):
                     return True
                 return super().eventFilter(watched, event)
 
-            if focused is self.left_tag_input:
+            if focused is left_tag_input:
                 if left_input_empty and activate_row():
                     return True
                 return super().eventFilter(watched, event)
 
-            if focused is self.comparison_table or self.comparison_table.isAncestorOf(focused):
+            if focused is comparison_table or comparison_table.isAncestorOf(focused):
                 return super().eventFilter(watched, event)
 
             if isinstance(focused, (QLineEdit, QTextEdit, QAbstractItemView, QPushButton, QCheckBox)):
@@ -1825,6 +1950,8 @@ class FixupDialog(QDialog):
             self._add_right_item(self._initial_proposed_description)
         for tag in self._initial_proposed_tags:
             self._add_right_item(tag)
+        for search_query in self._initial_search_matches:
+            self._add_search_match_item(search_query)
 
     def _create_regenerate_frame(self) -> QWidget:
         frame = QFrame(self)
@@ -2065,6 +2192,8 @@ class FixupDialog(QDialog):
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         image_label = ScalableImageLabel(self)
+        image_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        image_label.customContextMenuRequested.connect(self._show_image_context_menu)
 
         image_loaded = False
         if image_path:
@@ -2092,6 +2221,110 @@ class FixupDialog(QDialog):
         pane_layout.addWidget(scroll, stretch=1)
         pane_layout.addWidget(self._create_regenerate_frame(), stretch=0)
         return pane
+
+    def _show_image_context_menu(self, position) -> None:
+        image_path = self._image_path
+        if image_path is None:
+            return
+
+        menu = QMenu(self)
+        open_default_action = menu.addAction("Open in Default App")
+        open_default_action.triggered.connect(self._open_image_in_default_app)
+
+        open_with_menu = menu.addMenu("Open With")
+        editors = self._get_detected_external_editors(refresh=False)
+        if editors:
+            for editor in editors:
+                action = open_with_menu.addAction(editor.display_name)
+                action.triggered.connect(
+                    lambda _checked=False, selected_editor=editor: self._open_image_with_editor(selected_editor)
+                )
+        else:
+            unavailable = open_with_menu.addAction("No common editors detected")
+            unavailable.setEnabled(False)
+
+        open_with_menu.addSeparator()
+        choose_action = open_with_menu.addAction("Choose executable...")
+        choose_action.triggered.connect(self._open_image_with_custom_editor)
+
+        source_widget = self.sender()
+        if isinstance(source_widget, QWidget):
+            global_position = source_widget.mapToGlobal(position)
+        else:
+            global_position = self.mapToGlobal(position)
+        menu.exec(global_position)
+
+    def _open_image_in_default_app(self) -> None:
+        image_path = self._image_path
+        if image_path is None:
+            return
+
+        try:
+            launch_image_in_system_default(image_path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Open image failed", f"Could not open image in default app:\n{exc}")
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "Open image failed", f"Could not open image in default app:\n{exc}")
+            return
+
+        self.regenerate_status_label.setText(f"Opened {image_path.name} in default app")
+
+    def _open_image_with_editor(self, editor: ExternalEditor) -> None:
+        image_path = self._image_path
+        if image_path is None:
+            return
+
+        try:
+            launch_image_in_editor(editor, image_path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Open editor failed", f"Could not open image with {editor.display_name}:\n{exc}")
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "Open editor failed", f"Could not open image with {editor.display_name}:\n{exc}")
+            return
+
+        self.regenerate_status_label.setText(f"Opened {image_path.name} with {editor.display_name}")
+
+    def _open_image_with_custom_editor(self) -> None:
+        if self._image_path is None:
+            return
+
+        if sys.platform.startswith("win"):
+            file_filter = "Applications (*.exe);;All files (*)"
+        elif sys.platform == "darwin":
+            file_filter = "Applications (*.app);;All files (*)"
+        else:
+            file_filter = "All files (*)"
+
+        selected_path, _ = QFileDialog.getOpenFileName(self, "Choose graphics editor", "", file_filter)
+        if not selected_path:
+            return
+
+        selected = Path(selected_path)
+        if not selected.exists():
+            QMessageBox.warning(self, "Editor not found", "Selected editor path does not exist.")
+            return
+
+        launch_kind = "mac_app" if sys.platform == "darwin" and selected.suffix.lower() == ".app" else "executable"
+        custom_editor = ExternalEditor(
+            id="custom",
+            display_name=selected.stem or selected.name,
+            launch_target=str(selected),
+            launch_kind=launch_kind,
+        )
+        self._open_image_with_editor(custom_editor)
+
+    def _get_detected_external_editors(self, refresh: bool = False) -> list[ExternalEditor]:
+        if not refresh and self._detected_external_editors is not None:
+            return list(self._detected_external_editors)
+
+        try:
+            editors = discover_graphics_editors()
+        except Exception:
+            editors = []
+        self._detected_external_editors = editors
+        return list(editors)
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)

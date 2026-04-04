@@ -33,14 +33,14 @@ class OllamaCancellation:
     def __init__(self) -> None:
         self._event = threading.Event()
         self._lock = threading.Lock()
-        self._active_connection: http.client.HTTPConnection | None = None
+        self._active_connections: set[http.client.HTTPConnection] = set()
 
     def cancel(self) -> None:
         self._event.set()
         with self._lock:
-            connection = self._active_connection
-            self._active_connection = None
-        if connection is not None:
+            connections = list(self._active_connections)
+            self._active_connections.clear()
+        for connection in connections:
             try:
                 connection.close()
             except Exception:
@@ -55,7 +55,7 @@ class OllamaCancellation:
 
     def set_active_connection(self, connection: http.client.HTTPConnection) -> None:
         with self._lock:
-            self._active_connection = connection
+            self._active_connections.add(connection)
             already_cancelled = self._event.is_set()
         if already_cancelled:
             try:
@@ -66,8 +66,7 @@ class OllamaCancellation:
 
     def clear_active_connection(self, connection: http.client.HTTPConnection) -> None:
         with self._lock:
-            if self._active_connection is connection:
-                self._active_connection = None
+            self._active_connections.discard(connection)
 
 
 @dataclass(frozen=True)
@@ -259,16 +258,25 @@ _DEFAULT_VALIDATION_PROMPT = (
     "Do not return JSON or any extra headings."
 )
 
+_DEFAULT_SEARCH_PROMPT = (
+    "You are checking whether an image contains a target concept.\n"
+    "Target concept: \"{query}\"\n"
+    "Respond with exactly one token: YES or NO.\n"
+    "Do not add punctuation, explanations, or extra words."
+)
+
 _PROMPT_DEFAULTS: dict[str, str] = {
     "tagging": _DEFAULT_TAGS_PROMPT,
     "description": _DEFAULT_DESCRIPTION_PROMPT,
     "validation": _DEFAULT_VALIDATION_PROMPT,
+    "search": _DEFAULT_SEARCH_PROMPT,
 }
 
 _PROMPT_FILENAMES: dict[str, str] = {
     "tagging": "tags_prompt.txt",
     "description": "description_prompt.txt",
     "validation": "validation_prompt.txt",
+    "search": "search_prompt.txt",
 }
 
 # In-memory overrides set via UI "Apply".
@@ -466,3 +474,34 @@ def validate_tags(
     prompt_template = _active_prompt("validation")
     prompt = prompt_template.replace("{tags}", _format_annotations_for_validation(tags))
     return _generate_with_image(server, model, image_path, prompt, timeout=timeout, cancellation=cancellation)
+
+
+def image_matches_query(
+    server: str,
+    model: str,
+    image_path: Path,
+    query: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    cancellation: OllamaCancellation | None = None,
+) -> bool:
+    cleaned_query = query.strip()
+    if not cleaned_query:
+        raise OllamaError("Enter text to search for.")
+
+    prompt_template = _active_prompt("search")
+    prompt = prompt_template.replace("{query}", cleaned_query)
+
+    response = _generate_with_image(
+        server,
+        model,
+        image_path,
+        prompt,
+        timeout=timeout,
+        cancellation=cancellation,
+    ).strip()
+    upper = response.upper()
+    if upper.startswith("YES"):
+        return True
+    if upper.startswith("NO"):
+        return False
+    raise OllamaError(f"Model returned ambiguous AI Find response: {response}")

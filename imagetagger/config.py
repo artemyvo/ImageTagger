@@ -12,6 +12,7 @@ _DEFAULTS: dict = {
     "ollama_server": "",
     "ollama_model": "",
     "ollama_max_resolution_mpx": 5,
+    "ollama_threads": 1,
     "merge_dialog_geometry": {},
     "font_point_size": 0,
     "directory_loader_max_threads": 8,

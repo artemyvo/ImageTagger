@@ -9,6 +9,15 @@ from imagetagger.io_utils import atomic_write_text
 from imagetagger.merge_dialog import FixupDialog, parse_fixup_data
 
 
+_AI_FIND_SECTION_HEADER = "AI_FIND_MATCHES:"
+_KNOWN_FIXUP_HEADERS = {
+    "ISSUES:",
+    "TAGS:",
+    "DESCRIPTION:",
+    _AI_FIND_SECTION_HEADER,
+}
+
+
 def fixup_path_for_image(image_path: Path) -> Path:
     return image_path.parent / f"{image_path.name}.fixup"
 
@@ -32,6 +41,85 @@ def existing_fixup_path_for_image(image_path: Path) -> Path | None:
 def write_fixup_for_image(image_path: Path, content: str) -> Path:
     fixup_path = fixup_path_for_image(image_path)
     atomic_write_text(fixup_path, content.strip() + "\n", encoding="utf-8")
+    return fixup_path
+
+
+def _normalize_fixup_section_entry(value: str) -> str:
+    text = value.strip()
+    if text.startswith("- "):
+        text = text[2:].strip()
+    return text
+
+
+def _normalize_ai_find_match_query(
+    query: str,
+    normalize_annotation: Callable[[str], str] | None = None,
+) -> str:
+    cleaned_query = _normalize_fixup_section_entry(query)
+    if normalize_annotation is not None:
+        cleaned_query = normalize_annotation(cleaned_query)
+    return cleaned_query.strip().lower()
+
+
+def record_ai_find_match_for_image(
+    image_path: Path,
+    query: str,
+    normalize_annotation: Callable[[str], str] | None = None,
+) -> Path:
+    normalized_query = _normalize_ai_find_match_query(query, normalize_annotation)
+    if not normalized_query:
+        raise OSError("AI Find query cannot be empty.")
+
+    existing_path = existing_fixup_path_for_image(image_path)
+    if existing_path is None:
+        lines: list[str] = []
+    else:
+        try:
+            lines = existing_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            raise OSError(f"Could not read fixup file: {exc}") from exc
+
+    header_index: int | None = None
+    for index, line in enumerate(lines):
+        if line.strip().upper() == _AI_FIND_SECTION_HEADER:
+            header_index = index
+            break
+
+    section_start = -1
+    section_end = -1
+    section_entries: list[str] = []
+    if header_index is not None:
+        section_start = header_index + 1
+        section_end = len(lines)
+        for index in range(section_start, len(lines)):
+            if lines[index].strip().upper() in _KNOWN_FIXUP_HEADERS:
+                section_end = index
+                break
+
+        for line in lines[section_start:section_end]:
+            entry = _normalize_fixup_section_entry(line)
+            if entry:
+                section_entries.append(entry)
+
+    existing_keys = {entry.casefold() for entry in section_entries}
+    if normalized_query.casefold() not in existing_keys:
+        section_entries.append(normalized_query)
+
+    new_section_lines = [_AI_FIND_SECTION_HEADER]
+    new_section_lines.extend(f"- {entry}" for entry in section_entries)
+
+    if header_index is None:
+        output_lines = list(lines)
+        while output_lines and not output_lines[-1].strip():
+            output_lines.pop()
+        if output_lines:
+            output_lines.append("")
+        output_lines.extend(new_section_lines)
+    else:
+        output_lines = lines[:header_index] + new_section_lines + lines[section_end:]
+
+    fixup_path = fixup_path_for_image(image_path)
+    atomic_write_text(fixup_path, "\n".join(output_lines).strip() + "\n", encoding="utf-8")
     return fixup_path
 
 
