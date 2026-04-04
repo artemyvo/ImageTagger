@@ -2801,15 +2801,18 @@ class MainWindow(QMainWindow):
 
                         if include_tags:
                             attempt_items.extend(
-                                self._parse_tags(
-                                    generate_tags(
-                                        self.ollama_server_url,
-                                        self.ollama_model_name,
-                                        record.image_path,
-                                        timeout=remaining_timeout(),
-                                        cancellation=cancel_token,
+                                [
+                                    tag.lower()
+                                    for tag in self._parse_tags(
+                                        generate_tags(
+                                            self.ollama_server_url,
+                                            self.ollama_model_name,
+                                            record.image_path,
+                                            timeout=remaining_timeout(),
+                                            cancellation=cancel_token,
+                                        )
                                     )
-                                )
+                                ]
                             )
 
                         if not attempt_items:

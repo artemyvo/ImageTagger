@@ -2090,7 +2090,7 @@ class FixupDialog(QDialog):
         for part in normalized.split(","):
             cleaned = self._normalize_annotation(part).strip()
             if cleaned:
-                tags.append(cleaned)
+                tags.append(cleaned.lower())
         return tags
 
     def _dedupe_preserve_order(self, values: list[str]) -> list[str]:
