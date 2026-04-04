@@ -45,6 +45,16 @@ Supported image formats: jpg, jpeg, png, bmp, gif, webp.
 - Editable prompt tabs for Description, Tagging, Validation, and AI Search.
 - Preview context menu with Open in Default App and Open With support.
 
+## Screenshots
+
+Main window:
+
+![ImageTagger Main Window](docs/screenshots/main_window.png)
+
+Merge dialog:
+
+![ImageTagger Merge Dialog](docs/screenshots/merge_dialog.png)
+
 ## Acknowledgement and Inspiration
 
 This project is heavily inspired by TagGUI.
