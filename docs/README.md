@@ -5,6 +5,7 @@ This folder contains project documentation beyond the top-level README.
 ## Start Here
 
 - Usage guide: [usage.md](usage.md)
+- Ollama settings: [ollama_settings.md](ollama_settings.md)
 
 ## Reference Assets
 
@@ -14,7 +15,6 @@ This folder contains project documentation beyond the top-level README.
 ## Suggested Future Pages
 
 - troubleshooting.md: common issues, error messages, and fixes.
-- configuration.md: config.json keys and defaults.
 - contributing.md: local development workflow and contribution guidelines.
 
 ## Navigation

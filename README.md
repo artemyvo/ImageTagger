@@ -35,6 +35,7 @@ Supported image formats: jpg, jpeg, png, bmp, gif, webp.
 
 - Docs index: [docs/README.md](docs/README.md)
 - Full usage guide: [docs/usage.md](docs/usage.md)
+- Ollama settings: [docs/ollama_settings.md](docs/ollama_settings.md)
 - Screenshots: [docs/screenshots/main_window.png](docs/screenshots/main_window.png), [docs/screenshots/merge_dialog.png](docs/screenshots/merge_dialog.png)
 
 ## Highlights

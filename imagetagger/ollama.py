@@ -228,17 +228,40 @@ def _load_prompt(filename: str, default: str) -> str:
 
 
 _DEFAULT_TAGS_PROMPT = (
-    "Analyze the image and return a list of short descriptive tags, one tag per line. "
-    "Each tag must be one or two words maximum. Use lowercase only. "
-    "Do not use commas. "
-    "Do not include numbering, explanations, or sentences."
+    "Analyze the image and return a list of short descriptive tags.\n\n"
+    "Rules:\n"
+    "- Do not include introductory text or greetings.\n"
+    "- Return between 10 and 20 tags.\n"
+    "- One tag per line.\n"
+    "- One or two words maximum per tag.\n"
+    "- Lowercase only.\n"
+    "- No numbering or sentences.\n"
+    "- Cover a range of aspects: subject, action or pose, setting, mood, lighting, colors, and style where applicable.\n"
+    "- Do not repeat the same concept with different words.\n\n"
+    "Example (if subject is a person outdoors):\n"
+    "outdoor setting\n"
+    "natural light\n"
+    "seated pose\n"
+    "warm tones\n"
+    "relaxed mood\n"
+    "wooden surface\n"
+    "casual style\n"
+    "green foliage\n"
+    "shallow depth\n"
+    "soft shadows"
 )
 
 _DEFAULT_DESCRIPTION_PROMPT = (
-    "Analyze the image and write a single descriptive sentence that captures what is depicted. "
-    "Describe the content and key visual elements in detail. "
-    "Return only the description sentence, nothing else. "
-    "Do not use commas."
+    "Analyze the image and return ONLY a single paragraph of 2-3 descriptive sentences.\n\n"
+    "Rules:\n"
+    "- Identify the main subject (e.g., woman, cat, car, pan) and start the very first sentence with that noun.\n"
+    "- Use the bare noun without an article (no 'A', 'An', or 'The') to start the first sentence.\n"
+    "- Use the specific noun instead of pronouns like \"it\", \"she\", or \"he\" to start first sentence.\n"
+    "- Write declarative statements; do not use hedging phrases like \"appears to\" or \"seems to\".\n"
+    "- Avoid comma-separated lists.\n"
+    "- Do NOT include any introductory text, greetings, or meta-talk.\n\n"
+    "Example (if subject is a cat):\n"
+    "Cat with orange tabby fur sits on a blue velvet sofa in a sunlit room. Cat gazes out a large window while twitching its tail in a playful manner. Soft dust motes dance in the light to create a peaceful atmosphere."
 )
 
 _DEFAULT_VALIDATION_PROMPT = (

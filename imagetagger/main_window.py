@@ -2654,10 +2654,26 @@ class MainWindow(QMainWindow):
             return
 
         auto_mode = requested_threads == 0
+
+        def cfg_int(key: str, default: int, minimum: int, maximum: int) -> int:
+            raw_value = self._cfg.get(key, default)
+            try:
+                parsed = int(raw_value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(minimum, min(maximum, parsed))
+
+        def cfg_float(key: str, default: float, minimum: float, maximum: float) -> float:
+            raw_value = self._cfg.get(key, default)
+            try:
+                parsed = float(raw_value)
+            except (TypeError, ValueError):
+                parsed = default
+            return max(minimum, min(maximum, parsed))
+
+        auto_max_threads = cfg_int("ollama_auto_max_threads", 32, 1, 512)
         if auto_mode:
-            max_threads = min(total, 16)
-            if max_threads < 1:
-                max_threads = 1
+            max_threads = min(total, auto_max_threads)
             target_parallelism = 1
         else:
             max_threads = min(total, requested_threads)
@@ -2665,6 +2681,13 @@ class MainWindow(QMainWindow):
 
         self._ollama_threads_auto_mode = auto_mode
         self._ollama_threads_current = target_parallelism
+
+        # Auto mode uses a conservative AIMD-like controller with latency/retry guardrails.
+        # Scale up by +1 every `scale_up_every` consecutive clean completions after warmup.
+        # A retry resets the streak and steps down by 1; a timeout halves immediately.
+        adaptive_warmup_items = cfg_int("ollama_auto_warmup_items", 4, 1, 1000)
+        scale_up_every = cfg_int("ollama_auto_scale_up_every", 3, 1, 100)
+        consecutive_clean = 0
 
         executor = ThreadPoolExecutor(max_workers=max_threads)
         in_flight: set = set()
@@ -2687,10 +2710,22 @@ class MainWindow(QMainWindow):
 
                 retried = bool(payload.get("retried")) if isinstance(payload, dict) else False
                 if auto_mode:
-                    if retried:
+                    timed_out = bool(payload.get("timed_out")) if isinstance(payload, dict) else False
+                    if timed_out:
+                        target_parallelism = max(1, target_parallelism // 2)
+                        consecutive_clean = 0
+                    elif retried:
                         target_parallelism = max(1, target_parallelism - 1)
-                    elif target_parallelism < max_threads:
-                        target_parallelism += 1
+                        consecutive_clean = 0
+                    elif completed >= adaptive_warmup_items:
+                        consecutive_clean += 1
+                        # Require scale_up_every * current_parallelism clean items before
+                        # adding a thread. This naturally slows ramp-up at higher concurrency
+                        # and prevents runaway scaling when the server is under load.
+                        threshold = scale_up_every * max(1, target_parallelism)
+                        if consecutive_clean >= threshold and target_parallelism < max_threads:
+                            target_parallelism += 1
+                            consecutive_clean = 0
                     self._ollama_threads_current = target_parallelism
 
                 image_name = ""
@@ -2755,6 +2790,8 @@ class MainWindow(QMainWindow):
                 image_name = record.image_path.name
                 generated_items: list[str] = []
                 image_retried = False
+                image_timed_out = False
+                image_started_at = time.monotonic()
 
                 for attempt in range(retry_count + 1):
                     cancel_token.raise_if_cancelled()
@@ -2770,7 +2807,7 @@ class MainWindow(QMainWindow):
                         )
                     else:
                         print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_retry image={image_name} attempt={attempt + 1}/{retry_count + 1}",
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_retry image={image_name} retry={attempt}/{retry_count}",
                             flush=True,
                         )
 
@@ -2819,7 +2856,9 @@ class MainWindow(QMainWindow):
                             retry_needed = True
                     except OllamaCancelled:
                         raise
-                    except OllamaError:
+                    except OllamaError as exc:
+                        if "Timed out" in str(exc):
+                            image_timed_out = True
                         retry_needed = True
 
                     elapsed_seconds = time.monotonic() - attempt_start
@@ -2841,6 +2880,8 @@ class MainWindow(QMainWindow):
                     "index": record_index,
                     "items": generated_items,
                     "retried": image_retried,
+                    "timed_out": image_timed_out,
+                    "elapsed_s": max(0.0, time.monotonic() - image_started_at),
                     "position": position,
                     "total": total,
                     "image_name": image_name,
@@ -2924,6 +2965,8 @@ class MainWindow(QMainWindow):
                 image_name = record.image_path.name
                 image_retried = False
                 validation_result = ""
+                image_timed_out = False
+                image_started_at = time.monotonic()
 
                 for attempt in range(retry_count + 1):
                     cancel_token.raise_if_cancelled()
@@ -2939,7 +2982,7 @@ class MainWindow(QMainWindow):
                         )
                     else:
                         print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_retry image={image_name} attempt={attempt + 1}/{retry_count + 1}",
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_retry image={image_name} retry={attempt}/{retry_count}",
                             flush=True,
                         )
 
@@ -2963,7 +3006,9 @@ class MainWindow(QMainWindow):
                         )
                     except OllamaCancelled:
                         raise
-                    except OllamaError:
+                    except OllamaError as exc:
+                        if "Timed out" in str(exc):
+                            image_timed_out = True
                         elapsed_seconds = time.monotonic() - attempt_start
                         print(
                             f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
@@ -2985,6 +3030,8 @@ class MainWindow(QMainWindow):
                     "index": record_index,
                     "result": validation_result,
                     "retried": image_retried,
+                    "timed_out": image_timed_out,
+                    "elapsed_s": max(0.0, time.monotonic() - image_started_at),
                     "position": position,
                     "total": total,
                     "image_name": image_name,
@@ -3065,6 +3112,8 @@ class MainWindow(QMainWindow):
                 image_name = record.image_path.name
                 image_retried = False
                 matched = False
+                image_timed_out = False
+                image_started_at = time.monotonic()
 
                 for attempt in range(retry_count + 1):
                     cancel_token.raise_if_cancelled()
@@ -3079,7 +3128,7 @@ class MainWindow(QMainWindow):
                         )
                     else:
                         print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_retry image={image_name} attempt={attempt + 1}/{retry_count + 1}",
+                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_retry image={image_name} retry={attempt}/{retry_count}",
                             flush=True,
                         )
 
@@ -3103,7 +3152,9 @@ class MainWindow(QMainWindow):
                         )
                     except OllamaCancelled:
                         raise
-                    except OllamaError:
+                    except OllamaError as exc:
+                        if "Timed out" in str(exc):
+                            image_timed_out = True
                         elapsed_seconds = time.monotonic() - attempt_start
                         print(
                             f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
@@ -3125,6 +3176,8 @@ class MainWindow(QMainWindow):
                     "index": record_index,
                     "matched": matched,
                     "retried": image_retried,
+                    "timed_out": image_timed_out,
+                    "elapsed_s": max(0.0, time.monotonic() - image_started_at),
                     "position": position,
                     "total": total,
                     "query": query,

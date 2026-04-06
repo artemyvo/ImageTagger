@@ -171,6 +171,8 @@ config.json stores session and UI state, including:
 - thread setting
 - window geometry state
 
+For a full list of Ollama and auto-mode keys, see [ollama_settings.md](ollama_settings.md).
+
 ## Acknowledgement and Inspiration
 
 This project is heavily inspired by TagGUI.

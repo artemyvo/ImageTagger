@@ -235,6 +235,7 @@ class DiffHighlightDelegate(QStyledItemDelegate):
 
         base = QStyleOptionViewItem(option)
         self.initStyleOption(base, index)
+        base.state &= ~QStyle.StateFlag.State_HasFocus
         text = base.text
         base.text = ""
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, base, painter, option.widget)
@@ -244,24 +245,28 @@ class DiffHighlightDelegate(QStyledItemDelegate):
             base,
             option.widget,
         )
-        if text_rect.isEmpty() or not text:
+        if text_rect.isEmpty():
             return
 
-        ranges = self._normalized_ranges(text, index.data(DIFF_RANGES_ROLE))
+        if option.state & QStyle.StateFlag.State_Selected:
+            palette = option.palette
+            painter.save()
+            painter.fillRect(
+                text_rect,
+                palette.brush(QPalette.ColorRole.Highlight),
+            )
+            painter.restore()
+
+        if not text:
+            return
+
+        # When selected, keep text plain for readability on highlight background.
+        ranges = [] if (option.state & QStyle.StateFlag.State_Selected) else self._normalized_ranges(text, index.data(DIFF_RANGES_ROLE))
         document = self._build_document(text, ranges, option)
         document.setTextWidth(float(max(10, text_rect.width())))
 
         painter.save()
         painter.translate(text_rect.topLeft())
-        if option.state & QStyle.StateFlag.State_Selected:
-            palette = option.palette
-            painter.fillRect(
-                0,
-                0,
-                text_rect.width(),
-                text_rect.height(),
-                palette.brush(QPalette.ColorRole.Highlight),
-            )
         document.drawContents(painter)
         painter.restore()
 
@@ -453,6 +458,12 @@ def parse_fixup_data(
 class FixupDialog(QDialog):
     NAVIGATE_PREV_CODE = 2
     NAVIGATE_NEXT_CODE = 3
+    _PANE_HEADER_BOTTOM_SPACING = 4
+    _PANE_HEADER_EXTRA_HEIGHT = 4
+    _ROW_WIDGET_SELECTED_STYLE = "background-color: palette(highlight);"
+    _ROW_WIDGET_UNSELECTED_STYLE = "background-color: transparent;"
+    _TEXT_WIDGET_SELECTED_STYLE = "background-color: palette(highlight); color: palette(highlighted-text);"
+    _TEXT_WIDGET_UNSELECTED_STYLE = "background-color: transparent; color: palette(text);"
 
     def __init__(
         self,
@@ -555,6 +566,7 @@ class FixupDialog(QDialog):
 
         self.left_tag_input = QLineEdit(self)
         self.left_tag_input.setPlaceholderText("Type a tag and press Enter")
+        self.left_tag_input.setToolTip("Type a tag and press Enter. Alt+T clears and focuses this field.")
         self.left_tag_input.returnPressed.connect(self._add_left_tag_from_input)
 
         self._tag_suggestions_model = QStringListModel(tag_suggestions or [], self)
@@ -573,7 +585,6 @@ class FixupDialog(QDialog):
 
         self.comparison_table = QTableWidget(self)
         self.comparison_table.setColumnCount(3)
-        self.comparison_table.setHorizontalHeaderLabels(["Current", "", "Proposed"])
         self.comparison_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.comparison_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.comparison_table.setWordWrap(True)
@@ -587,23 +598,25 @@ class FixupDialog(QDialog):
         self.comparison_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.comparison_table.setMouseTracking(False)
         self.comparison_table.viewport().setMouseTracking(False)
-        self.comparison_table.setStyleSheet(
-            "QTableWidget::item:hover { background-color: transparent; }"
+        self.comparison_table.setShowGrid(False)
+        self.comparison_table.setGridStyle(Qt.PenStyle.NoPen)
+        self.comparison_table.setStyleSheet(self._comparison_table_base_stylesheet())
+        self.comparison_table.setToolTip(
+            "Keyboard: Alt+Up/Alt+Down jump actionable rows, Left applies proposed rows, "
+            "Enter triggers current row action, Delete removes selected current rows."
         )
         self.comparison_table.itemChanged.connect(self._on_comparison_item_changed)
+        self.comparison_table.itemSelectionChanged.connect(self._on_comparison_selection_changed)
         self.comparison_table.installEventFilter(self)
         header = self.comparison_table.horizontalHeader()
-        header.setStyleSheet(
-            "QHeaderView::section {"
-            "  background-color: #d0d0d0;"
-            "  padding: 4px;"
-            "  font-weight: bold;"
-            "  border: 1px solid #aaa;"
-            "}"
-        )
+        header.setVisible(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.comparison_left_label = self._create_pane_header_label("Current")
+        self.comparison_right_label = self._create_pane_header_label("Proposed")
+
+        self.comparison_header_action_spacer = QWidget(self)
         self._action_button_width = 24
         self._action_button_height = 22
         self._update_action_column_metrics()
@@ -677,7 +690,8 @@ class FixupDialog(QDialog):
 
         self.undo_button = QPushButton("Undo", self)
         self.undo_button.setEnabled(False)
-        self.undo_button.setToolTip("Undo the last merge or local changes")
+        self.undo_button.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
+        self.undo_button.setToolTip("Undo the last merge or local changes (Alt+U)")
         self.undo_button.clicked.connect(self._undo_merge)
 
         self.merge_next_button = QPushButton("Merge and Next", self)
@@ -713,6 +727,13 @@ class FixupDialog(QDialog):
         table_pane = QWidget(self)
         table_layout = QVBoxLayout(table_pane)
         table_layout.setContentsMargins(0, 0, 0, 0)
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, self._PANE_HEADER_BOTTOM_SPACING)
+        header_row.setSpacing(0)
+        header_row.addWidget(self.comparison_left_label, stretch=1)
+        header_row.addWidget(self.comparison_header_action_spacer, stretch=0)
+        header_row.addWidget(self.comparison_right_label, stretch=1)
+        table_layout.addLayout(header_row, stretch=0)
         table_layout.addWidget(self.comparison_table, stretch=1)
         input_row = QHBoxLayout()
         input_row.setContentsMargins(0, 0, 0, 0)
@@ -811,8 +832,8 @@ class FixupDialog(QDialog):
         self._update_difference_highlights()
 
     def _focus_left_tag_input(self) -> None:
+        self.left_tag_input.clear()
         self.left_tag_input.setFocus(Qt.FocusReason.ShortcutFocusReason)
-        self.left_tag_input.selectAll()
 
     def _select_existing_tag_row(self, normalized_key: str) -> None:
         if not normalized_key:
@@ -1017,14 +1038,29 @@ class FixupDialog(QDialog):
         if 0 <= row < len(self._table_row_map):
             self._last_action_table_row = row
 
+    def _preferred_focus_column_for_row(self, row: int) -> int:
+        left_item = self.comparison_table.item(row, 0)
+        if left_item is not None and left_item.text().strip():
+            return 0
+
+        right_widget = self.comparison_table.cellWidget(row, 2)
+        if right_widget is not None:
+            return 2
+
+        return 0
+
     def _select_comparison_row(self, row: int, focus_reason: Qt.FocusReason) -> bool:
         row_count = self.comparison_table.rowCount()
         if row < 0 or row >= row_count:
             return False
 
-        self.comparison_table.setFocus(focus_reason)
+        preferred_column = self._preferred_focus_column_for_row(row)
+
+        # Set current cell BEFORE setFocus so Qt's focusInEvent does not
+        # auto-select row 0 (its fallback when no current index exists).
         self.comparison_table.clearSelection()
-        self.comparison_table.setCurrentCell(row, 0)
+        self.comparison_table.setCurrentCell(row, preferred_column)
+        self.comparison_table.setFocus(focus_reason)
         self.comparison_table.selectRow(row)
         return True
 
@@ -1084,6 +1120,40 @@ class FixupDialog(QDialog):
 
     def _activate_next_actionable_row(self) -> None:
         self._activate_adjacent_actionable_row(1)
+
+    def _advance_to_next_actionable_from(self, start_row: int) -> None:
+        row_count = self.comparison_table.rowCount()
+        if row_count <= 0:
+            return
+        # Try to find an actionable row at or after start_row.
+        for row in range(start_row, row_count):
+            if self._row_needs_addressing(row):
+                self._select_comparison_row(row, Qt.FocusReason.ShortcutFocusReason)
+                return
+        # No actionable row ahead: select the next row after the acted one,
+        # clamped to the last row if start_row is now past the end.
+        self._select_comparison_row(min(start_row, row_count - 1), Qt.FocusReason.ShortcutFocusReason)
+
+    def _trigger_action_for_current_row(self) -> bool:
+        row = self.comparison_table.currentRow()
+        if row < 0:
+            return False
+
+        action_host = self.comparison_table.cellWidget(row, 1)
+        if action_host is None:
+            return False
+
+        for button in action_host.findChildren(QPushButton):
+            if button.isEnabled():
+                # ✕ removes the row so rows below shift up by 1: scan from
+                # start_row in the rebuilt table (it now points to the old
+                # start_row+1).  ← / 🔍 keep the row so we skip past it.
+                removes_row = button.text() == "✕"
+                button.click()
+                advance_from = row if removes_row else row + 1
+                self._advance_to_next_actionable_from(advance_from)
+                return True
+        return False
 
     def _merge_proposed_row_from_table(self, table_row: int, right_index: int) -> None:
         self._remember_last_action_table_row(table_row)
@@ -1433,8 +1503,66 @@ class FixupDialog(QDialog):
         label.setWordWrap(True)
         label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         label.setTextFormat(Qt.TextFormat.RichText)
-        label.setText(self._build_highlighted_html(text, ranges))
+        label.setContentsMargins(0, 0, 0, 0)
+        label.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        highlighted_html = self._build_highlighted_html(text, ranges)
+        plain_html = ItemActionWidget._escape_html(text)
+        label.setProperty("_highlighted_html", highlighted_html)
+        label.setProperty("_plain_html", plain_html)
+        label.setText(highlighted_html)
         return label
+
+    @staticmethod
+    def _comparison_table_base_stylesheet() -> str:
+        return (
+            "QTableWidget {"
+            "  border: none;"
+            "  outline: 0;"
+            "  gridline-color: transparent;"
+            "  selection-background-color: palette(highlight);"
+            "  selection-color: palette(highlighted-text);"
+            "}"
+            "QTableWidget::item {"
+            "  border: none;"
+            "  margin: 0px;"
+            "  padding: 0px;"
+            "}"
+            "QTableWidget::item:selected {"
+            "  border: none;"
+            "  outline: 0;"
+            "}"
+            "QTableWidget::item:focus {"
+            "  border: none;"
+            "  outline: 0;"
+            "}"
+            "QTableWidget::item:hover { background-color: transparent; }"
+        )
+
+    def _apply_comparison_row_widget_styles(
+        self,
+        row_selected: bool,
+        action_widget: QWidget | None,
+        left_widget: QWidget | None,
+        right_widget: QWidget | None,
+    ) -> None:
+        if action_widget is not None:
+            action_widget.setStyleSheet(
+                self._ROW_WIDGET_SELECTED_STYLE if row_selected else self._ROW_WIDGET_UNSELECTED_STYLE
+            )
+
+        if isinstance(left_widget, QLabel):
+            left_widget.setStyleSheet(
+                self._TEXT_WIDGET_SELECTED_STYLE if row_selected else self._TEXT_WIDGET_UNSELECTED_STYLE
+            )
+
+        if isinstance(right_widget, QLabel):
+            plain_html = right_widget.property("_plain_html")
+            highlighted_html = right_widget.property("_highlighted_html")
+            if isinstance(plain_html, str) and isinstance(highlighted_html, str):
+                right_widget.setText(plain_html if row_selected else highlighted_html)
+            right_widget.setStyleSheet(
+                self._TEXT_WIDGET_SELECTED_STYLE if row_selected else self._TEXT_WIDGET_UNSELECTED_STYLE
+            )
 
     def _set_action_cell(
         self,
@@ -1443,6 +1571,7 @@ class FixupDialog(QDialog):
         callback: Callable[[], None] | None,
     ) -> None:
         action_host = QWidget(self.comparison_table)
+        action_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         action_layout = QHBoxLayout(action_host)
         action_layout.setContentsMargins(0, 0, 0, 0)
         if action_text == "✕":
@@ -1461,6 +1590,19 @@ class FixupDialog(QDialog):
             action_layout.addWidget(button)
         self.comparison_table.setCellWidget(row, 1, action_host)
 
+    def _on_comparison_selection_changed(self) -> None:
+        self._refresh_button_state()
+        self._sync_comparison_widget_selection_styles()
+
+    def _sync_comparison_widget_selection_styles(self) -> None:
+        selected_rows = {index.row() for index in self.comparison_table.selectedIndexes()}
+        for row in range(self.comparison_table.rowCount()):
+            row_selected = row in selected_rows
+            action_widget = self.comparison_table.cellWidget(row, 1)
+            left_widget = self.comparison_table.cellWidget(row, 0)
+            right_widget = self.comparison_table.cellWidget(row, 2)
+            self._apply_comparison_row_widget_styles(row_selected, action_widget, left_widget, right_widget)
+
     def _update_action_column_metrics(self) -> None:
         metrics = self.comparison_table.fontMetrics()
         symbol_width = max(metrics.horizontalAdvance("←"), metrics.horizontalAdvance("✕"))
@@ -1469,6 +1611,9 @@ class FixupDialog(QDialog):
 
         action_col_width = self._action_button_width + 10
         self.comparison_table.setColumnWidth(1, action_col_width)
+        header_spacer = getattr(self, "comparison_header_action_spacer", None)
+        if isinstance(header_spacer, QWidget):
+            header_spacer.setFixedWidth(action_col_width)
 
     def _render_comparison_table(
         self,
@@ -1530,6 +1675,7 @@ class FixupDialog(QDialog):
                 else:
                     placeholder_item = QTableWidgetItem("")
                     placeholder_item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                    placeholder_item.setData(DIFF_RANGES_ROLE, [])
                     self.comparison_table.setItem(row, 0, placeholder_item)
 
                 if right_index is not None:
@@ -1542,7 +1688,7 @@ class FixupDialog(QDialog):
                     )
                     self.comparison_table.setCellWidget(row, 2, right_widget)
                 else:
-                    self.comparison_table.setItem(row, 2, QTableWidgetItem(""))
+                    self.comparison_table.setCellWidget(row, 2, self._make_text_cell_label("", []))
 
                 action_text = ""
                 callback: Callable[[], None] | None = None
@@ -1577,6 +1723,7 @@ class FixupDialog(QDialog):
 
         self.comparison_table.resizeRowsToContents()
         scrollbar.setValue(min(saved_scroll, scrollbar.maximum()))
+        self._sync_comparison_widget_selection_styles()
 
     def _schedule_refresh_after_edit(self) -> None:
         if self._pending_edit_refresh:
@@ -1587,7 +1734,15 @@ class FixupDialog(QDialog):
         def _run_refresh() -> None:
             self._pending_edit_refresh = False
             self._refresh_button_state()
+            saved_row = self.comparison_table.currentRow()
             self._update_difference_highlights()
+            if saved_row >= 0:
+                row_count = self.comparison_table.rowCount()
+                if row_count > 0:
+                    self._select_comparison_row(
+                        min(saved_row, row_count - 1),
+                        Qt.FocusReason.OtherFocusReason,
+                    )
 
         QTimer.singleShot(0, _run_refresh)
 
@@ -1692,6 +1847,9 @@ class FixupDialog(QDialog):
             return super().eventFilter(watched, event)
 
         if watched is comparison_table and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                if event.modifiers() == Qt.KeyboardModifier.NoModifier and self._trigger_action_for_current_row():
+                    return True
             if event.key() == Qt.Key.Key_Left:
                 selected_rows = sorted({index.row() for index in comparison_table.selectedIndexes()})
                 right_indexes: list[int] = []
@@ -2187,7 +2345,8 @@ class FixupDialog(QDialog):
         pane = QWidget(self)
         pane_layout = QVBoxLayout(pane)
         pane_layout.setContentsMargins(0, 0, 0, 0)
-        pane_layout.addWidget(QLabel("Image", self))
+        pane_layout.addWidget(self._create_pane_header_label("Image"))
+        pane_layout.addSpacing(self._PANE_HEADER_BOTTOM_SPACING)
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -2221,6 +2380,13 @@ class FixupDialog(QDialog):
         pane_layout.addWidget(scroll, stretch=1)
         pane_layout.addWidget(self._create_regenerate_frame(), stretch=0)
         return pane
+
+    def _create_pane_header_label(self, text: str) -> QLabel:
+        label = QLabel(text, self)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label.setContentsMargins(0, 0, 0, 0)
+        label.setMinimumHeight(label.fontMetrics().height() + self._PANE_HEADER_EXTRA_HEIGHT)
+        return label
 
     def _show_image_context_menu(self, position) -> None:
         image_path = self._image_path
@@ -2333,7 +2499,6 @@ class FixupDialog(QDialog):
             if app is not None:
                 app.installEventFilter(self)
                 self._global_key_filter_installed = True
-        self.comparison_table.itemSelectionChanged.connect(self._refresh_button_state)
         self._update_action_column_metrics()
         self._update_difference_highlights()
         self.comparison_table.resizeRowsToContents()
