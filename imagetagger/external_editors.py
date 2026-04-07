@@ -87,6 +87,22 @@ def _discover_macos_editors() -> list[ExternalEditor]:
                         )
                     )
 
+    # Adobe Creative Cloud frequently installs Photoshop inside versioned folders,
+    # for example /Applications/Adobe Photoshop 2024/Adobe Photoshop 2024.app.
+    for bundle in _discover_macos_photoshop_bundles(roots):
+        key = str(bundle).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(
+            ExternalEditor(
+                id="photoshop",
+                display_name=_macos_bundle_display_name(bundle, "Adobe Photoshop"),
+                launch_target=str(bundle),
+                launch_kind="mac_app",
+            )
+        )
+
     found.extend(
         _discover_from_which(
             [
@@ -99,6 +115,27 @@ def _discover_macos_editors() -> list[ExternalEditor]:
     )
 
     return found
+
+
+def _discover_macos_photoshop_bundles(roots: list[Path]) -> list[Path]:
+    bundles: list[Path] = []
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        try:
+            for bundle in root.rglob("Adobe Photoshop*.app"):
+                if bundle.is_dir():
+                    bundles.append(bundle)
+        except OSError:
+            continue
+    return bundles
+
+
+def _macos_bundle_display_name(bundle_path: Path, fallback: str) -> str:
+    name = bundle_path.name
+    if name.lower().endswith(".app"):
+        name = name[:-4]
+    return name.strip() or fallback
 
 
 def _discover_windows_editors() -> list[ExternalEditor]:

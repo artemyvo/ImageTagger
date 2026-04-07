@@ -127,12 +127,9 @@ Examples:
 
 ## Keyboard Shortcuts
 
-- Ctrl+L: Open folder.
-- Ctrl+R: Refresh current folder.
-- Ctrl+A: Select all visible images.
-- Alt+F: Jump to first fixup.
-- Alt+L: Jump to last fixup.
-- Ctrl++ / Ctrl+-: Increase/decrease UI font size.
+See the full cross-platform shortcut reference:
+
+- [shortcuts.md](shortcuts.md)
 
 ## Prompt Files
 

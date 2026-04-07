@@ -6,6 +6,7 @@ This folder contains project documentation beyond the top-level README.
 
 - Usage guide: [usage.md](usage.md)
 - Ollama settings: [ollama_settings.md](ollama_settings.md)
+- Keyboard shortcuts: [shortcuts.md](shortcuts.md)
 
 ## Reference Assets
 

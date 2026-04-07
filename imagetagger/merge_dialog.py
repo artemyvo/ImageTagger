@@ -54,6 +54,8 @@ from imagetagger.external_editors import (
     launch_image_in_editor,
     launch_image_in_system_default,
 )
+from imagetagger.shortcuts import native_shortcut_text, platform_key_sequence, platform_key_sequences
+from imagetagger.theme_colors import danger_accent_color
 
 
 class ItemActionWidget(QWidget):
@@ -94,7 +96,7 @@ class ItemActionWidget(QWidget):
             button.setMaximumHeight(20)
             button.clicked.connect(button_callback)
             if button_text == "✕":
-                button.setStyleSheet("QPushButton { color: red; font-weight: bold; padding: 2px; }")
+                button.setStyleSheet(_danger_button_stylesheet(button.palette()))
 
         if button is not None and button_on_left:
             layout.addWidget(button, stretch=0)
@@ -109,19 +111,24 @@ class ItemActionWidget(QWidget):
     def _build_highlighted_html(self, text: str, ranges: list[tuple[int, int]]) -> str:
         """Build HTML with diff highlighting for specified ranges."""
         if not ranges:
-            return f"<span>{text}</span>"
+            return f"<span>{self._escape_html(text)}</span>"
         
         # Sort ranges to avoid overlaps
         sorted_ranges = sorted(ranges)
         
         html_parts = []
         last_end = 0
+        highlight_bg, highlight_text = _diff_highlight_colors(self.palette())
+        highlight_bg_css = highlight_bg.name(QColor.NameFormat.HexRgb)
+        highlight_text_css = highlight_text.name(QColor.NameFormat.HexRgb)
         
         for start, end in sorted_ranges:
             if start > last_end:
                 html_parts.append(self._escape_html(text[last_end:start]))
-            high_color = "#fff3b3"  # Light yellow
-            html_parts.append(f'<span style="background-color: {high_color};">{self._escape_html(text[start:end])}</span>')
+            html_parts.append(
+                f'<span style="background-color: {highlight_bg_css}; color: {highlight_text_css};">'
+                f"{self._escape_html(text[start:end])}</span>"
+            )
             last_end = end
         
         if last_end < len(text):
@@ -173,6 +180,36 @@ ITEM_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 IS_SEARCH_MATCH_ROLE = int(Qt.ItemDataRole.UserRole) + 3
 
 
+def _blend_colors(base: QColor, overlay: QColor, alpha: float) -> QColor:
+    """Return an opaque blend of two colors using the provided alpha factor."""
+    clamped_alpha = max(0.0, min(1.0, alpha))
+    inv = 1.0 - clamped_alpha
+    return QColor(
+        round(base.red() * inv + overlay.red() * clamped_alpha),
+        round(base.green() * inv + overlay.green() * clamped_alpha),
+        round(base.blue() * inv + overlay.blue() * clamped_alpha),
+    )
+
+
+def _diff_highlight_colors(palette: QPalette) -> tuple[QColor, QColor]:
+    """Build diff highlight colors that stay readable in both light and dark themes."""
+    base = palette.color(QPalette.ColorRole.Base)
+    highlight = palette.color(QPalette.ColorRole.Highlight)
+    text = palette.color(QPalette.ColorRole.Text)
+    background = _blend_colors(base, highlight, 0.5)
+    return background, text
+
+
+def _danger_text_color(palette: QPalette) -> QColor:
+    """Build a readable danger color used for delete actions."""
+    return danger_accent_color(palette)
+
+
+def _danger_button_stylesheet(palette: QPalette) -> str:
+    color = _danger_text_color(palette).name(QColor.NameFormat.HexRgb)
+    return f"QPushButton {{ color: {color}; font-weight: bold; padding: 2px; }}"
+
+
 def strip_tag_list_prefix(tag: str) -> str:
     """Remove one or more leading markdown list markers from a tag value."""
     cleaned = tag.strip()
@@ -220,7 +257,9 @@ class DiffHighlightDelegate(QStyledItemDelegate):
         if ranges:
             cursor = QTextCursor(document)
             char_format = QTextCharFormat()
-            char_format.setBackground(QColor(255, 243, 179))
+            highlight_bg, highlight_text = _diff_highlight_colors(option.palette)
+            char_format.setBackground(highlight_bg)
+            char_format.setForeground(highlight_text)
             for start, end in ranges:
                 cursor.setPosition(start)
                 cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
@@ -356,7 +395,7 @@ class ScalableImageLabel(QLabel):
         super().__init__(parent)
         self._original_pixmap: QPixmap | None = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc;")
+        self.setStyleSheet("background-color: palette(base); border: 1px solid palette(mid);")
 
     def set_original_image(self, pixmap: QPixmap) -> None:
         self._original_pixmap = pixmap
@@ -532,41 +571,56 @@ class FixupDialog(QDialog):
         self.left_list.hide()
 
         self.remove_left_tag_action = QAction("Remove Selected Existing Tags", self)
-        self.remove_left_tag_action.setShortcut("Delete")
+        delete_shortcuts = [QKeySequence("Delete"), QKeySequence("Backspace")]
+        self.remove_left_tag_action.setShortcuts(delete_shortcuts)
+        self._delete_rows_shortcut_hint = native_shortcut_text(delete_shortcuts)
         self.remove_left_tag_action.triggered.connect(self._remove_selected_left_items)
         self.left_list.addAction(self.remove_left_tag_action)
         self.addAction(self.remove_left_tag_action)
 
         self.merge_and_next_alt_action = QAction("Merge and Next", self)
-        self.merge_and_next_alt_action.setShortcuts(
-            [QKeySequence("Alt+Enter"), QKeySequence("Alt+Return")]
+        merge_next_shortcuts = platform_key_sequences(
+            ["Alt+Enter", "Alt+Return"],
+            ["Alt+Enter", "Alt+Return"],
         )
+        self.merge_and_next_alt_action.setShortcuts(merge_next_shortcuts)
+        self._merge_next_shortcut_hint = native_shortcut_text(merge_next_shortcuts)
         self.merge_and_next_alt_action.triggered.connect(self._merge_and_next)
         self.addAction(self.merge_and_next_alt_action)
 
         self.focus_tag_input_action = QAction("Focus Tag Input", self)
-        self.focus_tag_input_action.setShortcut(QKeySequence("Alt+T"))
+        focus_tag_shortcut = platform_key_sequence("Alt+T", "Alt+T")
+        self.focus_tag_input_action.setShortcut(focus_tag_shortcut)
+        self._focus_tag_input_shortcut_hint = native_shortcut_text(focus_tag_shortcut)
         self.focus_tag_input_action.triggered.connect(self._focus_left_tag_input)
         self.addAction(self.focus_tag_input_action)
 
         self.undo_alt_action = QAction("Undo", self)
-        self.undo_alt_action.setShortcut(QKeySequence("Alt+U"))
+        undo_shortcuts = QKeySequence.keyBindings(QKeySequence.StandardKey.Undo)
+        self.undo_alt_action.setShortcuts(undo_shortcuts)
+        self._undo_shortcut_hint = native_shortcut_text(undo_shortcuts)
         self.undo_alt_action.triggered.connect(self._undo_merge)
         self.addAction(self.undo_alt_action)
 
         self.prev_actionable_row_action = QAction("Previous Actionable Row", self)
-        self.prev_actionable_row_action.setShortcut(QKeySequence("Alt+Up"))
+        prev_actionable_shortcut = platform_key_sequence("Alt+Up", "Alt+Up")
+        self.prev_actionable_row_action.setShortcut(prev_actionable_shortcut)
+        self._prev_actionable_shortcut_hint = native_shortcut_text(prev_actionable_shortcut)
         self.prev_actionable_row_action.triggered.connect(self._activate_previous_actionable_row)
         self.addAction(self.prev_actionable_row_action)
 
         self.next_actionable_row_action = QAction("Next Actionable Row", self)
-        self.next_actionable_row_action.setShortcut(QKeySequence("Alt+Down"))
+        next_actionable_shortcut = platform_key_sequence("Alt+Down", "Alt+Down")
+        self.next_actionable_row_action.setShortcut(next_actionable_shortcut)
+        self._next_actionable_shortcut_hint = native_shortcut_text(next_actionable_shortcut)
         self.next_actionable_row_action.triggered.connect(self._activate_next_actionable_row)
         self.addAction(self.next_actionable_row_action)
 
         self.left_tag_input = QLineEdit(self)
         self.left_tag_input.setPlaceholderText("Type a tag and press Enter")
-        self.left_tag_input.setToolTip("Type a tag and press Enter. Alt+T clears and focuses this field.")
+        self.left_tag_input.setToolTip(
+            f"Type a tag and press Enter. {self._focus_tag_input_shortcut_hint} clears and focuses this field."
+        )
         self.left_tag_input.returnPressed.connect(self._add_left_tag_from_input)
 
         self._tag_suggestions_model = QStringListModel(tag_suggestions or [], self)
@@ -602,8 +656,9 @@ class FixupDialog(QDialog):
         self.comparison_table.setGridStyle(Qt.PenStyle.NoPen)
         self.comparison_table.setStyleSheet(self._comparison_table_base_stylesheet())
         self.comparison_table.setToolTip(
-            "Keyboard: Alt+Up/Alt+Down jump actionable rows, Left applies proposed rows, "
-            "Enter triggers current row action, Delete removes selected current rows."
+            f"Keyboard: {self._prev_actionable_shortcut_hint}/{self._next_actionable_shortcut_hint} "
+            "jump actionable rows, Left applies proposed rows, "
+            f"Enter triggers current row action, {self._delete_rows_shortcut_hint} removes selected current rows."
         )
         self.comparison_table.itemChanged.connect(self._on_comparison_item_changed)
         self.comparison_table.itemSelectionChanged.connect(self._on_comparison_selection_changed)
@@ -654,8 +709,12 @@ class FixupDialog(QDialog):
         self.regenerate_max_resolution_input.setMaximumWidth(80)
 
         self.regenerate_button = QPushButton("&Regenerate", self)
-        self.regenerate_button.setShortcut(QKeySequence("Alt+R"))
-        self.regenerate_button.setToolTip("Regenerate proposed annotations (Alt+R)")
+        regenerate_shortcut = platform_key_sequence("Alt+R", "Alt+R")
+        self.regenerate_button.setShortcut(regenerate_shortcut)
+        self._regenerate_shortcut_hint = native_shortcut_text(regenerate_shortcut)
+        self.regenerate_button.setToolTip(
+            f"Regenerate proposed annotations ({self._regenerate_shortcut_hint})"
+        )
         self.regenerate_button.clicked.connect(self._regenerate_proposed_annotations)
 
         self.regenerate_status_label = QLabel(self)
@@ -665,7 +724,7 @@ class FixupDialog(QDialog):
         self.issues_label = QLabel(fixup_data.issues or "No issue details provided.", self)
         self.issues_label.setWordWrap(True)
         self.issues_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.issues_label.setStyleSheet("border: 1px solid #666; padding: 6px;")
+        self.issues_label.setStyleSheet("border: 1px solid palette(mid); padding: 6px;")
 
         for tag in current_tags:
             self._add_left_item(tag)
@@ -691,24 +750,32 @@ class FixupDialog(QDialog):
         self.undo_button = QPushButton("Undo", self)
         self.undo_button.setEnabled(False)
         self.undo_button.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
-        self.undo_button.setToolTip("Undo the last merge or local changes (Alt+U)")
+        self.undo_button.setToolTip(
+            f"Undo the last merge or local changes ({self._undo_shortcut_hint})"
+        )
         self.undo_button.clicked.connect(self._undo_merge)
 
         self.merge_next_button = QPushButton("Merge and Next", self)
-        self.merge_next_button.setShortcut(QKeySequence("Alt+Enter"))
-        self.merge_next_button.setToolTip("Apply current annotations and go to next item, even with no local edits (Alt+Enter)")
+        self.merge_next_button.setShortcut(merge_next_shortcuts[0])
+        self.merge_next_button.setToolTip(
+            f"Apply current annotations and go to next item, even with no local edits ({self._merge_next_shortcut_hint})"
+        )
         self.merge_next_button.clicked.connect(self._merge_and_next)
 
         self.prev_button = QPushButton("Prev", self)
         self.prev_button.setEnabled(can_navigate_prev)
-        self.prev_button.setShortcut(QKeySequence("Alt+Left"))
-        self.prev_button.setToolTip("Go to previous item (Alt+Left)")
+        prev_nav_shortcut = platform_key_sequence("Alt+Left", "Meta+[")
+        self.prev_button.setShortcut(prev_nav_shortcut)
+        self._prev_nav_shortcut_hint = native_shortcut_text(prev_nav_shortcut)
+        self.prev_button.setToolTip(f"Go to previous item ({self._prev_nav_shortcut_hint})")
         self.prev_button.clicked.connect(self._navigate_prev)
 
         self.next_button = QPushButton("Next", self)
         self.next_button.setEnabled(can_navigate_next)
-        self.next_button.setShortcut(QKeySequence("Alt+Right"))
-        self.next_button.setToolTip("Go to next item (Alt+Right)")
+        next_nav_shortcut = platform_key_sequence("Alt+Right", "Meta+]")
+        self.next_button.setShortcut(next_nav_shortcut)
+        self._next_nav_shortcut_hint = native_shortcut_text(next_nav_shortcut)
+        self.next_button.setToolTip(f"Go to next item ({self._next_nav_shortcut_hint})")
         self.next_button.clicked.connect(self._navigate_next)
 
         for button in (
@@ -1174,12 +1241,14 @@ class FixupDialog(QDialog):
         if self.next_button.isEnabled():
             self.merge_next_button.setText("Merge and Next")
             self.merge_next_button.setToolTip(
-                "Apply current annotations and go to next item, even with no local edits (Alt+Enter)"
+                f"Apply current annotations and go to next item, even with no local edits ({self._merge_next_shortcut_hint})"
             )
             self.merge_and_next_alt_action.setText("Merge and Next")
         else:
             self.merge_next_button.setText("Merge")
-            self.merge_next_button.setToolTip("Apply current annotations and resolve this fixup (Alt+Enter)")
+            self.merge_next_button.setToolTip(
+                f"Apply current annotations and resolve this fixup ({self._merge_next_shortcut_hint})"
+            )
             self.merge_and_next_alt_action.setText("Merge")
 
     def _refresh_button_state(self) -> None:
@@ -1485,13 +1554,17 @@ class FixupDialog(QDialog):
         if not ranges:
             return ItemActionWidget._escape_html(text)
 
+        highlight_bg, highlight_text = _diff_highlight_colors(self.palette())
+        highlight_bg_css = highlight_bg.name(QColor.NameFormat.HexRgb)
+        highlight_text_css = highlight_text.name(QColor.NameFormat.HexRgb)
         html_parts: list[str] = []
         last_end = 0
         for start, end in sorted(ranges):
             if start > last_end:
                 html_parts.append(ItemActionWidget._escape_html(text[last_end:start]))
             html_parts.append(
-                f'<span style="background-color: #fff3b3;">{ItemActionWidget._escape_html(text[start:end])}</span>'
+                f'<span style="background-color: {highlight_bg_css}; color: {highlight_text_css};">'
+                f"{ItemActionWidget._escape_html(text[start:end])}</span>"
             )
             last_end = end
         if last_end < len(text):
@@ -1585,7 +1658,7 @@ class FixupDialog(QDialog):
             button.setFixedWidth(self._action_button_width)
             button.setFixedHeight(self._action_button_height)
             if action_text == "✕":
-                button.setStyleSheet("QPushButton { color: red; font-weight: bold; padding: 2px; }")
+                button.setStyleSheet(_danger_button_stylesheet(button.palette()))
             button.clicked.connect(lambda _checked=False, cb=callback: cb())
             action_layout.addWidget(button)
         self.comparison_table.setCellWidget(row, 1, action_host)
@@ -1880,6 +1953,11 @@ class FixupDialog(QDialog):
                 return self._activate_first_comparison_row()
             if event.key() == Qt.Key.Key_End and event.modifiers() == Qt.KeyboardModifier.NoModifier:
                 return self._activate_last_comparison_row()
+            if sys.platform == "darwin" and event.modifiers() == Qt.KeyboardModifier.MetaModifier:
+                if event.key() == Qt.Key.Key_Up:
+                    return self._activate_first_comparison_row()
+                if event.key() == Qt.Key.Key_Down:
+                    return self._activate_last_comparison_row()
 
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
             if event.modifiers() != Qt.KeyboardModifier.NoModifier:
@@ -1915,11 +1993,21 @@ class FixupDialog(QDialog):
                 if event.key() == Qt.Key.Key_Down and self._activate_first_comparison_row():
                     return True
 
-        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End):
-            if event.modifiers() != Qt.KeyboardModifier.NoModifier:
+        if event.type() == QEvent.Type.KeyPress:
+            is_home_end = event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End) and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            is_macos_cmd_home_end = (
+                sys.platform == "darwin"
+                and event.modifiers() == Qt.KeyboardModifier.MetaModifier
+                and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)
+            )
+            if not is_home_end and not is_macos_cmd_home_end:
                 return super().eventFilter(watched, event)
 
-            activate_row = self._activate_first_comparison_row if event.key() == Qt.Key.Key_Home else self._activate_last_comparison_row
+            activate_row = (
+                self._activate_first_comparison_row
+                if event.key() in (Qt.Key.Key_Home, Qt.Key.Key_Up)
+                else self._activate_last_comparison_row
+            )
             left_input_empty = not left_tag_input.text().strip()
 
             focused = self.focusWidget()

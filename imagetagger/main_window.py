@@ -81,6 +81,8 @@ from imagetagger.ollama import (
     validate_tags,
     reset_prompt_to_default,
 )
+from imagetagger.shortcuts import platform_key_sequence
+from imagetagger.theme_colors import danger_accent_color, danger_text_on_accent_color
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
@@ -734,18 +736,20 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.list_widget, stretch=1)
 
         self.select_all_images_action = QAction("Select All Images", self)
-        self.select_all_images_action.setShortcut("Ctrl+A")
+        self.select_all_images_action.setShortcuts(
+            QKeySequence.keyBindings(QKeySequence.StandardKey.SelectAll)
+        )
         self.select_all_images_action.triggered.connect(self._select_all_images)
         self.list_widget.addAction(self.select_all_images_action)
 
         self.jump_first_fixup_action = QAction("Jump to First Fixup", self)
-        self.jump_first_fixup_action.setShortcut("Alt+F")
+        self.jump_first_fixup_action.setShortcut(platform_key_sequence("Alt+F", "Alt+F"))
         self.jump_first_fixup_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.jump_first_fixup_action.triggered.connect(self._jump_to_first_fixup)
         self.list_widget.addAction(self.jump_first_fixup_action)
 
         self.jump_last_fixup_action = QAction("Jump to Last Fixup", self)
-        self.jump_last_fixup_action.setShortcut("Alt+L")
+        self.jump_last_fixup_action.setShortcut(platform_key_sequence("Alt+L", "Alt+L"))
         self.jump_last_fixup_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.jump_last_fixup_action.triggered.connect(self._jump_to_last_fixup)
         self.list_widget.addAction(self.jump_last_fixup_action)
@@ -761,7 +765,9 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Ignored,
         )
-        self.image_label.setStyleSheet("background: #111; color: #ddd; border: 1px solid #333;")
+        self.image_label.setStyleSheet(
+            "background-color: palette(base); color: palette(text); border: 1px solid palette(mid);"
+        )
         self.image_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.image_label.customContextMenuRequested.connect(self._show_image_context_menu)
         center_layout.addWidget(self.image_label)
@@ -1146,15 +1152,15 @@ class MainWindow(QMainWindow):
         menu = self.menuBar().addMenu("File")
 
         self.open_action = QAction("Open Folder", self)
-        self.open_action.setShortcut("Ctrl+L")
+        self.open_action.setShortcut(platform_key_sequence("Ctrl+L", "Meta+O"))
         self.open_action.triggered.connect(self.open_folder)
 
         self.refresh_action = QAction("Refresh Folder", self)
-        self.refresh_action.setShortcut("Ctrl+R")
+        self.refresh_action.setShortcut(platform_key_sequence("Ctrl+R", "Meta+R"))
         self.refresh_action.triggered.connect(self.refresh_directory)
 
         self.exit_action = QAction("Exit", self)
-        self.exit_action.setShortcut("Alt+F4")
+        self.exit_action.setShortcuts(QKeySequence.keyBindings(QKeySequence.StandardKey.Quit))
         self.exit_action.triggered.connect(self.close)
 
         menu.addAction(self.open_action)
@@ -2318,14 +2324,18 @@ class MainWindow(QMainWindow):
         y = 2
         badge_rect = QRect(x, y, diameter, diameter)
 
+        palette = self.palette()
+        badge_color = danger_accent_color(palette)
+        badge_text_color = danger_text_on_accent_color(palette)
+
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(220, 45, 45))
+        painter.setBrush(badge_color)
         painter.drawEllipse(badge_rect)
 
         font = painter.font()
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QColor(255, 255, 255))
+        painter.setPen(badge_text_color)
         painter.drawText(badge_rect, int(Qt.AlignmentFlag.AlignCenter), "!")
         painter.end()
         return badge_ready
