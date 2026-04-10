@@ -6,6 +6,7 @@ from typing import Callable, Literal
 from PyQt6.QtWidgets import QDialog, QMessageBox, QStyle, QWidget
 
 from imagetagger.io_utils import atomic_write_text
+from imagetagger.llm_provider import VisionLlmSession
 from imagetagger.merge_dialog import FixupDialog, parse_fixup_data
 
 
@@ -150,8 +151,7 @@ def open_fixup_dialog_for_image(
     can_navigate_prev: bool = False,
     can_navigate_next: bool = False,
     tag_suggestions: list[str] | None = None,
-    ollama_server_url: str = "",
-    ollama_model_name: str = "",
+    provider_session: VisionLlmSession | None = None,
     regenerate_tags_enabled: bool = True,
     regenerate_description_enabled: bool = True,
     regenerate_timeout_seconds: int = 300,
@@ -209,8 +209,7 @@ def open_fixup_dialog_for_image(
         can_navigate_next,
         tag_suggestions=tag_suggestions,
         normalize_annotation=sanitize_annotation,
-        ollama_server_url=ollama_server_url,
-        ollama_model_name=ollama_model_name,
+        provider_session=provider_session,
         regenerate_tags_enabled=regenerate_tags_enabled,
         regenerate_description_enabled=regenerate_description_enabled,
         regenerate_timeout_seconds=regenerate_timeout_seconds,

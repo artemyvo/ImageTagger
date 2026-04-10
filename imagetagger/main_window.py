@@ -44,7 +44,16 @@ from PyQt6.QtWidgets import (
 
 from imagetagger import config as _config
 from imagetagger.annotations import parse_tags_text, sanitize_annotation_text
+from imagetagger.image_prep import configure_image_preparation, consume_image_preparation_warning
 from imagetagger.io_utils import atomic_write_text
+from imagetagger.llm_provider import (
+    DEFAULT_LLM_TIMEOUT,
+    DEFAULT_VISION_PROVIDER,
+    LlmProviderCancelled,
+    LlmProviderError,
+    LlmRequestCancellation,
+    VisionLlmSession,
+)
 from imagetagger.merge_actions import (
     clear_fixup_files_for_image,
     existing_fixup_path_for_image,
@@ -58,28 +67,20 @@ from imagetagger.external_editors import (
     launch_image_in_editor,
     launch_image_in_system_default,
 )
-from imagetagger.ollama import (
+from imagetagger.llm_queries import (
     active_prompt_for_kind,
     clear_prompt_override,
-    configure_runtime,
-    consume_resize_warning,
-    DEFAULT_TIMEOUT,
-    DEFAULT_OLLAMA_SERVER,
     get_default_prompt,
-    image_matches_query,
     load_prompt_for_kind,
-    OllamaCancelled,
-    OllamaCancellation,
-    OllamaError,
-    fetch_models,
-    generate_description,
-    generate_tags,
-    normalize_server_url,
+    parse_yes_no_response,
+    prepare_description_query,
+    prepare_search_query,
+    prepare_tagging_query,
+    prepare_validation_query,
     prompt_source_for_kind,
+    reset_prompt_to_default,
     save_prompt_for_kind,
     set_prompt_override,
-    validate_tags,
-    reset_prompt_to_default,
 )
 from imagetagger.shortcuts import platform_key_sequence
 from imagetagger.theme_colors import danger_accent_color, danger_text_on_accent_color
@@ -542,7 +543,7 @@ class FolderLoadWorker(QObject):
         self.finished.emit(processed, str(self.folder))
 
 
-class OllamaTaskWorker(QObject):
+class LlmTaskWorker(QObject):
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal(str)
@@ -556,14 +557,14 @@ class OllamaTaskWorker(QObject):
     def run(self) -> None:
         try:
             result = self.task(self.progress.emit, self.item_ready.emit)
-        except OllamaCancelled as exc:
+        except LlmProviderCancelled as exc:
             self.cancelled.emit(str(exc))
             return
-        except OllamaError as exc:
+        except LlmProviderError as exc:
             self.failed.emit(str(exc))
             return
         except Exception as exc:
-            self.failed.emit(f"Unexpected Ollama error: {exc}")
+            self.failed.emit(f"Unexpected LLM error: {exc}")
             return
         self.finished.emit(result)
 
@@ -646,8 +647,9 @@ class MainWindow(QMainWindow):
         self.current_index: int = -1
         self._loader_thread: QThread | None = None
         self._loader_worker: FolderLoadWorker | None = None
-        self._ollama_thread: QThread | None = None
-        self._ollama_worker: OllamaTaskWorker | None = None
+        self._llm_provider = DEFAULT_VISION_PROVIDER
+        self._llm_thread: QThread | None = None
+        self._llm_worker: LlmTaskWorker | None = None
         self.known_tags: set[str] = set()
         self.tag_counts: Counter[str] = Counter()
         self._updating_tag_list = False
@@ -670,10 +672,10 @@ class MainWindow(QMainWindow):
         self._ai_find_batch_matched = 0
         self._ai_find_batch_started_at: float | None = None
         self._ai_find_batch_retry_images = 0
-        self._ollama_action_name: str | None = None
-        self._ollama_cancel: OllamaCancellation | None = None
-        self._ollama_threads_auto_mode = False
-        self._ollama_threads_current = 0
+        self._llm_action_name: str | None = None
+        self._llm_cancel: LlmRequestCancellation | None = None
+        self._llm_threads_auto_mode = False
+        self._llm_threads_current = 0
         self._icc_warning_paths: list[str] = []
         self._right_splitter_initialized = False
         self.prompt_editors: dict[str, QTextEdit] = {}
@@ -684,8 +686,8 @@ class MainWindow(QMainWindow):
         self.save_action: QAction | None = None
         self.increase_font_action: QAction | None = None
         self.decrease_font_action: QAction | None = None
-        self.ollama_server_url = DEFAULT_OLLAMA_SERVER
-        self.ollama_model_name = ""
+        self.llm_endpoint = self._llm_provider.default_endpoint
+        self.llm_model_name = ""
         self.status_connection_label: QLabel | None = None
         self._pending_selection_path: Path | None = None
         self._root_directory: Path | None = None
@@ -697,7 +699,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._apply_tag_list_height()
         self._apply_config()
-        self._update_ollama_controls()
+        self._update_llm_controls()
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -826,81 +828,81 @@ class MainWindow(QMainWindow):
         autotag_layout.setContentsMargins(6, 6, 6, 6)
         autotag_layout.setSpacing(6)
 
-        self.ollama_server_input = QLineEdit(self)
-        self.ollama_server_input.setPlaceholderText("http://127.0.0.1:11434")
-        self.ollama_server_input.setText(self.ollama_server_url)
+        self.llm_endpoint_input = QLineEdit(self)
+        self.llm_endpoint_input.setPlaceholderText("http://127.0.0.1:11434")
+        self.llm_endpoint_input.setText(self.llm_endpoint)
 
-        self.ollama_fetch_button = QPushButton("Fetch models", self)
-        self.ollama_fetch_button.clicked.connect(self.fetch_ollama_models)
+        self.llm_fetch_button = QPushButton("Fetch models", self)
+        self.llm_fetch_button.clicked.connect(self.fetch_provider_models)
 
-        self.ollama_model_combo = QComboBox(self)
-        self.ollama_model_combo.setEditable(False)
+        self.llm_model_combo = QComboBox(self)
+        self.llm_model_combo.setEditable(False)
 
-        self.ollama_use_button = QPushButton("Use", self)
-        self.ollama_use_button.clicked.connect(self.use_selected_ollama_model)
+        self.llm_use_button = QPushButton("Use", self)
+        self.llm_use_button.clicked.connect(self.use_selected_provider_model)
 
-        self.ollama_timeout_input = QLineEdit(self)
-        self.ollama_timeout_input.setValidator(QIntValidator(1, 86400, self))
-        self.ollama_timeout_input.setText(str(int(DEFAULT_TIMEOUT)))
-        self.ollama_timeout_input.setMaximumWidth(90)
+        self.llm_timeout_input = QLineEdit(self)
+        self.llm_timeout_input.setValidator(QIntValidator(1, 86400, self))
+        self.llm_timeout_input.setText(str(int(DEFAULT_LLM_TIMEOUT)))
+        self.llm_timeout_input.setMaximumWidth(90)
 
-        self.ollama_retry_input = QLineEdit(self)
-        self.ollama_retry_input.setValidator(QIntValidator(0, 10, self))
-        self.ollama_retry_input.setText("3")
-        self.ollama_retry_input.setMaximumWidth(60)
+        self.llm_retry_input = QLineEdit(self)
+        self.llm_retry_input.setValidator(QIntValidator(0, 10, self))
+        self.llm_retry_input.setText("3")
+        self.llm_retry_input.setMaximumWidth(60)
 
-        self.ollama_max_resolution_input = QLineEdit(self)
+        self.llm_max_resolution_input = QLineEdit(self)
         max_resolution_validator = QDoubleValidator(0.01, 1000.0, 3, self)
         max_resolution_validator.setNotation(QDoubleValidator.Notation.StandardNotation)
-        self.ollama_max_resolution_input.setValidator(max_resolution_validator)
-        self.ollama_max_resolution_input.setText("5.0")
-        self.ollama_max_resolution_input.setMaximumWidth(80)
+        self.llm_max_resolution_input.setValidator(max_resolution_validator)
+        self.llm_max_resolution_input.setText("5.0")
+        self.llm_max_resolution_input.setMaximumWidth(80)
 
-        self.ollama_threads_input = QLineEdit(self)
-        self.ollama_threads_input.setValidator(QIntValidator(0, 128, self))
-        self.ollama_threads_input.setText("1")
-        self.ollama_threads_input.setMaximumWidth(50)
-        self.ollama_threads_input.setToolTip("0 = auto")
+        self.llm_threads_input = QLineEdit(self)
+        self.llm_threads_input.setValidator(QIntValidator(0, 128, self))
+        self.llm_threads_input.setText("1")
+        self.llm_threads_input.setMaximumWidth(50)
+        self.llm_threads_input.setToolTip("0 = auto")
 
         server_row = QHBoxLayout()
-        server_row.addWidget(self.ollama_server_input, stretch=1)
-        server_row.addWidget(self.ollama_fetch_button)
+        server_row.addWidget(self.llm_endpoint_input, stretch=1)
+        server_row.addWidget(self.llm_fetch_button)
 
         model_row = QHBoxLayout()
-        model_row.addWidget(self.ollama_model_combo, stretch=1)
-        model_row.addWidget(self.ollama_use_button)
+        model_row.addWidget(self.llm_model_combo, stretch=1)
+        model_row.addWidget(self.llm_use_button)
 
         generate_options_row = QHBoxLayout()
         self.generate_tags_checkbox = QCheckBox("Tags", self)
         self.generate_tags_checkbox.setChecked(True)
-        self.generate_tags_checkbox.checkStateChanged.connect(lambda _state: self._update_ollama_controls())
+        self.generate_tags_checkbox.checkStateChanged.connect(lambda _state: self._update_llm_controls())
         self.generate_description_checkbox = QCheckBox("Description", self)
         self.generate_description_checkbox.setChecked(True)
-        self.generate_description_checkbox.checkStateChanged.connect(lambda _state: self._update_ollama_controls())
+        self.generate_description_checkbox.checkStateChanged.connect(lambda _state: self._update_llm_controls())
         generate_options_row.addWidget(self.generate_tags_checkbox)
         generate_options_row.addWidget(self.generate_description_checkbox)
         generate_options_row.addSpacing(12)
         generate_options_row.addWidget(QLabel("Timeout", self))
-        generate_options_row.addWidget(self.ollama_timeout_input)
+        generate_options_row.addWidget(self.llm_timeout_input)
         generate_options_row.addSpacing(8)
         generate_options_row.addWidget(QLabel("Retries", self))
-        generate_options_row.addWidget(self.ollama_retry_input)
+        generate_options_row.addWidget(self.llm_retry_input)
         generate_options_row.addSpacing(8)
         generate_options_row.addWidget(QLabel("Downscale", self))
-        generate_options_row.addWidget(self.ollama_max_resolution_input)
+        generate_options_row.addWidget(self.llm_max_resolution_input)
         generate_options_row.addSpacing(8)
         generate_options_row.addWidget(QLabel("Threads", self))
-        generate_options_row.addWidget(self.ollama_threads_input)
+        generate_options_row.addWidget(self.llm_threads_input)
         generate_options_row.addStretch(1)
 
         gen_row = QHBoxLayout()
         self.generate_button = QPushButton("Generate", self)
-        self.generate_button.clicked.connect(self.generate_with_ollama)
+        self.generate_button.clicked.connect(self.generate_with_llm)
         gen_row.addWidget(self.generate_button)
 
         buttons_row = QHBoxLayout()
         self.validate_button = QPushButton("Validate", self)
-        self.validate_button.clicked.connect(self.validate_tags_with_ollama)
+        self.validate_button.clicked.connect(self.validate_tags_with_llm)
         self.fixup_button = QPushButton("Fixup", self)
         self.fixup_button.clicked.connect(self.open_fixup_dialog)
         buttons_row.addWidget(self.validate_button)
@@ -909,9 +911,9 @@ class MainWindow(QMainWindow):
         ai_find_row = QHBoxLayout()
         self.ai_find_input = QLineEdit(self)
         self.ai_find_input.setPlaceholderText("Find concept in selected images (e.g. raven)")
-        self.ai_find_input.textChanged.connect(lambda _text: self._update_ollama_controls())
+        self.ai_find_input.textChanged.connect(lambda _text: self._update_llm_controls())
         self.ai_find_button = QPushButton("AI Find", self)
-        self.ai_find_button.clicked.connect(self.ai_find_with_ollama)
+        self.ai_find_button.clicked.connect(self.ai_find_with_llm)
         ai_find_row.addWidget(self.ai_find_input, stretch=1)
         ai_find_row.addWidget(self.ai_find_button)
 
@@ -1029,7 +1031,7 @@ class MainWindow(QMainWindow):
             current_text = editor.toPlainText().strip()
             try:
                 active_text = active_prompt_for_kind(kind)
-            except OllamaError:
+            except LlmProviderError:
                 active_text = load_prompt_for_kind(kind)
 
             if current_text != active_text:
@@ -1056,13 +1058,13 @@ class MainWindow(QMainWindow):
     def _prompt_editor_text(self, kind: str) -> str:
         editor = self.prompt_editors.get(kind)
         if editor is None:
-            raise OllamaError(f"Prompt editor for {kind} is not available.")
+            raise LlmProviderError(f"Prompt editor for {kind} is not available.")
         return editor.toPlainText().strip()
 
     def _apply_prompt_override(self, kind: str) -> None:
         try:
             set_prompt_override(kind, self._prompt_editor_text(kind))
-        except OllamaError as exc:
+        except LlmProviderError as exc:
             QMessageBox.critical(self, "Apply prompt failed", str(exc))
             return
         self._update_prompt_status(kind)
@@ -1071,7 +1073,7 @@ class MainWindow(QMainWindow):
     def _save_prompt_to_file(self, kind: str) -> None:
         try:
             saved_text = save_prompt_for_kind(kind, self._prompt_editor_text(kind))
-        except OllamaError as exc:
+        except LlmProviderError as exc:
             QMessageBox.critical(self, "Save prompt failed", str(exc))
             return
 
@@ -1085,7 +1087,7 @@ class MainWindow(QMainWindow):
         try:
             default_text = reset_prompt_to_default(kind)
             clear_prompt_override(kind)
-        except OllamaError as exc:
+        except LlmProviderError as exc:
             QMessageBox.critical(self, "Reset prompt failed", str(exc))
             return
 
@@ -1104,36 +1106,36 @@ class MainWindow(QMainWindow):
 
         self._apply_main_window_geometry_from_config()
 
-        server = self._cfg.get("ollama_server", "").strip()
-        model = self._cfg.get("ollama_model", "").strip()
+        server = self._cfg.get("llm_endpoint", self._cfg.get("ollama_server", "")).strip()
+        model = self._cfg.get("llm_model", self._cfg.get("ollama_model", "")).strip()
 
-        max_resolution_mpx = self._cfg.get("ollama_max_resolution_mpx", 5)
+        max_resolution_mpx = self._cfg.get("llm_max_resolution_mpx", 5)
         try:
             max_resolution_value = float(max_resolution_mpx)
             if max_resolution_value <= 0:
                 raise ValueError()
         except (TypeError, ValueError):
             max_resolution_value = 5.0
-        self.ollama_max_resolution_input.setText(self._format_mpx(max_resolution_value))
+        self.llm_max_resolution_input.setText(self._format_mpx(max_resolution_value))
         max_pixels = max(1, int(max_resolution_value * 1_000_000))
-        configure_runtime(max_image_pixels=max_pixels)
+        configure_image_preparation(max_image_pixels=max_pixels)
 
-        raw_threads = self._cfg.get("ollama_threads", 1)
+        raw_threads = self._cfg.get("llm_threads", self._cfg.get("ollama_threads", 1))
         try:
             thread_count = int(raw_threads)
             if thread_count < 0:
                 raise ValueError()
         except (TypeError, ValueError):
             thread_count = 1
-        self.ollama_threads_input.setText(str(thread_count))
+        self.llm_threads_input.setText(str(thread_count))
 
         if server:
-            self.ollama_server_url = server
-            self.ollama_server_input.setText(server)
+            self.llm_endpoint = server
+            self.llm_endpoint_input.setText(server)
         if model:
-            self.ollama_model_name = model
-            self.ollama_model_combo.addItem(model)
-            self.ollama_model_combo.setCurrentIndex(0)
+            self.llm_model_name = model
+            self.llm_model_combo.addItem(model)
+            self.llm_model_combo.setCurrentIndex(0)
 
         # Load last used directory if it exists
         last_dir = self._cfg.get("last_open_directory", "").strip()
@@ -1247,73 +1249,78 @@ class MainWindow(QMainWindow):
     def decrease_font_size(self) -> None:
         self._apply_app_font_size(self._current_app_font_size() - 1)
 
-    def fetch_ollama_models(self) -> None:
-        server = self.ollama_server_input.text().strip()
-        self.ollama_fetch_button.setEnabled(False)
+    def fetch_provider_models(self) -> None:
+        server = self.llm_endpoint_input.text().strip()
+        self.llm_fetch_button.setEnabled(False)
         try:
-            model_names = fetch_models(server, timeout=self._ollama_timeout_seconds())
-            normalized_server = normalize_server_url(server)
-        except OllamaError as exc:
-            QMessageBox.warning(self, "Ollama connection failed", str(exc))
+            model_names = self._llm_provider.fetch_models(server, timeout=self._llm_timeout_seconds())
+            normalized_server = self._llm_provider.normalize_endpoint(server)
+        except LlmProviderError as exc:
+            QMessageBox.warning(self, f"{self._llm_provider.display_name} connection failed", str(exc))
             return
         finally:
-            self.ollama_fetch_button.setEnabled(True)
+            self.llm_fetch_button.setEnabled(True)
 
-        self.ollama_server_input.setText(normalized_server)
-        self.ollama_model_combo.clear()
-        self.ollama_model_combo.addItems(model_names)
+        self.llm_endpoint_input.setText(normalized_server)
+        self.llm_model_combo.clear()
+        self.llm_model_combo.addItems(model_names)
         if model_names:
-            self.ollama_model_combo.setCurrentIndex(0)
+            self.llm_model_combo.setCurrentIndex(0)
             self.statusBar().showMessage(f"Fetched {len(model_names)} model(s) from {normalized_server}")
         else:
             self.statusBar().showMessage(f"No models found at {normalized_server}")
-            QMessageBox.information(self, "No models found", "The Ollama server returned no models.")
+            QMessageBox.information(self, "No models found", f"The {self._llm_provider.display_name} server returned no models.")
 
-    def use_selected_ollama_model(self) -> None:
-        model_name = self.ollama_model_combo.currentText().strip()
+    def use_selected_provider_model(self) -> None:
+        model_name = self.llm_model_combo.currentText().strip()
         if not model_name:
             QMessageBox.warning(self, "No model selected", "Fetch models and choose one before using it.")
             return
 
         try:
-            normalized_server = normalize_server_url(self.ollama_server_input.text())
-        except OllamaError as exc:
+            normalized_server = self._llm_provider.normalize_endpoint(self.llm_endpoint_input.text())
+        except LlmProviderError as exc:
             QMessageBox.warning(self, "Invalid server", str(exc))
             return
 
-        self.ollama_server_url = normalized_server
-        self.ollama_model_name = model_name
-        self.ollama_server_input.setText(normalized_server)
-        self._cfg["ollama_server"] = normalized_server
-        self._cfg["ollama_model"] = model_name
+        self.llm_endpoint = normalized_server
+        self.llm_model_name = model_name
+        self.llm_endpoint_input.setText(normalized_server)
+        self._cfg["llm_endpoint"] = normalized_server
+        self._cfg["llm_model"] = model_name
         try:
-            self._cfg["ollama_threads"] = self._ollama_thread_count(show_message=False)
-        except OllamaError:
-            self._cfg["ollama_threads"] = 1
+            self._cfg["llm_threads"] = self._llm_thread_count(show_message=False)
+        except LlmProviderError:
+            self._cfg["llm_threads"] = 1
         _config.save(self._cfg)
-        self._update_ollama_controls()
-        self.statusBar().showMessage(f"Ollama model selected: {self.ollama_model_name}")
+        self._update_llm_controls()
+        self.statusBar().showMessage(f"{self._llm_provider.display_name} model selected: {self.llm_model_name}")
 
-    def _ollama_timeout_seconds(self) -> float:
-        raw_value = self.ollama_timeout_input.text().strip()
+    def _active_provider_session(self) -> VisionLlmSession | None:
+        if not self.llm_model_name.strip():
+            return None
+        return self._llm_provider.create_session(self.llm_endpoint, self.llm_model_name)
+
+    def _llm_timeout_seconds(self) -> float:
+        raw_value = self.llm_timeout_input.text().strip()
         if not raw_value:
             QMessageBox.warning(self, "Invalid timeout", "Enter timeout in seconds.")
-            raise OllamaError("Enter timeout in seconds.")
+            raise LlmProviderError("Enter timeout in seconds.")
 
         try:
             timeout = int(raw_value)
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid timeout", "Timeout must be a whole number of seconds.")
-            raise OllamaError("Timeout must be a whole number of seconds.") from exc
+            raise LlmProviderError("Timeout must be a whole number of seconds.") from exc
 
         if timeout < 1:
             QMessageBox.warning(self, "Invalid timeout", "Timeout must be at least 1 second.")
-            raise OllamaError("Timeout must be at least 1 second.")
+            raise LlmProviderError("Timeout must be at least 1 second.")
 
         return float(timeout)
 
-    def _ollama_retry_count(self) -> int:
-        raw_value = self.ollama_retry_input.text().strip()
+    def _llm_retry_count(self) -> int:
+        raw_value = self.llm_retry_input.text().strip()
         try:
             retries = int(raw_value)
         except ValueError:
@@ -1327,63 +1334,63 @@ class MainWindow(QMainWindow):
             normalized += ".0"
         return normalized
 
-    def _ollama_max_resolution_mpx_value(self, show_message: bool = True) -> float:
-        raw_value = self.ollama_max_resolution_input.text().strip()
+    def _llm_max_resolution_mpx_value(self, show_message: bool = True) -> float:
+        raw_value = self.llm_max_resolution_input.text().strip()
         if not raw_value:
             if show_message:
                 QMessageBox.warning(self, "Invalid query downscale", "Enter query downscale in megapixels.")
-            raise OllamaError("Enter query downscale in megapixels.")
+            raise LlmProviderError("Enter query downscale in megapixels.")
 
         try:
             value = float(raw_value)
         except ValueError as exc:
             if show_message:
                 QMessageBox.warning(self, "Invalid query downscale", "Query downscale must be a number.")
-            raise OllamaError("Query downscale must be a number.") from exc
+            raise LlmProviderError("Query downscale must be a number.") from exc
 
         if value <= 0:
             if show_message:
                 QMessageBox.warning(self, "Invalid query downscale", "Query downscale must be greater than 0.")
-            raise OllamaError("Query downscale must be greater than 0.")
+            raise LlmProviderError("Query downscale must be greater than 0.")
 
         return value
 
     def _apply_query_downscale_setting(self) -> float:
-        max_resolution_mpx = self._ollama_max_resolution_mpx_value()
+        max_resolution_mpx = self._llm_max_resolution_mpx_value()
         max_pixels = max(1, int(max_resolution_mpx * 1_000_000))
-        configure_runtime(max_image_pixels=max_pixels)
+        configure_image_preparation(max_image_pixels=max_pixels)
         return max_resolution_mpx
 
-    def _ollama_thread_count(self, show_message: bool = True) -> int:
-        raw_value = self.ollama_threads_input.text().strip()
+    def _llm_thread_count(self, show_message: bool = True) -> int:
+        raw_value = self.llm_threads_input.text().strip()
         if not raw_value:
             if show_message:
                 QMessageBox.warning(self, "Invalid threads", "Enter thread count (0 for auto).")
-            raise OllamaError("Enter thread count.")
+            raise LlmProviderError("Enter thread count.")
 
         try:
             thread_count = int(raw_value)
         except ValueError as exc:
             if show_message:
                 QMessageBox.warning(self, "Invalid threads", "Thread count must be a whole number.")
-            raise OllamaError("Thread count must be a whole number.") from exc
+            raise LlmProviderError("Thread count must be a whole number.") from exc
 
         if thread_count < 0:
             if show_message:
                 QMessageBox.warning(self, "Invalid threads", "Thread count must be 0 or greater.")
-            raise OllamaError("Thread count must be 0 or greater.")
+            raise LlmProviderError("Thread count must be 0 or greater.")
 
         return thread_count
 
-    def _update_ollama_controls(self) -> None:
-        connected = bool(self.ollama_model_name.strip())
+    def _update_llm_controls(self) -> None:
+        connected = bool(self.llm_model_name.strip())
         if connected:
-            text = f"{self.ollama_model_name} @ {self.ollama_server_url}"
+            text = f"{self.llm_model_name} @ {self.llm_endpoint}"
         else:
             text = "no model"
         if self.status_connection_label is not None:
             self.status_connection_label.setText(text)
-        if self._ollama_thread is not None and self._ollama_action_name == "Generate":
+        if self._llm_thread is not None and self._llm_action_name == "Generate":
             self.generate_button.setText("Stop generation")
             self.generate_button.setEnabled(True)
             self.validate_button.setText("Validate")
@@ -1393,7 +1400,7 @@ class MainWindow(QMainWindow):
             self.ai_find_input.setEnabled(False)
             self._update_fixup_button_state()
             return
-        if self._ollama_thread is not None and self._ollama_action_name == "Validate":
+        if self._llm_thread is not None and self._llm_action_name == "Validate":
             self.generate_button.setText("Generate")
             self.generate_button.setEnabled(False)
             self.validate_button.setText("Stop validation")
@@ -1403,7 +1410,7 @@ class MainWindow(QMainWindow):
             self.ai_find_input.setEnabled(False)
             self._update_fixup_button_state()
             return
-        if self._ollama_thread is not None and self._ollama_action_name == "AI Find":
+        if self._llm_thread is not None and self._llm_action_name == "AI Find":
             self.generate_button.setText("Generate")
             self.generate_button.setEnabled(False)
             self.validate_button.setText("Validate")
@@ -1417,7 +1424,7 @@ class MainWindow(QMainWindow):
         self.generate_button.setText("Generate")
         self.validate_button.setText("Validate")
         self.ai_find_button.setText("AI Find")
-        active = connected and self._ollama_thread is None
+        active = connected and self._llm_thread is None
         self.generate_button.setEnabled(
             active
             and (self.generate_tags_checkbox.isChecked() or self.generate_description_checkbox.isChecked())
@@ -1630,7 +1637,7 @@ class MainWindow(QMainWindow):
             item = self.list_widget.item(self.current_index)
             if item is None or item.isHidden():
                 enabled = False
-        if self._ollama_thread is not None:
+        if self._llm_thread is not None:
             enabled = False
         self.fixup_button.setEnabled(enabled)
 
@@ -1894,7 +1901,7 @@ class MainWindow(QMainWindow):
 
         try:
             regenerate_max_resolution_mpx = self._apply_query_downscale_setting()
-        except OllamaError:
+        except LlmProviderError:
             return
 
         initial_fixup_record_indices = [
@@ -1907,12 +1914,12 @@ class MainWindow(QMainWindow):
 
         regenerate_tags_enabled = self.generate_tags_checkbox.isChecked()
         regenerate_description_enabled = self.generate_description_checkbox.isChecked()
-        timeout_text = self.ollama_timeout_input.text().strip()
-        retry_text = self.ollama_retry_input.text().strip()
+        timeout_text = self.llm_timeout_input.text().strip()
+        retry_text = self.llm_retry_input.text().strip()
         try:
-            regenerate_timeout_seconds = int(timeout_text) if timeout_text else int(DEFAULT_TIMEOUT)
+            regenerate_timeout_seconds = int(timeout_text) if timeout_text else int(DEFAULT_LLM_TIMEOUT)
         except ValueError:
-            regenerate_timeout_seconds = int(DEFAULT_TIMEOUT)
+            regenerate_timeout_seconds = int(DEFAULT_LLM_TIMEOUT)
         try:
             regenerate_retry_count = int(retry_text) if retry_text else 0
         except ValueError:
@@ -1941,8 +1948,8 @@ class MainWindow(QMainWindow):
                 regenerate_retry_count = max(0, retry_count)
             if isinstance(max_resolution_mpx, (int, float)) and max_resolution_mpx > 0:
                 regenerate_max_resolution_mpx = float(max_resolution_mpx)
-                self.ollama_max_resolution_input.setText(self._format_mpx(regenerate_max_resolution_mpx))
-                configure_runtime(max_image_pixels=max(1, int(regenerate_max_resolution_mpx * 1_000_000)))
+                self.llm_max_resolution_input.setText(self._format_mpx(regenerate_max_resolution_mpx))
+                configure_image_preparation(max_image_pixels=max(1, int(regenerate_max_resolution_mpx * 1_000_000)))
 
         while True:
             record = self._current_record()
@@ -1977,8 +1984,7 @@ class MainWindow(QMainWindow):
                 can_navigate_prev=prev_fixup_index is not None,
                 can_navigate_next=next_fixup_index is not None,
                 tag_suggestions=self._sorted_tag_suggestions(),
-                ollama_server_url=self.ollama_server_url,
-                ollama_model_name=self.ollama_model_name,
+                provider_session=self._active_provider_session(),
                 regenerate_tags_enabled=regenerate_tags_enabled,
                 regenerate_description_enabled=regenerate_description_enabled,
                 regenerate_timeout_seconds=regenerate_timeout_seconds,
@@ -2163,22 +2169,22 @@ class MainWindow(QMainWindow):
         self.list_widget.setEnabled(not loading)
         self.tag_input.setEnabled(not loading)
         self.tag_list.setEnabled(not loading)
-        self.ollama_server_input.setEnabled(not loading and self._ollama_thread is None)
-        self.ollama_fetch_button.setEnabled(not loading and self._ollama_thread is None)
-        self.ollama_model_combo.setEnabled(not loading and self._ollama_thread is None)
-        self.ollama_timeout_input.setEnabled(not loading and self._ollama_thread is None)
-        self.ollama_retry_input.setEnabled(not loading and self._ollama_thread is None)
-        self.ollama_max_resolution_input.setEnabled(not loading and self._ollama_thread is None)
-        self.ollama_use_button.setEnabled(not loading and self._ollama_thread is None)
-        self.ai_find_input.setEnabled(not loading and self._ollama_thread is None)
-        self.ai_find_button.setEnabled(not loading and self._ollama_thread is None and bool(self.ollama_model_name.strip()))
+        self.llm_endpoint_input.setEnabled(not loading and self._llm_thread is None)
+        self.llm_fetch_button.setEnabled(not loading and self._llm_thread is None)
+        self.llm_model_combo.setEnabled(not loading and self._llm_thread is None)
+        self.llm_timeout_input.setEnabled(not loading and self._llm_thread is None)
+        self.llm_retry_input.setEnabled(not loading and self._llm_thread is None)
+        self.llm_max_resolution_input.setEnabled(not loading and self._llm_thread is None)
+        self.llm_use_button.setEnabled(not loading and self._llm_thread is None)
+        self.ai_find_input.setEnabled(not loading and self._llm_thread is None)
+        self.ai_find_button.setEnabled(not loading and self._llm_thread is None and bool(self.llm_model_name.strip()))
         self.fixup_button.setEnabled(False)
         if loading:
             self.generate_button.setEnabled(False)
             self.validate_button.setEnabled(False)
             self.ai_find_button.setEnabled(False)
         else:
-            self._update_ollama_controls()
+            self._update_llm_controls()
 
     def _apply_tag_list_height(self) -> None:
         if self._right_splitter_initialized:
@@ -2410,17 +2416,17 @@ class MainWindow(QMainWindow):
             self._show_image(self.records[self.current_index].image_path)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
-        if self._ollama_cancel is not None:
-            self._ollama_cancel.cancel()
+        if self._llm_cancel is not None:
+            self._llm_cancel.cancel()
         if self._loader_worker is not None:
             self._loader_worker.cancel()
 
         if self._loader_thread is not None and self._loader_thread.isRunning():
             self._loader_thread.quit()
             self._loader_thread.wait(2000)
-        if self._ollama_thread is not None and self._ollama_thread.isRunning():
-            self._ollama_thread.quit()
-            self._ollama_thread.wait(2000)
+        if self._llm_thread is not None and self._llm_thread.isRunning():
+            self._llm_thread.quit()
+            self._llm_thread.wait(2000)
 
         self._save_main_window_geometry()
         record = self._current_record()
@@ -2429,7 +2435,7 @@ class MainWindow(QMainWindow):
         else:
             self._cfg.pop("last_selected_image", None)
 
-        configured_downscale = self._cfg.get("ollama_max_resolution_mpx", 5)
+        configured_downscale = self._cfg.get("llm_max_resolution_mpx", 5)
         try:
             fallback_value = float(configured_downscale)
             if fallback_value <= 0:
@@ -2438,11 +2444,11 @@ class MainWindow(QMainWindow):
             fallback_value = 5.0
 
         try:
-            self._cfg["ollama_max_resolution_mpx"] = self._ollama_max_resolution_mpx_value(show_message=False)
-        except OllamaError:
-            self._cfg["ollama_max_resolution_mpx"] = fallback_value
+            self._cfg["llm_max_resolution_mpx"] = self._llm_max_resolution_mpx_value(show_message=False)
+        except LlmProviderError:
+            self._cfg["llm_max_resolution_mpx"] = fallback_value
 
-        configured_threads = self._cfg.get("ollama_threads", 1)
+        configured_threads = self._cfg.get("llm_threads", self._cfg.get("ollama_threads", 1))
         try:
             fallback_threads = int(configured_threads)
             if fallback_threads < 0:
@@ -2451,9 +2457,9 @@ class MainWindow(QMainWindow):
             fallback_threads = 1
 
         try:
-            self._cfg["ollama_threads"] = self._ollama_thread_count(show_message=False)
-        except OllamaError:
-            self._cfg["ollama_threads"] = fallback_threads
+            self._cfg["llm_threads"] = self._llm_thread_count(show_message=False)
+        except LlmProviderError:
+            self._cfg["llm_threads"] = fallback_threads
 
         _config.save(self._cfg)
         super().closeEvent(event)
@@ -2641,20 +2647,20 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{status_prefix}: {record.text_path.name}")
         return True
 
-    def _ollama_threads_status_suffix(self) -> str:
-        if self._ollama_action_name is None:
+    def _llm_threads_status_suffix(self) -> str:
+        if self._llm_action_name is None:
             return ""
-        current = max(1, int(self._ollama_threads_current))
-        if self._ollama_threads_auto_mode:
+        current = max(1, int(self._llm_threads_current))
+        if self._llm_threads_auto_mode:
             return f" | threads: {current} auto"
         return f" | threads: {current}"
 
-    def _run_parallel_ollama_jobs(
+    def _run_parallel_llm_jobs(
         self,
         jobs: list[object],
         requested_threads: int,
         action_prefix: str,
-        cancel_token: OllamaCancellation,
+        cancel_token: LlmRequestCancellation,
         report_progress: Callable[[str], None],
         report_item: Callable[[object], None],
         process_one: Callable[[int, object], dict],
@@ -2681,7 +2687,7 @@ class MainWindow(QMainWindow):
                 parsed = default
             return max(minimum, min(maximum, parsed))
 
-        auto_max_threads = cfg_int("ollama_auto_max_threads", 32, 1, 512)
+        auto_max_threads = cfg_int("llm_auto_max_threads", int(self._cfg.get("ollama_auto_max_threads", 32)), 1, 512)
         if auto_mode:
             max_threads = min(total, auto_max_threads)
             target_parallelism = 1
@@ -2689,18 +2695,31 @@ class MainWindow(QMainWindow):
             max_threads = min(total, requested_threads)
             target_parallelism = max_threads
 
-        self._ollama_threads_auto_mode = auto_mode
-        self._ollama_threads_current = target_parallelism
+        self._llm_threads_auto_mode = auto_mode
+        self._llm_threads_current = target_parallelism
 
         # Auto mode uses a conservative AIMD-like controller with latency/retry guardrails.
         # Scale up by +1 every `scale_up_every` consecutive clean completions after warmup.
         # A retry resets the streak and steps down by 1; a timeout halves immediately.
-        adaptive_warmup_items = cfg_int("ollama_auto_warmup_items", 4, 1, 1000)
-        scale_up_every = cfg_int("ollama_auto_scale_up_every", 3, 1, 100)
+        adaptive_warmup_items = cfg_int("llm_auto_warmup_items", int(self._cfg.get("ollama_auto_warmup_items", 4)), 1, 1000)
+        scale_up_every = cfg_int("llm_auto_scale_up_every", int(self._cfg.get("ollama_auto_scale_up_every", 3)), 1, 100)
         consecutive_clean = 0
+        backoff_epoch = 0
+
+        def log_thread_change(previous: int, current: int, reason: str, image_name: str = "") -> None:
+            if previous == current:
+                return
+            message = (
+                f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
+                f"llm_threads_change action={action_prefix.lower()} from={previous} to={current} reason={reason}"
+            )
+            if image_name:
+                message += f" image={image_name}"
+            print(message, flush=True)
 
         executor = ThreadPoolExecutor(max_workers=max_threads)
         in_flight: set = set()
+        future_backoff_epochs: dict = {}
         next_job_index = 0
         completed = 0
 
@@ -2708,25 +2727,51 @@ class MainWindow(QMainWindow):
             while next_job_index < total and len(in_flight) < target_parallelism:
                 future = executor.submit(process_one, next_job_index + 1, jobs[next_job_index])
                 in_flight.add(future)
+                future_backoff_epochs[future] = backoff_epoch
                 next_job_index += 1
 
             while in_flight:
                 cancel_token.raise_if_cancelled()
                 finished = next(as_completed(in_flight))
                 in_flight.remove(finished)
+                finished_backoff_epoch = int(future_backoff_epochs.pop(finished, backoff_epoch))
 
                 payload = finished.result()
                 completed += 1
 
                 retried = bool(payload.get("retried")) if isinstance(payload, dict) else False
+                image_name = ""
+                if isinstance(payload, dict):
+                    image_name = str(payload.get("image_name", "")).strip()
                 if auto_mode:
                     timed_out = bool(payload.get("timed_out")) if isinstance(payload, dict) else False
                     if timed_out:
-                        target_parallelism = max(1, target_parallelism // 2)
-                        consecutive_clean = 0
+                        # Only the first negative signal from a given submission epoch
+                        # should trigger backoff. Other in-flight failures from the same
+                        # overload window are stale signals and should not keep shrinking.
+                        if finished_backoff_epoch == backoff_epoch:
+                            previous_parallelism = target_parallelism
+                            target_parallelism = max(1, target_parallelism // 2)
+                            backoff_epoch += 1
+                            consecutive_clean = 0
+                            log_thread_change(
+                                previous_parallelism,
+                                target_parallelism,
+                                f"timeout_backoff completed={completed}/{total} epoch={backoff_epoch}",
+                                image_name=image_name,
+                            )
                     elif retried:
-                        target_parallelism = max(1, target_parallelism - 1)
-                        consecutive_clean = 0
+                        if finished_backoff_epoch == backoff_epoch:
+                            previous_parallelism = target_parallelism
+                            target_parallelism = max(1, target_parallelism - 1)
+                            backoff_epoch += 1
+                            consecutive_clean = 0
+                            log_thread_change(
+                                previous_parallelism,
+                                target_parallelism,
+                                f"retry_backoff completed={completed}/{total} epoch={backoff_epoch}",
+                                image_name=image_name,
+                            )
                     elif completed >= adaptive_warmup_items:
                         consecutive_clean += 1
                         # Require scale_up_every * current_parallelism clean items before
@@ -2734,13 +2779,17 @@ class MainWindow(QMainWindow):
                         # and prevents runaway scaling when the server is under load.
                         threshold = scale_up_every * max(1, target_parallelism)
                         if consecutive_clean >= threshold and target_parallelism < max_threads:
+                            previous_parallelism = target_parallelism
                             target_parallelism += 1
                             consecutive_clean = 0
-                    self._ollama_threads_current = target_parallelism
+                            log_thread_change(
+                                previous_parallelism,
+                                target_parallelism,
+                                f"clean_scale_up completed={completed}/{total} threshold={threshold}",
+                                image_name=image_name,
+                            )
+                    self._llm_threads_current = target_parallelism
 
-                image_name = ""
-                if isinstance(payload, dict):
-                    image_name = str(payload.get("image_name", "")).strip()
                 if image_name:
                     report_progress(f"{action_prefix}: processing {completed}/{total} - {image_name}")
                 else:
@@ -2751,6 +2800,7 @@ class MainWindow(QMainWindow):
                 while next_job_index < total and len(in_flight) < target_parallelism:
                     future = executor.submit(process_one, next_job_index + 1, jobs[next_job_index])
                     in_flight.add(future)
+                    future_backoff_epochs[future] = backoff_epoch
                     next_job_index += 1
         except Exception:
             cancel_token.cancel()
@@ -2760,19 +2810,19 @@ class MainWindow(QMainWindow):
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
 
-    def generate_with_ollama(self) -> None:
-        if self._ollama_thread is not None and self._ollama_action_name == "Generate":
+    def generate_with_llm(self) -> None:
+        if self._llm_thread is not None and self._llm_action_name == "Generate":
             self._request_stop_generation()
             return
 
         try:
             self._apply_query_downscale_setting()
-        except OllamaError:
+        except LlmProviderError:
             return
 
         try:
-            thread_count = self._ollama_thread_count()
-        except OllamaError:
+            thread_count = self._llm_thread_count()
+        except LlmProviderError:
             return
 
         selected_indexes = self._selected_record_indexes()
@@ -2785,15 +2835,21 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Nothing selected", "Enable Tags or Description before generating.")
             return
 
-        cancel_token = OllamaCancellation()
+        cancel_token = LlmRequestCancellation()
+        session = self._active_provider_session()
+        if session is None:
+            QMessageBox.warning(self, "No model selected", f"Choose a {self._llm_provider.display_name} model first.")
+            return
 
         def generate_task(
             report_progress: Callable[[str], None],
             report_item: Callable[[object], None],
         ) -> object:
-            timeout = self._ollama_timeout_seconds()
-            retry_count = self._ollama_retry_count()
+            timeout = self._llm_timeout_seconds()
+            retry_count = self._llm_retry_count()
             total = len(selected_indexes)
+            description_query = prepare_description_query() if include_description else None
+            tags_query = prepare_tagging_query() if include_tags else None
 
             def process_one(position: int, record_index: int) -> dict:
                 record = self.records[record_index]
@@ -2825,7 +2881,7 @@ class MainWindow(QMainWindow):
                         elapsed = time.monotonic() - _start
                         remaining = timeout - elapsed
                         if remaining <= 0:
-                            raise OllamaError(
+                            raise LlmProviderError(
                                 f"Timed out after {int(timeout)} seconds while generating annotations for {record.image_path.name}."
                             )
                         return remaining
@@ -2833,12 +2889,11 @@ class MainWindow(QMainWindow):
                     attempt_items: list[str] = []
                     retry_needed = False
                     try:
-                        if include_description:
+                        if description_query is not None:
                             description = self._sanitize_annotation_text(
-                                generate_description(
-                                    self.ollama_server_url,
-                                    self.ollama_model_name,
+                                session.generate(
                                     record.image_path,
+                                    description_query.prompt,
                                     timeout=remaining_timeout(),
                                     cancellation=cancel_token,
                                 ).strip()
@@ -2846,15 +2901,14 @@ class MainWindow(QMainWindow):
                             if description:
                                 attempt_items.append(description)
 
-                        if include_tags:
+                        if tags_query is not None:
                             attempt_items.extend(
                                 [
                                     tag.lower()
                                     for tag in self._parse_tags(
-                                        generate_tags(
-                                            self.ollama_server_url,
-                                            self.ollama_model_name,
+                                        session.generate(
                                             record.image_path,
+                                            tags_query.prompt,
                                             timeout=remaining_timeout(),
                                             cancellation=cancel_token,
                                         )
@@ -2864,9 +2918,9 @@ class MainWindow(QMainWindow):
 
                         if not attempt_items:
                             retry_needed = True
-                    except OllamaCancelled:
+                    except LlmProviderCancelled:
                         raise
-                    except OllamaError as exc:
+                    except LlmProviderError as exc:
                         if "Timed out" in str(exc):
                             image_timed_out = True
                         retry_needed = True
@@ -2897,7 +2951,7 @@ class MainWindow(QMainWindow):
                     "image_name": image_name,
                 }
 
-            self._run_parallel_ollama_jobs(
+            self._run_parallel_llm_jobs(
                 jobs=[int(index) for index in selected_indexes],
                 requested_threads=thread_count,
                 action_prefix="Generate",
@@ -2917,7 +2971,7 @@ class MainWindow(QMainWindow):
         self._generate_batch_started_at = time.monotonic()
         self._generate_batch_retry_images = 0
 
-        self._start_ollama_task(
+        self._start_llm_task(
             task=generate_task,
             action_name="Generate",
             empty_message="Ollama returned no annotations.",
@@ -2925,19 +2979,19 @@ class MainWindow(QMainWindow):
             merge_with_existing=True,
         )
 
-    def validate_tags_with_ollama(self) -> None:
-        if self._ollama_thread is not None and self._ollama_action_name == "Validate":
+    def validate_tags_with_llm(self) -> None:
+        if self._llm_thread is not None and self._llm_action_name == "Validate":
             self._request_stop_validation()
             return
 
         try:
             self._apply_query_downscale_setting()
-        except OllamaError:
+        except LlmProviderError:
             return
 
         try:
-            thread_count = self._ollama_thread_count()
-        except OllamaError:
+            thread_count = self._llm_thread_count()
+        except LlmProviderError:
             return
 
         selected_indexes = self._selected_record_indexes()
@@ -2960,14 +3014,18 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No annotations to validate", "Add tags or a description before validating.")
             return
 
-        cancel_token = OllamaCancellation()
+        cancel_token = LlmRequestCancellation()
+        session = self._active_provider_session()
+        if session is None:
+            QMessageBox.warning(self, "No model selected", f"Choose a {self._llm_provider.display_name} model first.")
+            return
 
         def validate_task(
             report_progress: Callable[[str], None],
             report_item: Callable[[object], None],
         ) -> object:
-            timeout = self._ollama_timeout_seconds()
-            retry_count = self._ollama_retry_count()
+            timeout = self._llm_timeout_seconds()
+            retry_count = self._llm_retry_count()
             total = len(annotated_records)
 
             def process_one(position: int, record_index: int, annotations: str) -> dict:
@@ -3000,23 +3058,21 @@ class MainWindow(QMainWindow):
                         elapsed = time.monotonic() - _start
                         remaining = timeout - elapsed
                         if remaining <= 0:
-                            raise OllamaError(
+                            raise LlmProviderError(
                                 f"Timed out after {int(timeout)} seconds while validating annotations for {record.image_path.name}."
                             )
                         return remaining
 
                     try:
-                        validation_result = validate_tags(
-                            self.ollama_server_url,
-                            self.ollama_model_name,
+                        validation_result = session.generate(
                             record.image_path,
-                            annotations,
+                            prepare_validation_query(annotations).prompt,
                             timeout=remaining_timeout(),
                             cancellation=cancel_token,
                         )
-                    except OllamaCancelled:
+                    except LlmProviderCancelled:
                         raise
-                    except OllamaError as exc:
+                    except LlmProviderError as exc:
                         if "Timed out" in str(exc):
                             image_timed_out = True
                         elapsed_seconds = time.monotonic() - attempt_start
@@ -3047,7 +3103,7 @@ class MainWindow(QMainWindow):
                     "image_name": image_name,
                 }
 
-            self._run_parallel_ollama_jobs(
+            self._run_parallel_llm_jobs(
                 jobs=[(int(record_index), str(annotations)) for record_index, annotations in annotated_records],
                 requested_threads=thread_count,
                 action_prefix="Validate",
@@ -3074,7 +3130,7 @@ class MainWindow(QMainWindow):
         self._validate_batch_started_at = time.monotonic()
         self._validate_batch_retry_images = 0
 
-        self._start_ollama_task(
+        self._start_llm_task(
             task=validate_task,
             action_name="Validate",
             empty_message="Ollama returned no validation result.",
@@ -3082,19 +3138,19 @@ class MainWindow(QMainWindow):
             validation_report=True,
         )
 
-    def ai_find_with_ollama(self) -> None:
-        if self._ollama_thread is not None and self._ollama_action_name == "AI Find":
+    def ai_find_with_llm(self) -> None:
+        if self._llm_thread is not None and self._llm_action_name == "AI Find":
             self._request_stop_ai_find()
             return
 
         try:
             self._apply_query_downscale_setting()
-        except OllamaError:
+        except LlmProviderError:
             return
 
         try:
-            thread_count = self._ollama_thread_count()
-        except OllamaError:
+            thread_count = self._llm_thread_count()
+        except LlmProviderError:
             return
 
         query = " ".join(self.ai_find_input.text().split())
@@ -3107,14 +3163,19 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No image selected", "Select one or more images before running AI Find.")
             return
 
-        cancel_token = OllamaCancellation()
+        cancel_token = LlmRequestCancellation()
+        session = self._active_provider_session()
+        if session is None:
+            QMessageBox.warning(self, "No model selected", f"Choose a {self._llm_provider.display_name} model first.")
+            return
+        search_query = prepare_search_query(query)
 
         def find_task(
             report_progress: Callable[[str], None],
             report_item: Callable[[object], None],
         ) -> object:
-            timeout = self._ollama_timeout_seconds()
-            retry_count = self._ollama_retry_count()
+            timeout = self._llm_timeout_seconds()
+            retry_count = self._llm_retry_count()
             total = len(selected_indexes)
 
             def process_one(position: int, record_index: int) -> dict:
@@ -3146,23 +3207,24 @@ class MainWindow(QMainWindow):
                         elapsed = time.monotonic() - _start
                         remaining = timeout - elapsed
                         if remaining <= 0:
-                            raise OllamaError(
+                            raise LlmProviderError(
                                 f"Timed out after {int(timeout)} seconds while searching {record.image_path.name}."
                             )
                         return remaining
 
                     try:
-                        matched = image_matches_query(
-                            self.ollama_server_url,
-                            self.ollama_model_name,
-                            record.image_path,
-                            query,
-                            timeout=remaining_timeout(),
-                            cancellation=cancel_token,
+                        matched = parse_yes_no_response(
+                            session.generate(
+                                record.image_path,
+                                search_query.prompt,
+                                timeout=remaining_timeout(),
+                                cancellation=cancel_token,
+                            ),
+                            context="AI Find",
                         )
-                    except OllamaCancelled:
+                    except LlmProviderCancelled:
                         raise
-                    except OllamaError as exc:
+                    except LlmProviderError as exc:
                         if "Timed out" in str(exc):
                             image_timed_out = True
                         elapsed_seconds = time.monotonic() - attempt_start
@@ -3194,7 +3256,7 @@ class MainWindow(QMainWindow):
                     "image_name": image_name,
                 }
 
-            self._run_parallel_ollama_jobs(
+            self._run_parallel_llm_jobs(
                 jobs=[int(index) for index in selected_indexes],
                 requested_threads=thread_count,
                 action_prefix="AI Find",
@@ -3219,53 +3281,53 @@ class MainWindow(QMainWindow):
         self._ai_find_batch_started_at = time.monotonic()
         self._ai_find_batch_retry_images = 0
 
-        self._start_ollama_task(
+        self._start_llm_task(
             task=find_task,
             action_name="AI Find",
             empty_message="No matching images were found.",
             cancel_token=cancel_token,
         )
 
-    def _start_ollama_task(
+    def _start_llm_task(
         self,
         task: Callable[[Callable[[str], None], Callable[[object], None]], object],
         action_name: str,
         empty_message: str,
-        cancel_token: OllamaCancellation | None = None,
+        cancel_token: LlmRequestCancellation | None = None,
         result_as_single: bool = False,
         merge_with_existing: bool = False,
         validation_report: bool = False,
     ) -> None:
-        if not self.ollama_model_name.strip():
-            QMessageBox.warning(self, "No Ollama model", "Connect to an Ollama server and choose a model first.")
+        if not self.llm_model_name.strip():
+            QMessageBox.warning(self, "No model selected", f"Connect to {self._llm_provider.display_name} and choose a model first.")
             return
-        if self._ollama_thread is not None:
+        if self._llm_thread is not None:
             return
 
-        resize_warning = consume_resize_warning()
+        resize_warning = consume_image_preparation_warning()
         if resize_warning:
             QMessageBox.warning(self, "Image resize disabled", resize_warning)
 
-        self.statusBar().showMessage(f"{action_name} with Ollama...")
+        self.statusBar().showMessage(f"{action_name} with {self._llm_provider.display_name}...")
         self.validate_button.setEnabled(False)
-        self.ollama_server_input.setEnabled(False)
-        self.ollama_fetch_button.setEnabled(False)
-        self.ollama_model_combo.setEnabled(False)
-        self.ollama_timeout_input.setEnabled(False)
-        self.ollama_retry_input.setEnabled(False)
-        self.ollama_max_resolution_input.setEnabled(False)
-        self.ollama_threads_input.setEnabled(False)
-        self.ollama_use_button.setEnabled(False)
-        self._ollama_action_name = action_name
-        self._ollama_cancel = cancel_token
-        self._update_ollama_controls()
+        self.llm_endpoint_input.setEnabled(False)
+        self.llm_fetch_button.setEnabled(False)
+        self.llm_model_combo.setEnabled(False)
+        self.llm_timeout_input.setEnabled(False)
+        self.llm_retry_input.setEnabled(False)
+        self.llm_max_resolution_input.setEnabled(False)
+        self.llm_threads_input.setEnabled(False)
+        self.llm_use_button.setEnabled(False)
+        self._llm_action_name = action_name
+        self._llm_cancel = cancel_token
+        self._update_llm_controls()
 
-        self._ollama_thread = QThread(self)
-        self._ollama_worker = OllamaTaskWorker(task)
-        self._ollama_worker.moveToThread(self._ollama_thread)
-        self._ollama_thread.started.connect(self._ollama_worker.run)
-        self._ollama_worker.finished.connect(
-            lambda result: self._on_ollama_task_finished(
+        self._llm_thread = QThread(self)
+        self._llm_worker = LlmTaskWorker(task)
+        self._llm_worker.moveToThread(self._llm_thread)
+        self._llm_thread.started.connect(self._llm_worker.run)
+        self._llm_worker.finished.connect(
+            lambda result: self._on_llm_task_finished(
                 result,
                 action_name,
                 empty_message,
@@ -3274,40 +3336,40 @@ class MainWindow(QMainWindow):
                 validation_report,
             )
         )
-        self._ollama_worker.progress.connect(self._on_ollama_task_progress)
-        self._ollama_worker.item_ready.connect(self._on_ollama_task_item_ready)
-        self._ollama_worker.cancelled.connect(self._on_ollama_task_cancelled)
-        self._ollama_worker.failed.connect(self._on_ollama_task_failed)
-        self._ollama_worker.finished.connect(self._ollama_thread.quit)
-        self._ollama_worker.cancelled.connect(self._ollama_thread.quit)
-        self._ollama_worker.failed.connect(self._ollama_thread.quit)
-        self._ollama_thread.finished.connect(self._cleanup_ollama_task)
-        self._update_ollama_controls()
-        self._ollama_thread.start()
+        self._llm_worker.progress.connect(self._on_llm_task_progress)
+        self._llm_worker.item_ready.connect(self._on_llm_task_item_ready)
+        self._llm_worker.cancelled.connect(self._on_llm_task_cancelled)
+        self._llm_worker.failed.connect(self._on_llm_task_failed)
+        self._llm_worker.finished.connect(self._llm_thread.quit)
+        self._llm_worker.cancelled.connect(self._llm_thread.quit)
+        self._llm_worker.failed.connect(self._llm_thread.quit)
+        self._llm_thread.finished.connect(self._cleanup_llm_task)
+        self._update_llm_controls()
+        self._llm_thread.start()
 
     def _request_stop_generation(self) -> None:
-        if self._ollama_action_name != "Generate" or self._ollama_cancel is None:
+        if self._llm_action_name != "Generate" or self._llm_cancel is None:
             return
         self.generate_button.setEnabled(False)
         self.generate_button.setText("Stopping generation...")
         self.statusBar().showMessage("Stopping generation...")
-        self._ollama_cancel.cancel()
+        self._llm_cancel.cancel()
 
     def _request_stop_validation(self) -> None:
-        if self._ollama_action_name != "Validate" or self._ollama_cancel is None:
+        if self._llm_action_name != "Validate" or self._llm_cancel is None:
             return
         self.validate_button.setEnabled(False)
         self.validate_button.setText("Stopping validation...")
         self.statusBar().showMessage("Stopping validation...")
-        self._ollama_cancel.cancel()
+        self._llm_cancel.cancel()
 
     def _request_stop_ai_find(self) -> None:
-        if self._ollama_action_name != "AI Find" or self._ollama_cancel is None:
+        if self._llm_action_name != "AI Find" or self._llm_cancel is None:
             return
         self.ai_find_button.setEnabled(False)
         self.ai_find_button.setText("Stopping AI Find...")
         self.statusBar().showMessage("Stopping AI Find...")
-        self._ollama_cancel.cancel()
+        self._llm_cancel.cancel()
 
     def _format_duration(self, seconds: float) -> str:
         total_seconds = max(0, int(seconds))
@@ -3342,8 +3404,8 @@ class MainWindow(QMainWindow):
             f" | retried images {retry_images}"
         )
 
-    def _on_ollama_task_progress(self, message: str) -> None:
-        if self._ollama_action_name == "Generate" and (
+    def _on_llm_task_progress(self, message: str) -> None:
+        if self._llm_action_name == "Generate" and (
             message.startswith("Generate: processing")
             or message.startswith("Generate: retry")
             or message.startswith("Generate: finalizing")
@@ -3354,10 +3416,10 @@ class MainWindow(QMainWindow):
                 self._generate_batch_started_at,
                 self._generate_batch_retry_images,
             )
-            self.statusBar().showMessage(f"{message}{details}{self._ollama_threads_status_suffix()}")
+            self.statusBar().showMessage(f"{message}{details}{self._llm_threads_status_suffix()}")
             return
 
-        if self._ollama_action_name == "Validate" and (
+        if self._llm_action_name == "Validate" and (
             message.startswith("Validate: processing")
             or message.startswith("Validate: retry")
             or message.startswith("Validate: finalizing")
@@ -3369,10 +3431,10 @@ class MainWindow(QMainWindow):
                 self._validate_batch_retry_images,
             )
             issues_text = f" | invalid: {self._validate_batch_issues}"
-            self.statusBar().showMessage(f"{message}{details}{issues_text}{self._ollama_threads_status_suffix()}")
+            self.statusBar().showMessage(f"{message}{details}{issues_text}{self._llm_threads_status_suffix()}")
             return
 
-        if self._ollama_action_name == "AI Find" and (
+        if self._llm_action_name == "AI Find" and (
             message.startswith("AI Find: processing")
             or message.startswith("AI Find: retry")
             or message.startswith("AI Find: finalizing")
@@ -3384,13 +3446,13 @@ class MainWindow(QMainWindow):
                 self._ai_find_batch_retry_images,
             )
             found_text = f" | found images: {self._ai_find_batch_matched}"
-            self.statusBar().showMessage(f"{message}{details}{found_text}{self._ollama_threads_status_suffix()}")
+            self.statusBar().showMessage(f"{message}{details}{found_text}{self._llm_threads_status_suffix()}")
             return
 
-        self.statusBar().showMessage(f"{message}{self._ollama_threads_status_suffix()}")
+        self.statusBar().showMessage(f"{message}{self._llm_threads_status_suffix()}")
 
-    def _on_ollama_task_cancelled(self, message: str) -> None:
-        action = self._ollama_action_name or "Request"
+    def _on_llm_task_cancelled(self, message: str) -> None:
+        action = self._llm_action_name or "Request"
         if action == "Validate":
             total = self._validate_batch_total
             processed = self._validate_batch_processed
@@ -3449,7 +3511,7 @@ class MainWindow(QMainWindow):
 
         return (False, 0)
 
-    def _on_ollama_task_item_ready(self, payload: object) -> None:
+    def _on_llm_task_item_ready(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
         kind = payload.get("kind")
@@ -3485,7 +3547,7 @@ class MainWindow(QMainWindow):
                     self._generate_batch_retry_images,
                 )
                 self.statusBar().showMessage(
-                    f"Generate: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name}{details}{self._ollama_threads_status_suffix()}"
+                    f"Generate: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name}{details}{self._llm_threads_status_suffix()}"
                 )
             return
 
@@ -3532,7 +3594,7 @@ class MainWindow(QMainWindow):
                 result_text = "match" if matched else "no match"
                 found_text = f" | found images: {self._ai_find_batch_matched}"
                 self.statusBar().showMessage(
-                    f"AI Find: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name} ({result_text}){details}{found_text}{self._ollama_threads_status_suffix()}"
+                    f"AI Find: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name} ({result_text}){details}{found_text}{self._llm_threads_status_suffix()}"
                 )
             return
 
@@ -3567,10 +3629,10 @@ class MainWindow(QMainWindow):
                 self._validate_batch_retry_images,
             )
             self.statusBar().showMessage(
-                f"Validate: processed {self._validate_batch_processed}/{raw_total}{details}{self._ollama_threads_status_suffix()}"
+                f"Validate: processed {self._validate_batch_processed}/{raw_total}{details}{self._llm_threads_status_suffix()}"
             )
 
-    def _on_ollama_task_finished(
+    def _on_llm_task_finished(
         self,
         result: object,
         action_name: str,
@@ -3600,7 +3662,7 @@ class MainWindow(QMainWindow):
                 if skipped:
                     parts.append(f"{skipped} skipped")
                 self.statusBar().showMessage(
-                    f"{action_name} complete via Ollama ({', '.join(parts)})"
+                    f"{action_name} complete via {self._llm_provider.display_name} ({', '.join(parts)})"
                 )
 
             self._validate_batch_total = 0
@@ -3639,7 +3701,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"{action_name} finished")
             else:
                 self.statusBar().showMessage(
-                    f"{action_name} complete via Ollama ({self._generate_batch_updated} image{'s' if self._generate_batch_updated != 1 else ''}, {self._generate_batch_new_annotations} new annotation{'s' if self._generate_batch_new_annotations != 1 else ''})"
+                    f"{action_name} complete via {self._llm_provider.display_name} ({self._generate_batch_updated} image{'s' if self._generate_batch_updated != 1 else ''}, {self._generate_batch_new_annotations} new annotation{'s' if self._generate_batch_new_annotations != 1 else ''})"
                 )
             self._generate_batch_total = 0
             self._generate_batch_processed = 0
@@ -3701,7 +3763,7 @@ class MainWindow(QMainWindow):
                 self._populate_tag_list(self._parse_tags(self.records[self.current_index].text))
 
             self.statusBar().showMessage(
-                f"{action_name} complete via Ollama ({updated} image{'s' if updated != 1 else ''}, {with_new} new annotation{'s' if with_new != 1 else ''})"
+                f"{action_name} complete via {self._llm_provider.display_name} ({updated} image{'s' if updated != 1 else ''}, {with_new} new annotation{'s' if with_new != 1 else ''})"
             )
             return
 
@@ -3770,16 +3832,16 @@ class MainWindow(QMainWindow):
 
             self._set_current_tags(merged_tags, status_prefix=f"{action_name} + auto-saved")
             self.statusBar().showMessage(
-                f"{action_name} complete via Ollama ({added_count} tag{'s' if added_count != 1 else ''} added)"
+                f"{action_name} complete via {self._llm_provider.display_name} ({added_count} tag{'s' if added_count != 1 else ''} added)"
             )
             return
 
         self._set_current_tags(tags, status_prefix=f"{action_name} + auto-saved")
-        self.statusBar().showMessage(f"{action_name} complete via Ollama")
+        self.statusBar().showMessage(f"{action_name} complete via {self._llm_provider.display_name}")
 
-    def _on_ollama_task_failed(self, message: str) -> None:
-        QMessageBox.warning(self, "Ollama request failed", message)
-        self.statusBar().showMessage("Ollama request failed")
+    def _on_llm_task_failed(self, message: str) -> None:
+        QMessageBox.warning(self, f"{self._llm_provider.display_name} request failed", message)
+        self.statusBar().showMessage(f"{self._llm_provider.display_name} request failed")
 
     def _apply_validation_result_to_record(self, record_index: int, result: str) -> str:
         if record_index < 0 or record_index >= len(self.records):
@@ -3803,13 +3865,13 @@ class MainWindow(QMainWindow):
         self._on_fixup_state_changed(record.image_path)
         return "issues"
 
-    def _cleanup_ollama_task(self) -> None:
-        if self._ollama_worker is not None:
-            self._ollama_worker.deleteLater()
-        if self._ollama_thread is not None:
-            self._ollama_thread.deleteLater()
-        self._ollama_worker = None
-        self._ollama_thread = None
+    def _cleanup_llm_task(self) -> None:
+        if self._llm_worker is not None:
+            self._llm_worker.deleteLater()
+        if self._llm_thread is not None:
+            self._llm_thread.deleteLater()
+        self._llm_worker = None
+        self._llm_thread = None
         self._generate_batch_total = 0
         self._generate_batch_processed = 0
         self._generate_batch_updated = 0
@@ -3828,19 +3890,19 @@ class MainWindow(QMainWindow):
         self._ai_find_batch_matched = 0
         self._ai_find_batch_started_at = None
         self._ai_find_batch_retry_images = 0
-        self._ollama_action_name = None
-        self._ollama_cancel = None
-        self._ollama_threads_auto_mode = False
-        self._ollama_threads_current = 0
-        self._update_ollama_controls()
-        self.ollama_server_input.setEnabled(True)
-        self.ollama_fetch_button.setEnabled(True)
-        self.ollama_model_combo.setEnabled(True)
-        self.ollama_timeout_input.setEnabled(True)
-        self.ollama_retry_input.setEnabled(True)
-        self.ollama_max_resolution_input.setEnabled(True)
-        self.ollama_threads_input.setEnabled(True)
-        self.ollama_use_button.setEnabled(True)
+        self._llm_action_name = None
+        self._llm_cancel = None
+        self._llm_threads_auto_mode = False
+        self._llm_threads_current = 0
+        self._update_llm_controls()
+        self.llm_endpoint_input.setEnabled(True)
+        self.llm_fetch_button.setEnabled(True)
+        self.llm_model_combo.setEnabled(True)
+        self.llm_timeout_input.setEnabled(True)
+        self.llm_retry_input.setEnabled(True)
+        self.llm_max_resolution_input.setEnabled(True)
+        self.llm_threads_input.setEnabled(True)
+        self.llm_use_button.setEnabled(True)
         self._update_fixup_button_state()
 
 

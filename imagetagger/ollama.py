@@ -3,83 +3,35 @@ from __future__ import annotations
 import base64
 import http.client
 import json
-import math
-import threading
 from dataclasses import dataclass
-from io import BytesIO
-from pathlib import Path
 from urllib.parse import urlparse
+
+from pathlib import Path
+
+from imagetagger.image_prep import prepare_image_for_query
+from imagetagger.llm_provider import LlmProviderCancelled, LlmProviderError, LlmRequestCancellation
 
 
 DEFAULT_OLLAMA_SERVER = "http://127.0.0.1:11434"
 # Vision-capable LLMs can take a while on busy GPUs; keep this generous.
 DEFAULT_TIMEOUT = 300.0
-# Default to 1 MP; can be overridden from config.json.
-MAX_IMAGE_PIXELS_FOR_OLLAMA = 1_000_000
-
-_resize_warning_lock = threading.Lock()
-_resize_warning_pending = False
 
 
-class OllamaError(Exception):
+class OllamaError(LlmProviderError):
     pass
 
 
-class OllamaCancelled(OllamaError):
+class OllamaCancelled(OllamaError, LlmProviderCancelled):
     pass
 
 
-class OllamaCancellation:
-    def __init__(self) -> None:
-        self._event = threading.Event()
-        self._lock = threading.Lock()
-        self._active_connections: set[http.client.HTTPConnection] = set()
-
-    def cancel(self) -> None:
-        self._event.set()
-        with self._lock:
-            connections = list(self._active_connections)
-            self._active_connections.clear()
-        for connection in connections:
-            try:
-                connection.close()
-            except Exception:
-                pass
-
-    def is_cancelled(self) -> bool:
-        return self._event.is_set()
-
-    def raise_if_cancelled(self) -> None:
-        if self.is_cancelled():
-            raise OllamaCancelled("Request stopped.")
-
-    def set_active_connection(self, connection: http.client.HTTPConnection) -> None:
-        with self._lock:
-            self._active_connections.add(connection)
-            already_cancelled = self._event.is_set()
-        if already_cancelled:
-            try:
-                connection.close()
-            except Exception:
-                pass
-            raise OllamaCancelled("Request stopped.")
-
-    def clear_active_connection(self, connection: http.client.HTTPConnection) -> None:
-        with self._lock:
-            self._active_connections.discard(connection)
+OllamaCancellation = LlmRequestCancellation
 
 
 @dataclass(frozen=True)
 class OllamaConnection:
     server_url: str
     model_name: str
-
-
-def configure_runtime(*, max_image_pixels: int | None = None) -> None:
-    global MAX_IMAGE_PIXELS_FOR_OLLAMA
-
-    if max_image_pixels is not None:
-        MAX_IMAGE_PIXELS_FOR_OLLAMA = max(1, int(max_image_pixels))
 
 
 def normalize_server_url(server: str) -> str:
@@ -103,7 +55,7 @@ def _request_json(
     path: str,
     payload: dict | None = None,
     timeout: float = DEFAULT_TIMEOUT,
-    cancellation: OllamaCancellation | None = None,
+    cancellation: LlmRequestCancellation | None = None,
 ) -> dict:
     server_url = normalize_server_url(server)
     parsed = urlparse(server_url)
@@ -128,7 +80,7 @@ def _request_json(
     try:
         if cancellation is not None:
             cancellation.raise_if_cancelled()
-            cancellation.set_active_connection(connection)
+            cancellation.set_active_resource(connection)
 
         method = "POST" if payload is not None else "GET"
         connection.request(method, request_path, body=data, headers=headers)
@@ -168,31 +120,13 @@ def _request_json(
         raise OllamaError("Ollama server returned invalid JSON.") from exc
     finally:
         if cancellation is not None:
-            cancellation.clear_active_connection(connection)
+            cancellation.clear_active_resource(connection)
         if response is not None:
             try:
                 response.close()
             except Exception:
                 pass
         connection.close()
-
-
-def consume_resize_warning() -> str | None:
-    global _resize_warning_pending
-    with _resize_warning_lock:
-        if not _resize_warning_pending:
-            try:
-                import PIL  # noqa: F401
-            except ImportError:
-                _resize_warning_pending = True
-
-        if not _resize_warning_pending:
-            return None
-        _resize_warning_pending = False
-    return (
-        "Pillow is not installed, so images are sent to Ollama at original size.\n\n"
-        "Install dependencies to enable resizing before upload."
-    )
 
 
 def fetch_models(server: str, timeout: float = 5.0) -> list[str]:
@@ -211,248 +145,27 @@ def fetch_models(server: str, timeout: float = 5.0) -> list[str]:
 
     return model_names
 
-
-# ---------------------------------------------------------------------------
-# Prompt loading
-# ---------------------------------------------------------------------------
-
-_PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
-
-
-def _load_prompt(filename: str, default: str) -> str:
-    """Return prompt text from *filename* in the prompts directory, or *default*."""
-    try:
-        return (_PROMPTS_DIR / filename).read_text(encoding="utf-8").strip()
-    except OSError:
-        return default
-
-
-_DEFAULT_TAGS_PROMPT = (
-    "Analyze the image and return a list of short descriptive tags.\n\n"
-    "Rules:\n"
-    "- Do not include introductory text or greetings.\n"
-    "- Return between 10 and 20 tags.\n"
-    "- One tag per line.\n"
-    "- One or two words maximum per tag.\n"
-    "- Lowercase only.\n"
-    "- No numbering or sentences.\n"
-    "- Cover a range of aspects: subject, action or pose, setting, mood, lighting, colors, and style where applicable.\n"
-    "- Do not repeat the same concept with different words.\n\n"
-    "Example (if subject is a person outdoors):\n"
-    "outdoor setting\n"
-    "natural light\n"
-    "seated pose\n"
-    "warm tones\n"
-    "relaxed mood\n"
-    "wooden surface\n"
-    "casual style\n"
-    "green foliage\n"
-    "shallow depth\n"
-    "soft shadows"
-)
-
-_DEFAULT_DESCRIPTION_PROMPT = (
-    "Analyze the image and return ONLY a single paragraph of 2-3 descriptive sentences.\n\n"
-    "Rules:\n"
-    "- Identify the main subject (e.g., woman, cat, car, pan) and start the very first sentence with that noun.\n"
-    "- Use the bare noun without an article (no 'A', 'An', or 'The') to start the first sentence.\n"
-    "- Use the specific noun instead of pronouns like \"it\", \"she\", or \"he\" to start first sentence.\n"
-    "- Write declarative statements; do not use hedging phrases like \"appears to\" or \"seems to\".\n"
-    "- Avoid comma-separated lists.\n"
-    "- Do NOT include any introductory text, greetings, or meta-talk.\n\n"
-    "Example (if subject is a cat):\n"
-    "Cat with orange tabby fur sits on a blue velvet sofa in a sunlit room. Cat gazes out a large window while twitching its tail in a playful manner. Soft dust motes dance in the light to create a peaceful atmosphere."
-)
-
-_DEFAULT_VALIDATION_PROMPT = (
-    "You are validating image annotations. The annotation list may include short tags and one long description.\n"
-    "The original storage format may use commas only as separators between annotations. Those separator commas are not mistakes.\n"
-    "Missing commas are also not a problem.\n"
-    "Current annotations, one per line:\n{tags}\n"
-    "Analyze the image and verify whether the annotations are accurate and complete.\n"
-    "If everything is correct, reply with exactly: OK\n"
-    "If there are problems, reply using exactly this plain-text format:\n"
-    "ISSUES:\n"
-    "<brief explanation of what is wrong>\n"
-    "TAGS:\n"
-    "<corrected tags, one per line, no commas>\n"
-    "DESCRIPTION:\n"
-    "<corrected description without commas, or leave blank if no description is needed>\n"
-    "Do not return JSON or any extra headings."
-)
-
-_DEFAULT_SEARCH_PROMPT = (
-    "You are checking whether an image contains a target concept.\n"
-    "Target concept: \"{query}\"\n"
-    "Respond with exactly one token: YES or NO.\n"
-    "Do not add punctuation, explanations, or extra words."
-)
-
-_PROMPT_DEFAULTS: dict[str, str] = {
-    "tagging": _DEFAULT_TAGS_PROMPT,
-    "description": _DEFAULT_DESCRIPTION_PROMPT,
-    "validation": _DEFAULT_VALIDATION_PROMPT,
-    "search": _DEFAULT_SEARCH_PROMPT,
-}
-
-_PROMPT_FILENAMES: dict[str, str] = {
-    "tagging": "tags_prompt.txt",
-    "description": "description_prompt.txt",
-    "validation": "validation_prompt.txt",
-    "search": "search_prompt.txt",
-}
-
-# In-memory overrides set via UI "Apply".
-_PROMPT_OVERRIDES: dict[str, str] = {}
-
-
-def _assert_prompt_kind(kind: str) -> None:
-    if kind not in _PROMPT_DEFAULTS:
-        raise OllamaError(f"Unknown prompt kind: {kind}")
-
-
-def get_default_prompt(kind: str) -> str:
-    _assert_prompt_kind(kind)
-    return _PROMPT_DEFAULTS[kind]
-
-
-def load_prompt_for_kind(kind: str) -> str:
-    _assert_prompt_kind(kind)
-    return _load_prompt(_PROMPT_FILENAMES[kind], _PROMPT_DEFAULTS[kind])
-
-
-def prompt_source_for_kind(kind: str) -> str:
-    _assert_prompt_kind(kind)
-    if kind in _PROMPT_OVERRIDES:
-        return "memory"
-
-    prompt_path = _PROMPTS_DIR / _PROMPT_FILENAMES[kind]
-    try:
-        prompt_path.read_text(encoding="utf-8")
-    except OSError:
-        return "default"
-    return "file"
-
-
-def set_prompt_override(kind: str, prompt: str) -> None:
-    _assert_prompt_kind(kind)
-    _PROMPT_OVERRIDES[kind] = prompt.strip()
-
-
-def clear_prompt_override(kind: str) -> None:
-    _assert_prompt_kind(kind)
-    _PROMPT_OVERRIDES.pop(kind, None)
-
-
-def save_prompt_for_kind(kind: str, prompt: str) -> str:
-    _assert_prompt_kind(kind)
-    text = prompt.strip()
-    try:
-        _PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-        (_PROMPTS_DIR / _PROMPT_FILENAMES[kind]).write_text(text, encoding="utf-8")
-    except OSError as exc:
-        raise OllamaError(f"Could not save prompt file: {exc}") from exc
-    return text
-
-
-def reset_prompt_to_default(kind: str) -> str:
-    _assert_prompt_kind(kind)
-    default_text = _PROMPT_DEFAULTS[kind]
-    try:
-        _PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-        (_PROMPTS_DIR / _PROMPT_FILENAMES[kind]).write_text(default_text, encoding="utf-8")
-    except OSError as exc:
-        raise OllamaError(f"Could not reset prompt file: {exc}") from exc
-    clear_prompt_override(kind)
-    return default_text
-
-
-def _active_prompt(kind: str) -> str:
-    _assert_prompt_kind(kind)
-    override = _PROMPT_OVERRIDES.get(kind)
-    if override is not None:
-        return override
-    return load_prompt_for_kind(kind)
-
-
-def active_prompt_for_kind(kind: str) -> str:
-    _assert_prompt_kind(kind)
-    return _active_prompt(kind)
-
-
-def _format_annotations_for_validation(annotations: str) -> str:
-    lines = [part.strip() for part in annotations.replace("\n", ",").split(",") if part.strip()]
-    return "\n".join(f"- {line}" for line in lines)
-
-
-def _resize_image_bytes_for_ollama(image_bytes: bytes, max_pixels: int = MAX_IMAGE_PIXELS_FOR_OLLAMA) -> bytes:
-    global _resize_warning_pending
-    try:
-        from PIL import Image, ImageOps, UnidentifiedImageError
-    except ImportError:
-        # Keep original image if Pillow is not installed yet and emit a one-time warning.
-        with _resize_warning_lock:
-            _resize_warning_pending = True
-        return image_bytes
-
-    try:
-        with Image.open(BytesIO(image_bytes)) as image:
-            image = ImageOps.exif_transpose(image)
-            width, height = image.size
-            if width <= 0 or height <= 0:
-                return image_bytes
-
-            pixels = width * height
-            if pixels <= max_pixels:
-                return image_bytes
-
-            scale = math.sqrt(max_pixels / float(pixels))
-            target_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-            resized = image.resize(target_size, Image.Resampling.LANCZOS)
-
-            output = BytesIO()
-            image_format = (image.format or "").upper()
-            if image_format in {"JPEG", "JPG"}:
-                if resized.mode not in {"RGB", "L"}:
-                    resized = resized.convert("RGB")
-                resized.save(output, format="JPEG", quality=90, optimize=True)
-            elif image_format == "PNG":
-                resized.save(output, format="PNG", optimize=True)
-            else:
-                # For uncommon formats, encode as PNG to preserve transparency where possible.
-                resized.save(output, format="PNG", optimize=True)
-
-            return output.getvalue()
-    except (OSError, ValueError, UnidentifiedImageError):
-        return image_bytes
-
-
 def _encode_image(image_path: Path) -> str:
-    try:
-        image_bytes = image_path.read_bytes()
-    except OSError as exc:
-        raise OllamaError(f"Could not read image file: {exc}") from exc
-    image_bytes = _resize_image_bytes_for_ollama(image_bytes)
-    return base64.b64encode(image_bytes).decode("ascii")
+    prepared_image = prepare_image_for_query(image_path)
+    return base64.b64encode(prepared_image.content).decode("ascii")
 
 
-def _generate_with_image(
-    server: str,
-    model: str,
+def generate_with_image(
+    connection: OllamaConnection,
     image_path: Path,
     prompt: str,
     timeout: float = DEFAULT_TIMEOUT,
-    cancellation: OllamaCancellation | None = None,
+    cancellation: LlmRequestCancellation | None = None,
 ) -> str:
     payload: dict[str, object] = {
-        "model": model,
+        "model": connection.model_name,
         "prompt": prompt,
         "images": [_encode_image(image_path)],
         "stream": False,
     }
 
     payload = _request_json(
-        server,
+        connection.server_url,
         "/api/generate",
         payload=payload,
         timeout=timeout,
@@ -462,69 +175,3 @@ def _generate_with_image(
     if not isinstance(response, str) or not response.strip():
         raise OllamaError("Ollama returned an empty response.")
     return response.strip()
-
-
-def generate_tags(
-    server: str,
-    model: str,
-    image_path: Path,
-    timeout: float = DEFAULT_TIMEOUT,
-    cancellation: OllamaCancellation | None = None,
-) -> str:
-    prompt = _active_prompt("tagging")
-    return _generate_with_image(server, model, image_path, prompt, timeout=timeout, cancellation=cancellation)
-
-
-def generate_description(
-    server: str,
-    model: str,
-    image_path: Path,
-    timeout: float = DEFAULT_TIMEOUT,
-    cancellation: OllamaCancellation | None = None,
-) -> str:
-    prompt = _active_prompt("description")
-    return _generate_with_image(server, model, image_path, prompt, timeout=timeout, cancellation=cancellation)
-
-
-def validate_tags(
-    server: str,
-    model: str,
-    image_path: Path,
-    tags: str,
-    timeout: float = DEFAULT_TIMEOUT,
-    cancellation: OllamaCancellation | None = None,
-) -> str:
-    prompt_template = _active_prompt("validation")
-    prompt = prompt_template.replace("{tags}", _format_annotations_for_validation(tags))
-    return _generate_with_image(server, model, image_path, prompt, timeout=timeout, cancellation=cancellation)
-
-
-def image_matches_query(
-    server: str,
-    model: str,
-    image_path: Path,
-    query: str,
-    timeout: float = DEFAULT_TIMEOUT,
-    cancellation: OllamaCancellation | None = None,
-) -> bool:
-    cleaned_query = query.strip()
-    if not cleaned_query:
-        raise OllamaError("Enter text to search for.")
-
-    prompt_template = _active_prompt("search")
-    prompt = prompt_template.replace("{query}", cleaned_query)
-
-    response = _generate_with_image(
-        server,
-        model,
-        image_path,
-        prompt,
-        timeout=timeout,
-        cancellation=cancellation,
-    ).strip()
-    upper = response.upper()
-    if upper.startswith("YES"):
-        return True
-    if upper.startswith("NO"):
-        return False
-    raise OllamaError(f"Model returned ambiguous AI Find response: {response}")

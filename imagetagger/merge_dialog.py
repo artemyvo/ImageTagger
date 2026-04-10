@@ -39,14 +39,16 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from imagetagger.ollama import (
-    OllamaCancellation,
-    OllamaCancelled,
-    OllamaError,
-    configure_runtime,
-    consume_resize_warning,
-    generate_description,
-    generate_tags,
+from imagetagger.image_prep import configure_image_preparation, consume_image_preparation_warning
+from imagetagger.llm_provider import (
+    LlmProviderCancelled,
+    LlmProviderError,
+    LlmRequestCancellation,
+    VisionLlmSession,
+)
+from imagetagger.llm_queries import (
+    prepare_description_query,
+    prepare_tagging_query,
 )
 from imagetagger.external_editors import (
     ExternalEditor,
@@ -163,14 +165,14 @@ class RegenerateWorker(QObject):
     def run(self) -> None:
         try:
             result = self.task(self.progress.emit)
-        except OllamaCancelled as exc:
+        except LlmProviderCancelled as exc:
             self.cancelled.emit(str(exc))
             return
-        except OllamaError as exc:
+        except LlmProviderError as exc:
             self.failed.emit(str(exc))
             return
         except Exception as exc:
-            self.failed.emit(f"Unexpected Ollama error: {exc}")
+            self.failed.emit(f"Unexpected LLM error: {exc}")
             return
         self.finished.emit(result)
 
@@ -518,8 +520,7 @@ class FixupDialog(QDialog):
         can_navigate_next: bool = False,
         tag_suggestions: list[str] | None = None,
         normalize_annotation: Callable[[str], str] | None = None,
-        ollama_server_url: str = "",
-        ollama_model_name: str = "",
+        provider_session: VisionLlmSession | None = None,
         regenerate_tags_enabled: bool = True,
         regenerate_description_enabled: bool = True,
         regenerate_timeout_seconds: int = 300,
@@ -552,11 +553,10 @@ class FixupDialog(QDialog):
         self._pending_edit_refresh = False
         self._last_action_table_row: int | None = None
         self._image_path = image_path
-        self._ollama_server_url = ollama_server_url.strip()
-        self._ollama_model_name = ollama_model_name.strip()
+        self._provider_session = provider_session
         self._regenerate_thread: QThread | None = None
         self._regenerate_worker: RegenerateWorker | None = None
-        self._regenerate_cancel: OllamaCancellation | None = None
+        self._regenerate_cancel: LlmRequestCancellation | None = None
         self._discard_regenerate_result = False
         self._global_key_filter_installed = False
         self._search_matches = fixup_data.search_matches or []
@@ -2086,17 +2086,17 @@ class FixupDialog(QDialog):
         raw_value = self.regenerate_timeout_input.text().strip()
         if not raw_value:
             QMessageBox.warning(self, "Invalid timeout", "Enter timeout in seconds.")
-            raise OllamaError("Enter timeout in seconds.")
+            raise LlmProviderError("Enter timeout in seconds.")
 
         try:
             timeout = int(raw_value)
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid timeout", "Timeout must be a whole number of seconds.")
-            raise OllamaError("Timeout must be a whole number of seconds.") from exc
+            raise LlmProviderError("Timeout must be a whole number of seconds.") from exc
 
         if timeout < 1:
             QMessageBox.warning(self, "Invalid timeout", "Timeout must be at least 1 second.")
-            raise OllamaError("Timeout must be at least 1 second.")
+            raise LlmProviderError("Timeout must be at least 1 second.")
 
         return float(timeout)
 
@@ -2119,22 +2119,22 @@ class FixupDialog(QDialog):
         raw_value = self.regenerate_max_resolution_input.text().strip()
         if not raw_value:
             QMessageBox.warning(self, "Invalid query downscale", "Enter query downscale in megapixels.")
-            raise OllamaError("Enter query downscale in megapixels.")
+            raise LlmProviderError("Enter query downscale in megapixels.")
 
         try:
             value = float(raw_value)
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid query downscale", "Query downscale must be a number.")
-            raise OllamaError("Query downscale must be a number.") from exc
+            raise LlmProviderError("Query downscale must be a number.") from exc
 
         if value <= 0:
             QMessageBox.warning(self, "Invalid query downscale", "Query downscale must be greater than 0.")
-            raise OllamaError("Query downscale must be greater than 0.")
+            raise LlmProviderError("Query downscale must be greater than 0.")
 
         return value
 
     def _update_regenerate_controls(self) -> None:
-        connected = bool(self._ollama_model_name)
+        connected = self._provider_session is not None
         working = self._regenerate_thread is not None
         options_selected = (
             self.regenerate_tags_checkbox.isChecked()
@@ -2237,28 +2237,30 @@ class FixupDialog(QDialog):
         if not self.regenerate_tags_checkbox.isChecked() and not self.regenerate_description_checkbox.isChecked():
             QMessageBox.information(self, "Nothing selected", "Enable Tags or Description before regenerating.")
             return
-        if not self._ollama_model_name:
+        if self._provider_session is None:
             return
 
         try:
             max_resolution_mpx = self._regenerate_max_resolution_mpx()
-        except OllamaError:
+        except LlmProviderError:
             return
-        configure_runtime(max_image_pixels=max(1, int(max_resolution_mpx * 1_000_000)))
+        configure_image_preparation(max_image_pixels=max(1, int(max_resolution_mpx * 1_000_000)))
 
-        resize_warning = consume_resize_warning()
+        resize_warning = consume_image_preparation_warning()
         if resize_warning:
             QMessageBox.warning(self, "Image resize disabled", resize_warning)
 
-        cancel_token = OllamaCancellation()
+        cancel_token = LlmRequestCancellation()
         self._regenerate_cancel = cancel_token
         self._discard_regenerate_result = False
+        description_query = prepare_description_query() if self.regenerate_description_checkbox.isChecked() else None
+        tags_query = prepare_tagging_query() if self.regenerate_tags_checkbox.isChecked() else None
 
         def task(report_progress: Callable[[str], None]) -> object:
             timeout = self._regenerate_timeout_seconds()
             retry_count = self._regenerate_retry_count()
             image_name = self._image_path.name
-            last_error: OllamaError | None = None
+            last_error: LlmProviderError | None = None
 
             for attempt in range(retry_count + 1):
                 cancel_token.raise_if_cancelled()
@@ -2272,7 +2274,7 @@ class FixupDialog(QDialog):
                     elapsed = time.monotonic() - attempt_start
                     remaining = timeout - elapsed
                     if remaining <= 0:
-                        raise OllamaError(
+                        raise LlmProviderError(
                             f"Timed out after {int(timeout)} seconds while regenerating annotations for {image_name}."
                         )
                     return remaining
@@ -2280,23 +2282,21 @@ class FixupDialog(QDialog):
                 try:
                     description = ""
                     tags: list[str] = []
-                    if self.regenerate_description_checkbox.isChecked():
+                    if description_query is not None:
                         description = self._normalize_annotation(
-                            generate_description(
-                                self._ollama_server_url,
-                                self._ollama_model_name,
+                            self._provider_session.generate(
                                 self._image_path,
+                                description_query.prompt,
                                 timeout=remaining_timeout(),
                                 cancellation=cancel_token,
                             ).strip()
                         )
-                    if self.regenerate_tags_checkbox.isChecked():
+                    if tags_query is not None:
                         tags = self._dedupe_preserve_order(
                             self._parse_regenerated_tags(
-                                generate_tags(
-                                    self._ollama_server_url,
-                                    self._ollama_model_name,
+                                self._provider_session.generate(
                                     self._image_path,
+                                    tags_query.prompt,
                                     timeout=remaining_timeout(),
                                     cancellation=cancel_token,
                                 )
@@ -2305,15 +2305,15 @@ class FixupDialog(QDialog):
 
                     if description or tags:
                         return {"description": description, "tags": tags}
-                    last_error = OllamaError("Ollama returned no annotations.")
-                except OllamaCancelled:
+                    last_error = LlmProviderError("Model returned no annotations.")
+                except LlmProviderCancelled:
                     raise
-                except OllamaError as exc:
+                except LlmProviderError as exc:
                     last_error = exc
 
             if last_error is not None:
                 raise last_error
-            raise OllamaError("Ollama returned no annotations.")
+            raise LlmProviderError("Model returned no annotations.")
 
         self._regenerate_thread = QThread(self)
         self._regenerate_worker = RegenerateWorker(task)

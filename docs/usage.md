@@ -164,7 +164,7 @@ config.json stores session and UI state, including:
 
 - last opened directory
 - selected Ollama server and model
-- query downscale value (ollama_max_resolution_mpx)
+- query downscale value (llm_max_resolution_mpx)
 - thread setting
 - window geometry state
 
