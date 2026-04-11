@@ -829,7 +829,7 @@ class MainWindow(QMainWindow):
         autotag_layout.setSpacing(6)
 
         self.llm_endpoint_input = QLineEdit(self)
-        self.llm_endpoint_input.setPlaceholderText("http://127.0.0.1:11434")
+        self.llm_endpoint_input.setPlaceholderText("http://127.0.0.1:11434 (Ollama) or :8000 (OpenAI-compatible)")
         self.llm_endpoint_input.setText(self.llm_endpoint)
 
         self.llm_fetch_button = QPushButton("Fetch models", self)

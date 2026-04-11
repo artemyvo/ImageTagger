@@ -156,7 +156,12 @@ Merge dialog:
 
 ImageTagger is built with Python and PyQt6.
 
-Windows and Linux are tested. macOS support is expected but has not been tested.
+Windows, Linux, and macOS are tested.
+
+Install and run scripts are provided for all three platforms:
+
+- Windows: `install.bat`, `run.bat`, `update.bat`
+- Linux / macOS: `install.sh`, `run.sh`, `update.sh`
 
 ## Configuration and Persistence
 

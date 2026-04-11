@@ -6,25 +6,26 @@ It is designed for teams and solo practitioners who need to keep large caption/t
 
 ## Quick Start
 
-Windows PowerShell:
+Windows:
 
-1. python -m venv .venv
-2. .\.venv\Scripts\Activate.ps1
-3. pip install -r requirements.txt
-4. python run.py
+1. Double-click `install.bat` (or run it from a terminal).
+2. Double-click `run.bat` to launch.
 
-Linux (bash):
+Linux / macOS:
 
-1. python3 -m venv .venv
-2. source .venv/bin/activate
-3. pip install -r requirements.txt
-4. python run.py
+1. `chmod +x install.sh run.sh update.sh`
+2. `./install.sh`
+3. `./run.sh`
+
+To update dependencies later: run `update.bat` (Windows) or `./update.sh` (Linux/macOS).
 
 Then:
 
 1. Open a folder containing images.
-2. If you do not already have Ollama, install it from https://ollama.com.
-3. Connect to Ollama and choose a model.
+2. Start an LLM server endpoint:
+	- Ollama (default): https://ollama.com on port 11434.
+	- OpenAI-compatible server (for example vLLM) on a non-11434 port such as 8000.
+3. Enter the endpoint and fetch models.
 4. Qwen3-VL-8B is the current recommended model for the best practical performance/quality balance.
 5. Select one or more images.
 6. Generate, validate, and resolve fixups.

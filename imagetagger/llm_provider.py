@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import threading
 from typing import Protocol
+from urllib.parse import urlparse
 
 from imagetagger.llm_queries import LlmQueryError
 
@@ -110,7 +111,7 @@ class _OllamaSession:
 
 
 class _DefaultVisionProvider:
-    display_name = "Ollama"
+    display_name = "LLM"
 
     @property
     def default_endpoint(self) -> str:
@@ -119,17 +120,63 @@ class _DefaultVisionProvider:
         return DEFAULT_OLLAMA_SERVER
 
     def normalize_endpoint(self, endpoint: str) -> str:
-        from imagetagger.ollama import normalize_server_url
+        from imagetagger.openai_compat import OpenAiCompatError
+        from imagetagger.openai_compat import normalize_server_url
 
-        return normalize_server_url(endpoint)
+        try:
+            return normalize_server_url(endpoint)
+        except OpenAiCompatError as exc:
+            raise LlmProviderError(str(exc)) from exc
+
+    @staticmethod
+    def _uses_ollama_interface(endpoint: str) -> bool:
+        parsed = urlparse(endpoint)
+        try:
+            return parsed.port == 11434
+        except ValueError:
+            return False
 
     def fetch_models(self, endpoint: str, *, timeout: float) -> list[str]:
-        from imagetagger.ollama import fetch_models
+        normalized = self.normalize_endpoint(endpoint)
+        if self._uses_ollama_interface(normalized):
+            from imagetagger.ollama import fetch_models
 
-        return fetch_models(endpoint, timeout=timeout)
+            return fetch_models(normalized, timeout=timeout)
+
+        from imagetagger.openai_compat import fetch_models
+
+        return fetch_models(normalized, timeout=timeout)
 
     def create_session(self, endpoint: str, model_name: str) -> VisionLlmSession:
-        return _OllamaSession(endpoint=endpoint, model_name=model_name)
+        normalized = self.normalize_endpoint(endpoint)
+        if self._uses_ollama_interface(normalized):
+            return _OllamaSession(endpoint=normalized, model_name=model_name)
+
+        return _OpenAiCompatSession(endpoint=normalized, model_name=model_name)
+
+
+@dataclass(frozen=True)
+class _OpenAiCompatSession:
+    endpoint: str
+    model_name: str
+
+    def generate(
+        self,
+        image_path: Path,
+        prompt: str,
+        *,
+        timeout: float,
+        cancellation: LlmRequestCancellation | None = None,
+    ) -> str:
+        from imagetagger.openai_compat import OpenAiCompatConnection, generate_with_image
+
+        return generate_with_image(
+            OpenAiCompatConnection(self.endpoint, self.model_name),
+            image_path,
+            prompt,
+            timeout=timeout,
+            cancellation=cancellation,
+        )
 
 
 DEFAULT_VISION_PROVIDER: VisionLlmProvider = _DefaultVisionProvider()
