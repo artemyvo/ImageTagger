@@ -156,6 +156,8 @@ Merge dialog:
 
 ImageTagger is built with Python and PyQt6.
 
+Python 3.9 or newer is required.
+
 Windows, Linux, and macOS are tested.
 
 Install and run scripts are provided for all three platforms:

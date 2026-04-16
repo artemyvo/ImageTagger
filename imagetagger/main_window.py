@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image, ImageCms, UnidentifiedImageError
 
-from PyQt6.QtCore import QEvent, QObject, QRect, QStringListModel, QThread, Qt, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, QRect, QStringListModel, QThread, Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDoubleValidator, QFont, QIcon, QImage, QImageReader, QIntValidator, QKeySequence, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -692,6 +692,23 @@ class MainWindow(QMainWindow):
         self._pending_selection_path: Path | None = None
         self._root_directory: Path | None = None
         self._detected_external_editors: list[ExternalEditor] | None = None
+        self._watched_image_path: Path | None = None
+        self._watched_image_mtime_ns: int | None = None
+        self._image_reload_pending = False
+
+        self._image_file_watcher = QFileSystemWatcher(self)
+        self._image_file_watcher.fileChanged.connect(self._on_watched_image_file_changed)
+
+        self._image_reload_debounce_timer = QTimer(self)
+        self._image_reload_debounce_timer.setSingleShot(True)
+        self._image_reload_debounce_timer.setInterval(400)
+        self._image_reload_debounce_timer.timeout.connect(self._apply_pending_image_reload)
+
+        # Polling fallback keeps reload reliable on network filesystems (SMB/NFS)
+        # where native change notifications can be delayed or suppressed.
+        self._image_reload_poll_timer = QTimer(self)
+        self._image_reload_poll_timer.setInterval(1200)
+        self._image_reload_poll_timer.timeout.connect(self._poll_watched_image_changes)
 
         self._cfg = _config.load()
 
@@ -748,13 +765,13 @@ class MainWindow(QMainWindow):
         self.jump_first_fixup_action.setShortcut(platform_key_sequence("Alt+F", "Alt+F"))
         self.jump_first_fixup_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.jump_first_fixup_action.triggered.connect(self._jump_to_first_fixup)
-        self.list_widget.addAction(self.jump_first_fixup_action)
+        self.addAction(self.jump_first_fixup_action)
 
         self.jump_last_fixup_action = QAction("Jump to Last Fixup", self)
         self.jump_last_fixup_action.setShortcut(platform_key_sequence("Alt+L", "Alt+L"))
         self.jump_last_fixup_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.jump_last_fixup_action.triggered.connect(self._jump_to_last_fixup)
-        self.list_widget.addAction(self.jump_last_fixup_action)
+        self.addAction(self.jump_last_fixup_action)
 
         self.center_panel = QWidget(self)
         center_layout = QVBoxLayout(self.center_panel)
@@ -1146,8 +1163,12 @@ class MainWindow(QMainWindow):
                 restore_path: Path | None = None
                 if last_image_str:
                     candidate = Path(last_image_str)
-                    if candidate.exists() and candidate.is_file() and candidate.parent == folder:
-                        restore_path = candidate
+                    if candidate.exists() and candidate.is_file():
+                        try:
+                            candidate.relative_to(folder)
+                            restore_path = candidate
+                        except ValueError:
+                            restore_path = None
                 self.load_directory(folder, restore_selection=restore_path)
 
     def _build_menu(self) -> None:
@@ -1162,7 +1183,11 @@ class MainWindow(QMainWindow):
         self.refresh_action.triggered.connect(self.refresh_directory)
 
         self.exit_action = QAction("Exit", self)
-        self.exit_action.setShortcuts(QKeySequence.keyBindings(QKeySequence.StandardKey.Quit))
+        quit_shortcuts = [platform_key_sequence("Alt+F4", "Meta+Q")]
+        for shortcut in QKeySequence.keyBindings(QKeySequence.StandardKey.Quit):
+            if shortcut not in quit_shortcuts:
+                quit_shortcuts.append(shortcut)
+        self.exit_action.setShortcuts(quit_shortcuts)
         self.exit_action.triggered.connect(self.close)
 
         menu.addAction(self.open_action)
@@ -1759,6 +1784,124 @@ class MainWindow(QMainWindow):
             return None
         return record.image_path
 
+    @staticmethod
+    def _normalized_path_for_compare(path: Path) -> str:
+        return os.path.normcase(str(path.resolve(strict=False)))
+
+    def _image_mtime_ns(self, image_path: Path) -> int | None:
+        try:
+            return image_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _set_watched_image(self, image_path: Path | None) -> None:
+        self._image_reload_pending = False
+        self._image_reload_debounce_timer.stop()
+
+        existing_watch_paths = self._image_file_watcher.files()
+        if existing_watch_paths:
+            self._image_file_watcher.removePaths(existing_watch_paths)
+
+        self._watched_image_path = image_path
+        self._watched_image_mtime_ns = None
+
+        if image_path is None:
+            self._image_reload_poll_timer.stop()
+            return
+
+        self._watched_image_mtime_ns = self._image_mtime_ns(image_path)
+        try:
+            if image_path.exists():
+                self._image_file_watcher.addPath(str(image_path))
+        except OSError:
+            pass
+
+        if not self._image_reload_poll_timer.isActive():
+            self._image_reload_poll_timer.start()
+
+    def _ensure_watched_image_subscription(self) -> None:
+        image_path = self._watched_image_path
+        if image_path is None:
+            return
+        current_watches = {
+            os.path.normcase(path)
+            for path in self._image_file_watcher.files()
+        }
+        target = os.path.normcase(str(image_path))
+        if target in current_watches:
+            return
+        try:
+            if image_path.exists():
+                self._image_file_watcher.addPath(str(image_path))
+        except OSError:
+            pass
+
+    def _schedule_pending_image_reload(self) -> None:
+        self._image_reload_pending = True
+        self._image_reload_debounce_timer.start()
+
+    def _on_watched_image_file_changed(self, changed_path: str) -> None:
+        image_path = self._watched_image_path
+        if image_path is None:
+            return
+
+        normalized_changed = os.path.normcase(changed_path)
+        normalized_target = os.path.normcase(str(image_path))
+        if normalized_changed != normalized_target:
+            return
+
+        self._ensure_watched_image_subscription()
+        self._schedule_pending_image_reload()
+
+    def _poll_watched_image_changes(self) -> None:
+        image_path = self._watched_image_path
+        if image_path is None:
+            self._image_reload_poll_timer.stop()
+            return
+
+        current_mtime = self._image_mtime_ns(image_path)
+        if current_mtime is None:
+            return
+
+        if self._watched_image_mtime_ns is None:
+            self._watched_image_mtime_ns = current_mtime
+            return
+
+        if current_mtime != self._watched_image_mtime_ns:
+            self._schedule_pending_image_reload()
+
+    def _apply_pending_image_reload(self) -> None:
+        if not self._image_reload_pending:
+            return
+
+        self._image_reload_pending = False
+        image_path = self._watched_image_path
+        if image_path is None:
+            return
+
+        current_record = self._current_record()
+        if current_record is None:
+            return
+        if self._normalized_path_for_compare(current_record.image_path) != self._normalized_path_for_compare(image_path):
+            return
+
+        # External editors may do atomic-replace saves; re-subscribe every reload pass.
+        self._ensure_watched_image_subscription()
+
+        # Skip transient save states where the file is temporarily unavailable.
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            return
+
+        self._watched_image_mtime_ns = self._image_mtime_ns(image_path)
+        self._show_image(image_path)
+
+        record_index = self._record_index_for_image_path(image_path)
+        if record_index >= 0:
+            self._update_list_item_preview(record_index)
+
+        self.statusBar().showMessage(f"Reloaded image: {image_path.name}")
+
     def _open_current_image_in_default_app(self) -> None:
         image_path = self._current_image_path()
         if image_path is None:
@@ -1773,6 +1916,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open image failed", f"Could not open image in default app:\n{exc}")
             return
 
+        self._set_watched_image(image_path)
         self.statusBar().showMessage(f"Opened {image_path.name} in default app")
 
     def _open_current_image_with_editor(self, editor: ExternalEditor) -> None:
@@ -1789,6 +1933,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Open editor failed", f"Could not open image with {editor.display_name}:\n{exc}")
             return
 
+        self._set_watched_image(image_path)
         self.statusBar().showMessage(f"Opened {image_path.name} with {editor.display_name}")
 
     def _open_current_image_with_custom_editor(self) -> None:
@@ -2126,6 +2271,7 @@ class MainWindow(QMainWindow):
         self.tag_input.clear()
         self.tag_list.clear()
         self.current_index = -1
+        self._set_watched_image(None)
 
         # Tag completions depend on known tags, which we compute after load settles.
         self._refresh_tag_completions()
@@ -2374,6 +2520,7 @@ class MainWindow(QMainWindow):
             return
         if index < 0 or index >= len(self.records):
             self.current_index = -1
+            self._set_watched_image(None)
             self._update_fixup_button_state()
             if self.records:
                 self.statusBar().showMessage(self._filtered_total_status_text())
@@ -2381,6 +2528,7 @@ class MainWindow(QMainWindow):
 
         self.current_index = index
         record = self.records[index]
+        self._set_watched_image(record.image_path)
 
         self._show_image(record.image_path)
 

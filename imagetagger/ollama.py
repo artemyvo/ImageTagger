@@ -146,7 +146,7 @@ def fetch_models(server: str, timeout: float = 5.0) -> list[str]:
     return model_names
 
 def _encode_image(image_path: Path) -> str:
-    prepared_image = prepare_image_for_query(image_path)
+    prepared_image = prepare_image_for_query(image_path, force_webp_to_png=True)
     return base64.b64encode(prepared_image.content).decode("ascii")
 
 

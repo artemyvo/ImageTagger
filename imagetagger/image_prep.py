@@ -75,20 +75,38 @@ def _media_type_from_format(image_format: str | None, suffix: str) -> str:
     return _MEDIA_TYPES_BY_SUFFIX.get(suffix.casefold(), "application/octet-stream")
 
 
-def prepare_image_for_query(image_path: Path) -> PreparedImage:
+def prepare_image_for_query(
+    image_path: Path,
+    *,
+    force_webp_to_png: bool = False,
+) -> PreparedImage:
     try:
         image_bytes = image_path.read_bytes()
     except OSError as exc:
         raise LlmQueryError(f"Could not read image file: {exc}") from exc
 
-    return _prepare_image_bytes(image_bytes, suffix=image_path.suffix)
+    return _prepare_image_bytes(
+        image_bytes,
+        suffix=image_path.suffix,
+        force_webp_to_png=force_webp_to_png,
+    )
 
 
-def _prepare_image_bytes(image_bytes: bytes, *, suffix: str) -> PreparedImage:
+def _prepare_image_bytes(
+    image_bytes: bytes,
+    *,
+    suffix: str,
+    force_webp_to_png: bool,
+) -> PreparedImage:
     global _resize_warning_pending
+    suffix_is_webp = suffix.casefold() == ".webp"
     try:
         from PIL import Image, ImageOps, UnidentifiedImageError
     except ImportError:
+        if force_webp_to_png and suffix_is_webp:
+            raise LlmQueryError(
+                "Pillow is required to convert WEBP images to PNG for Ollama requests."
+            )
         with _resize_warning_lock:
             _resize_warning_pending = True
         return PreparedImage(content=image_bytes, media_type=_media_type_from_format(None, suffix))
@@ -99,12 +117,18 @@ def _prepare_image_bytes(image_bytes: bytes, *, suffix: str) -> PreparedImage:
             width, height = image.size
             image_format = (image.format or "").upper() or None
             media_type = _media_type_from_format(image_format, suffix)
+            is_webp = image_format == "WEBP" or suffix_is_webp
+            should_transcode_webp = force_webp_to_png and is_webp
 
             if width <= 0 or height <= 0:
+                if should_transcode_webp:
+                    output = BytesIO()
+                    image.save(output, format="PNG", optimize=True)
+                    return PreparedImage(content=output.getvalue(), media_type="image/png")
                 return PreparedImage(content=image_bytes, media_type=media_type)
 
             pixels = width * height
-            if pixels <= _max_image_pixels:
+            if pixels <= _max_image_pixels and not should_transcode_webp:
                 return PreparedImage(
                     content=image_bytes,
                     media_type=media_type,
@@ -123,8 +147,9 @@ def _prepare_image_bytes(image_bytes: bytes, *, suffix: str) -> PreparedImage:
                     resized = resized.convert("RGB")
                 resized.save(output, format="JPEG", quality=90, optimize=True)
                 output_format = "JPEG"
-            elif output_format == "PNG":
+            elif output_format == "PNG" or should_transcode_webp:
                 resized.save(output, format="PNG", optimize=True)
+                output_format = "PNG"
             else:
                 resized.save(output, format="PNG", optimize=True)
                 output_format = "PNG"

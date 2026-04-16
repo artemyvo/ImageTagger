@@ -2,6 +2,8 @@
 
 This folder contains project documentation beyond the top-level README.
 
+Runtime requirement: Python 3.9 or newer.
+
 ## Start Here
 
 - Usage guide: [usage.md](usage.md)

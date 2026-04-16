@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 from dataclasses import dataclass, field
+import os
 import sys
 import time
 from typing import Callable
 
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QObject, Qt, QSize, QStringListModel, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QFileSystemWatcher, QObject, Qt, QSize, QStringListModel, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QDoubleValidator, QIntValidator, QKeySequence, QPixmap, QPainter, QPalette, QTextCharFormat, QTextCursor, QTextDocument
 from PyQt6.QtWidgets import (
     QApplication,
@@ -35,6 +36,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -403,6 +405,11 @@ class ScalableImageLabel(QLabel):
         self._original_pixmap = pixmap
         self._update_scaled_image()
 
+    def clear_original_image(self, text: str = "") -> None:
+        self._original_pixmap = None
+        self.setPixmap(QPixmap())
+        self.setText(text)
+
     def _update_scaled_image(self) -> None:
         if self._original_pixmap is None:
             return
@@ -552,15 +559,34 @@ class FixupDialog(QDialog):
         self._updating_comparison_table = False
         self._pending_edit_refresh = False
         self._last_action_table_row: int | None = None
-        self._image_path = image_path
+        self._image_path = Path(image_path) if isinstance(image_path, str) else image_path
+        self._image_label: ScalableImageLabel | None = None
         self._provider_session = provider_session
         self._regenerate_thread: QThread | None = None
         self._regenerate_worker: RegenerateWorker | None = None
         self._regenerate_cancel: LlmRequestCancellation | None = None
+        self._regenerate_started_at: float | None = None
         self._discard_regenerate_result = False
         self._global_key_filter_installed = False
         self._search_matches = fixup_data.search_matches or []
         self._detected_external_editors: list[ExternalEditor] | None = None
+        self._watched_image_path: Path | None = None
+        self._watched_image_mtime_ns: int | None = None
+        self._image_reload_pending = False
+
+        self._image_file_watcher = QFileSystemWatcher(self)
+        self._image_file_watcher.fileChanged.connect(self._on_watched_image_file_changed)
+
+        self._image_reload_debounce_timer = QTimer(self)
+        self._image_reload_debounce_timer.setSingleShot(True)
+        self._image_reload_debounce_timer.setInterval(400)
+        self._image_reload_debounce_timer.timeout.connect(self._apply_pending_image_reload)
+
+        # Polling fallback keeps reload reliable on SMB/NFS volumes where
+        # native change notifications can be delayed or missing.
+        self._image_reload_poll_timer = QTimer(self)
+        self._image_reload_poll_timer.setInterval(1200)
+        self._image_reload_poll_timer.timeout.connect(self._poll_watched_image_changes)
 
         self.left_list = QListWidget(self)
         self.left_list.setItemDelegate(DiffHighlightDelegate(self.left_list))
@@ -579,12 +605,11 @@ class FixupDialog(QDialog):
         self.addAction(self.remove_left_tag_action)
 
         self.merge_and_next_alt_action = QAction("Merge and Next", self)
-        merge_next_shortcuts = platform_key_sequences(
+        merge_next_shortcut_labels = platform_key_sequences(
             ["Alt+Enter", "Alt+Return"],
             ["Alt+Enter", "Alt+Return"],
         )
-        self.merge_and_next_alt_action.setShortcuts(merge_next_shortcuts)
-        self._merge_next_shortcut_hint = native_shortcut_text(merge_next_shortcuts)
+        self._merge_next_shortcut_hint = native_shortcut_text(merge_next_shortcut_labels)
         self.merge_and_next_alt_action.triggered.connect(self._merge_and_next)
         self.addAction(self.merge_and_next_alt_action)
 
@@ -720,6 +745,11 @@ class FixupDialog(QDialog):
         self.regenerate_status_label = QLabel(self)
         self.regenerate_status_label.setWordWrap(True)
         self.regenerate_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.regenerate_status_label.setMinimumWidth(0)
+        self.regenerate_status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
 
         self.issues_label = QLabel(fixup_data.issues or "No issue details provided.", self)
         self.issues_label.setWordWrap(True)
@@ -756,7 +786,7 @@ class FixupDialog(QDialog):
         self.undo_button.clicked.connect(self._undo_merge)
 
         self.merge_next_button = QPushButton("Merge and Next", self)
-        self.merge_next_button.setShortcut(merge_next_shortcuts[0])
+        self.merge_next_button.setShortcut(merge_next_shortcut_labels[0])
         self.merge_next_button.setToolTip(
             f"Apply current annotations and go to next item, even with no local edits ({self._merge_next_shortcut_hint})"
         )
@@ -839,6 +869,126 @@ class FixupDialog(QDialog):
         self._update_difference_highlights()
         self._refresh_widget_item_sizes()
         self._update_regenerate_controls()
+        self._set_watched_image(self._image_path)
+
+    def _image_mtime_ns(self, image_path: Path) -> int | None:
+        try:
+            return image_path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _set_watched_image(self, image_path: Path | None) -> None:
+        self._image_reload_pending = False
+        self._image_reload_debounce_timer.stop()
+
+        existing_watch_paths = self._image_file_watcher.files()
+        if existing_watch_paths:
+            self._image_file_watcher.removePaths(existing_watch_paths)
+
+        self._watched_image_path = image_path
+        self._watched_image_mtime_ns = None
+
+        if image_path is None:
+            self._image_reload_poll_timer.stop()
+            return
+
+        self._watched_image_mtime_ns = self._image_mtime_ns(image_path)
+        try:
+            if image_path.exists():
+                self._image_file_watcher.addPath(str(image_path))
+        except OSError:
+            pass
+
+        if not self._image_reload_poll_timer.isActive():
+            self._image_reload_poll_timer.start()
+
+    def _ensure_watched_image_subscription(self) -> None:
+        image_path = self._watched_image_path
+        if image_path is None:
+            return
+
+        current_watches = {os.path.normcase(path) for path in self._image_file_watcher.files()}
+        target = os.path.normcase(str(image_path))
+        if target in current_watches:
+            return
+
+        try:
+            if image_path.exists():
+                self._image_file_watcher.addPath(str(image_path))
+        except OSError:
+            pass
+
+    def _schedule_pending_image_reload(self) -> None:
+        self._image_reload_pending = True
+        self._image_reload_debounce_timer.start()
+
+    def _on_watched_image_file_changed(self, changed_path: str) -> None:
+        image_path = self._watched_image_path
+        if image_path is None:
+            return
+
+        if os.path.normcase(changed_path) != os.path.normcase(str(image_path)):
+            return
+
+        self._ensure_watched_image_subscription()
+        self._schedule_pending_image_reload()
+
+    def _poll_watched_image_changes(self) -> None:
+        image_path = self._watched_image_path
+        if image_path is None:
+            self._image_reload_poll_timer.stop()
+            return
+
+        current_mtime = self._image_mtime_ns(image_path)
+        if current_mtime is None:
+            return
+
+        if self._watched_image_mtime_ns is None:
+            self._watched_image_mtime_ns = current_mtime
+            return
+
+        if current_mtime != self._watched_image_mtime_ns:
+            self._schedule_pending_image_reload()
+
+    def _load_dialog_image_preview(self, image_path: Path | None) -> bool:
+        image_label = self._image_label
+        if image_label is None:
+            return False
+
+        if image_path is None:
+            image_label.clear_original_image("No image path provided")
+            return False
+
+        if not image_path.exists() or not image_path.is_file():
+            image_label.clear_original_image(f"File not found:\n{image_path.name}")
+            return False
+
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            image_label.clear_original_image(f"Unsupported format:\n{image_path.name}")
+            return False
+
+        image_label.setText("")
+        image_label.set_original_image(pixmap)
+        return True
+
+    def _apply_pending_image_reload(self) -> None:
+        if not self._image_reload_pending:
+            return
+
+        self._image_reload_pending = False
+        image_path = self._watched_image_path
+        if image_path is None:
+            return
+
+        # External editors may save with atomic replace, so ensure watcher is re-attached.
+        self._ensure_watched_image_subscription()
+
+        if not self._load_dialog_image_preview(image_path):
+            return
+
+        self._watched_image_mtime_ns = self._image_mtime_ns(image_path)
+        self.regenerate_status_label.setText(f"Reloaded image: {image_path.name}")
 
     def _add_left_item(self, text: str) -> None:
         """Add item to left list with remove button if unmatched in right list."""
@@ -1919,6 +2069,16 @@ class FixupDialog(QDialog):
         if comparison_table is None or left_tag_input is None:
             return super().eventFilter(watched, event)
 
+        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            modifiers = event.modifiers()
+            allowed_modifiers = Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.KeypadModifier
+            has_alt_only = bool(modifiers & Qt.KeyboardModifier.AltModifier) and not bool(modifiers & ~allowed_modifiers)
+            if has_alt_only:
+                focused = self.focusWidget()
+                if not isinstance(focused, QTextEdit):
+                    self._merge_and_next()
+                    return True
+
         if watched is comparison_table and event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 if event.modifiers() == Qt.KeyboardModifier.NoModifier and self._trigger_action_for_current_row():
@@ -2327,6 +2487,7 @@ class FixupDialog(QDialog):
         self._regenerate_worker.cancelled.connect(self._regenerate_thread.quit)
         self._regenerate_worker.failed.connect(self._regenerate_thread.quit)
         self._regenerate_thread.finished.connect(self._cleanup_regenerate_task)
+        self._regenerate_started_at = time.monotonic()
         self._update_regenerate_controls()
         self._regenerate_thread.start()
 
@@ -2397,8 +2558,17 @@ class FixupDialog(QDialog):
             final_tags,
             exact_match_only_for_tags=exact_only_for_tags,
         )
+        self._activate_first_comparison_row()
+        elapsed_seconds: int | None = None
+        if self._regenerate_started_at is not None:
+            elapsed_seconds = max(1, int(time.monotonic() - self._regenerate_started_at))
         if description or tags:
-            self.regenerate_status_label.setText("Regenerated proposed annotations.")
+            if elapsed_seconds is not None:
+                self.regenerate_status_label.setText(
+                    f"Regenerated proposed annotations in {elapsed_seconds} seconds."
+                )
+            else:
+                self.regenerate_status_label.setText("Regenerated proposed annotations.")
         else:
             self.regenerate_status_label.setText("Ollama returned no annotations.")
 
@@ -2426,6 +2596,7 @@ class FixupDialog(QDialog):
         self._regenerate_worker = None
         self._regenerate_thread = None
         self._regenerate_cancel = None
+        self._regenerate_started_at = None
         self._update_regenerate_controls()
         self._refresh_button_state()
 
@@ -2439,30 +2610,11 @@ class FixupDialog(QDialog):
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         image_label = ScalableImageLabel(self)
+        self._image_label = image_label
         image_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         image_label.customContextMenuRequested.connect(self._show_image_context_menu)
 
-        image_loaded = False
-        if image_path:
-            # Ensure path is a Path object
-            if isinstance(image_path, str):
-                image_path = Path(image_path)
-            
-            if image_path.exists() and image_path.is_file():
-                try:
-                    pixmap = QPixmap(str(image_path))
-                    if not pixmap.isNull():
-                        image_label.set_original_image(pixmap)
-                        image_loaded = True
-                    else:
-                        image_label.setText(f"Unsupported format:\n{image_path.name}")
-                except Exception as e:
-                    image_label.setText(f"Failed to load:\n{str(e)[:50]}")
-            else:
-                image_label.setText(f"File not found:\n{image_path.name if image_path else 'unknown'}")
-        
-        if not image_loaded and image_label.text() == "":
-            image_label.setText("No image path provided")
+        self._load_dialog_image_preview(image_path)
 
         scroll.setWidget(image_label)
         pane_layout.addWidget(scroll, stretch=1)
@@ -2522,6 +2674,7 @@ class FixupDialog(QDialog):
             QMessageBox.warning(self, "Open image failed", f"Could not open image in default app:\n{exc}")
             return
 
+        self._set_watched_image(image_path)
         self.regenerate_status_label.setText(f"Opened {image_path.name} in default app")
 
     def _open_image_with_editor(self, editor: ExternalEditor) -> None:
@@ -2538,6 +2691,7 @@ class FixupDialog(QDialog):
             QMessageBox.warning(self, "Open editor failed", f"Could not open image with {editor.display_name}:\n{exc}")
             return
 
+        self._set_watched_image(image_path)
         self.regenerate_status_label.setText(f"Opened {image_path.name} with {editor.display_name}")
 
     def _open_image_with_custom_editor(self) -> None:
@@ -2610,6 +2764,7 @@ class FixupDialog(QDialog):
                 app.removeEventFilter(self)
             self._global_key_filter_installed = False
         self._cancel_regenerate(discard_result=True)
+        self._set_watched_image(None)
         super().closeEvent(event)
 
     def has_merged_changes(self) -> bool:

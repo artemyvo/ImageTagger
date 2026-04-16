@@ -39,9 +39,68 @@ def existing_fixup_path_for_image(image_path: Path) -> Path | None:
     return None
 
 
+def _dedupe_fixup_tags_content(content: str) -> str:
+    """Normalize and deduplicate entries within each TAGS section."""
+    lines = content.splitlines()
+    if not lines:
+        return ""
+
+    output_lines: list[str] = []
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        upper = stripped.upper()
+
+        if upper.startswith("TAGS:"):
+            raw_tags: list[str] = []
+            inline_content = stripped[5:].strip()
+            if inline_content:
+                raw_tags.append(inline_content)
+
+            index += 1
+            while index < len(lines):
+                next_line = lines[index]
+                next_stripped = next_line.strip()
+                next_upper = next_stripped.upper()
+                if (
+                    next_upper.startswith("ISSUES:")
+                    or next_upper.startswith("TAGS:")
+                    or next_upper.startswith("DESCRIPTION:")
+                    or next_upper.startswith(_AI_FIND_SECTION_HEADER)
+                ):
+                    break
+                if next_stripped:
+                    raw_tags.append(next_stripped)
+                index += 1
+
+            unique_tags: list[str] = []
+            seen_keys: set[str] = set()
+            for value in raw_tags:
+                normalized = _normalize_fixup_section_entry(value)
+                if not normalized:
+                    continue
+                key = normalized.casefold()
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                unique_tags.append(normalized)
+
+            output_lines.append("TAGS:")
+            output_lines.extend(f"- {tag}" for tag in unique_tags)
+            continue
+
+        output_lines.append(line)
+        index += 1
+
+    return "\n".join(output_lines).strip() + "\n"
+
+
 def write_fixup_for_image(image_path: Path, content: str) -> Path:
     fixup_path = fixup_path_for_image(image_path)
-    atomic_write_text(fixup_path, content.strip() + "\n", encoding="utf-8")
+    cleaned_content = _dedupe_fixup_tags_content(content)
+    atomic_write_text(fixup_path, cleaned_content, encoding="utf-8")
     return fixup_path
 
 

@@ -6,6 +6,8 @@ It is designed for teams and solo practitioners who need to keep large caption/t
 
 ## Quick Start
 
+Prerequisite: Python 3.9 or newer in PATH.
+
 Windows:
 
 1. Double-click `install.bat` (or run it from a terminal).

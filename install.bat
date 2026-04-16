@@ -13,7 +13,7 @@ where python >nul 2>&1
 if not errorlevel 1 (
     for /f "delims=" %%P in ('where python') do (
         if not defined PYTHON (
-            "%%P" -c "import sys; v=sys.version_info; exit(0 if v>=(3,10) else 1)" >nul 2>&1
+            "%%P" -c "import sys; v=sys.version_info; exit(0 if v>=(3,9) else 1)" >nul 2>&1
             if not errorlevel 1 (
                 set "PYTHON=%%P"
             )
@@ -26,7 +26,7 @@ if not defined PYTHON (
     if not errorlevel 1 (
         for /f "delims=" %%P in ('where python3') do (
             if not defined PYTHON (
-                "%%P" -c "import sys; v=sys.version_info; exit(0 if v>=(3,10) else 1)" >nul 2>&1
+                "%%P" -c "import sys; v=sys.version_info; exit(0 if v>=(3,9) else 1)" >nul 2>&1
                 if not errorlevel 1 (
                     set "PYTHON=%%P"
                 )
@@ -36,8 +36,18 @@ if not defined PYTHON (
 )
 
 if not defined PYTHON (
-    echo Error: Python 3.10 or newer is required but was not found in PATH.
-    echo Download Python from https://www.python.org/downloads/windows/
+    echo Error: Python 3.9 or newer is required but was not found in PATH.
+    echo.
+    echo You can install Python in one of these ways:
+    echo   1. Microsoft Store ^(recommended for beginners^):
+    echo      Open the Start menu, search for "Python", and install it from there.
+    echo      Or visit: https://apps.microsoft.com/search?query=python
+    echo   2. Official installer:
+    echo      https://www.python.org/downloads/windows/
+    echo      Check "Add Python to PATH" on the first installer screen.
+    echo.
+    echo After installing, close this window and open a new Command Prompt,
+    echo then run install.bat again.
     goto :end_error
 )
 
