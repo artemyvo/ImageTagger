@@ -2157,6 +2157,14 @@ class FixupDialog(QDialog):
             and event.key() == Qt.Key.Key_Left
             and _is_plain_arrow_modifiers(event.modifiers())
         ):
+            focused = self.focusWidget()
+            if isinstance(focused, (QLineEdit, QTextEdit)):
+                return super().eventFilter(watched, event)
+            if focused is not None and not (
+                focused is comparison_table or comparison_table.isAncestorOf(focused)
+            ):
+                return super().eventFilter(watched, event)
+
             selected_rows = sorted({index.row() for index in comparison_table.selectedIndexes()})
             right_indexes: list[int] = []
             for row in selected_rows:

@@ -2208,7 +2208,17 @@ class MainWindow(QMainWindow):
                 display_index = initial_fixup_record_indices.index(self.current_index) + 1
             except ValueError:
                 display_index = 1
-            dialog_title = f"Fixup - {record.image_path.name} ({display_index} of {initial_fixup_total})"
+
+            title_path = record.image_path.name
+            if self._root_directory is not None:
+                try:
+                    relative_path = record.image_path.relative_to(self._root_directory)
+                except ValueError:
+                    relative_path = None
+                if relative_path is not None and relative_path.parent != Path("."):
+                    title_path = relative_path.as_posix()
+
+            dialog_title = f"Fixup - {title_path} ({display_index} of {initial_fixup_total})"
 
             prev_fixup_index = self._find_adjacent_fixup_index(self.current_index, -1)
             next_fixup_index = self._find_adjacent_fixup_index(self.current_index, 1)
