@@ -45,7 +45,7 @@ Supported image formats: jpg, jpeg, png, bmp, gif, webp.
 
 - Batch operations on selected images for Generate, Validate, and AI Find.
 - Fixup workflow backed by per-image .fixup files.
-- Expression-based filtering with fixup, quoted tags, freetext, AND/OR, and parentheses.
+- Expression-based filtering with fixup, untagged, resolution, quoted tags, freetext, NOT/AND/OR, and parentheses.
 - Editable prompt tabs for Description, Tagging, Validation, and AI Search.
 - Preview context menu with Open in Default App and Open With support.
 

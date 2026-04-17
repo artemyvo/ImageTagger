@@ -160,11 +160,40 @@ class _OrFilterNode(_FilterNode):
         return self.left.evaluate(record, runtime) or self.right.evaluate(record, runtime)
 
 
+@dataclass(frozen=True)
+class _NotFilterNode(_FilterNode):
+    operand: _FilterNode
+
+    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
+        return not self.operand.evaluate(record, runtime)
+
+
+@dataclass(frozen=True)
+class _ComparisonFilterNode(_FilterNode):
+    operator: str  # "<", ">", "<=", ">="
+    value: float
+
+    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
+        resolution_mpx = runtime.get_resolution_mpx(record)
+        if resolution_mpx is None:
+            return False
+        if self.operator == "<":
+            return resolution_mpx < self.value
+        elif self.operator == "<=":
+            return resolution_mpx <= self.value
+        elif self.operator == ">":
+            return resolution_mpx > self.value
+        elif self.operator == ">=":
+            return resolution_mpx >= self.value
+        return False
+
+
 @dataclass
 class _FilterRuntime:
     named_filters: dict[str, Callable[[ImageRecord], bool]]
     tag_filter: Callable[[ImageRecord, str], bool]
     freetext_filter: Callable[[ImageRecord, str], bool]
+    get_resolution_mpx: Callable[[ImageRecord], float | None]
 
 
 def _tokenize_filter_expression(expression: str) -> list[_FilterToken]:
@@ -179,8 +208,38 @@ def _tokenize_filter_expression(expression: str) -> list[_FilterToken]:
             index += 1
             continue
 
-        if char in "&|()":
+        if char in "&|()": 
             tokens.append(_FilterToken(kind=char, value=char, position=index))
+            index += 1
+            continue
+
+        if char in "<>":
+            start = index
+            if char == "<" and index + 1 < length and expression[index + 1] == "=":
+                tokens.append(_FilterToken(kind="COMP", value="<=", position=index))
+                index += 2
+            elif char == ">" and index + 1 < length and expression[index + 1] == "=":
+                tokens.append(_FilterToken(kind="COMP", value=">=", position=index))
+                index += 2
+            else:
+                tokens.append(_FilterToken(kind="COMP", value=char, position=index))
+                index += 1
+            continue
+
+        if char.isdigit() or (char == "." and index + 1 < length and expression[index + 1].isdigit()):
+            start = index
+            while index < length and (expression[index].isdigit() or expression[index] == "."):
+                index += 1
+            value = expression[start:index]
+            try:
+                num_value = float(value)
+                tokens.append(_FilterToken(kind="NUMBER", value=value, position=start))
+            except ValueError:
+                raise FilterSyntaxError(f"Invalid number '{value}' at position {start + 1}.")
+            continue
+
+        if char in "!~":
+            tokens.append(_FilterToken(kind="NOT", value=char, position=index))
             index += 1
             continue
 
@@ -233,7 +292,7 @@ def _tokenize_filter_expression(expression: str) -> list[_FilterToken]:
             continue
 
         start = index
-        while index < length and (not expression[index].isspace()) and expression[index] not in "&|()\"":
+        while index < length and (not expression[index].isspace()) and expression[index] not in "&|()\"!~<>":
             index += 1
 
         value = expression[start:index]
@@ -284,8 +343,26 @@ def _parse_filter_expression(expression: str) -> _FilterNode | None:
             return nested
 
         if token.kind == "NAME":
-            _consume("NAME")
-            return _NamedFilterNode(name=token.value)
+            name_token = _consume("NAME")
+            if name_token.value.casefold() == "resolution":
+                comp_token = _peek()
+                if comp_token is None or comp_token.kind != "COMP":
+                    raise FilterSyntaxError(
+                        f"Expected comparison operator after 'resolution' at position {name_token.position + len(name_token.value) + 1}."
+                    )
+                _consume("COMP")
+                num_token = _peek()
+                if num_token is None or num_token.kind != "NUMBER":
+                    raise FilterSyntaxError(
+                        f"Expected number after '{comp_token.value}' at position {comp_token.position + len(comp_token.value) + 1}."
+                    )
+                _consume("NUMBER")
+                try:
+                    num_value = float(num_token.value)
+                except ValueError:
+                    raise FilterSyntaxError(f"Invalid number '{num_token.value}' at position {num_token.position + 1}.")
+                return _ComparisonFilterNode(operator=comp_token.value, value=num_value)
+            return _NamedFilterNode(name=name_token.value)
 
         if token.kind == "STRING":
             _consume("STRING")
@@ -297,14 +374,21 @@ def _parse_filter_expression(expression: str) -> _FilterNode | None:
 
         raise FilterSyntaxError(f"Unexpected token '{token.value}' at position {token.position + 1}.")
 
+    def _parse_not_expression() -> _FilterNode:
+        token = _peek()
+        if token is not None and token.kind == "NOT":
+            _consume("NOT")
+            return _NotFilterNode(operand=_parse_not_expression())
+        return _parse_primary()
+
     def _parse_and_expression() -> _FilterNode:
-        node = _parse_primary()
+        node = _parse_not_expression()
         while True:
             token = _peek()
             if token is None or token.kind != "&":
                 break
             _consume("&")
-            node = _AndFilterNode(left=node, right=_parse_primary())
+            node = _AndFilterNode(left=node, right=_parse_not_expression())
         return node
 
     def _parse_or_expression() -> _FilterNode:
@@ -1516,26 +1600,45 @@ class MainWindow(QMainWindow):
         rules_text = (
             "Filter rules:\n\n"
             "- fixup: show images with fixup files\n"
+            "- untagged: show images with no annotation file\n"
+            "- resolution <, >, <=, >=: compare resolution in megapixels\n"
             "- \"tag\": match an exact tag\n"
             "- 'text': match free text inside annotation content\n"
+            "- ! or ~: NOT operator\n"
             "- &: AND operator\n"
             "- |: OR operator\n"
             "- ( ... ): group expressions\n\n"
+            "Precedence (highest to lowest): NOT, AND, OR\n\n"
             "Examples:\n"
+            "- !fixup\n"
+            "- resolution < 1.0\n"
+            "- (resolution > 5) & 'landscape'\n"
+            "- untagged | fixup\n"
             "- fixup & \"landscape\"\n"
-            "- \"portrait\" | 'sunset'\n"
-            "- (fixup & \"animal\") | 'night'"
+            "- !\"portrait\" | 'sunset'\n"
+            "- (fixup & \"animal\") | ~'night'"
         )
         QMessageBox.information(self, "Filter rules", rules_text)
+
+    def _get_image_resolution_mpx(self, record: ImageRecord) -> float | None:
+        """Compute image resolution in megapixels."""
+        try:
+            with Image.open(record.image_path) as image:
+                width, height = image.size
+                return (width * height) / 1_000_000.0
+        except Exception:
+            return None
 
     def _build_filter_runtime(self, tag_cache: dict[Path, set[str]] | None = None) -> _FilterRuntime:
         named_filters: dict[str, Callable[[ImageRecord], bool]] = {
             "fixup": lambda record: existing_fixup_path_for_image(record.image_path) is not None,
+            "untagged": lambda record: not record.text_path.exists(),
         }
         return _FilterRuntime(
             named_filters=named_filters,
             tag_filter=lambda record, tag: self._record_has_tag(record, tag, tag_cache=tag_cache),
             freetext_filter=lambda record, text: self._record_contains_freetext(record, text),
+            get_resolution_mpx=self._get_image_resolution_mpx,
         )
 
     def _record_has_tag(self, record: ImageRecord, tag: str, tag_cache: dict[Path, set[str]] | None = None) -> bool:
@@ -2451,8 +2554,18 @@ class MainWindow(QMainWindow):
         if first_visible >= 0:
             self.list_widget.setCurrentRow(first_visible)
 
-    def _build_thumbnail_icon(self, image_path: Path) -> QIcon:
+    @staticmethod
+    def _load_normalized_pixmap(image_path: Path) -> QPixmap:
         pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            return pixmap
+        # Normalize high-DPI asset naming semantics (for example "@2x") so
+        # previews and thumbnails use consistent logical sizing across formats.
+        pixmap.setDevicePixelRatio(1.0)
+        return pixmap
+
+    def _build_thumbnail_icon(self, image_path: Path) -> QIcon:
+        pixmap = self._load_normalized_pixmap(image_path)
         if pixmap.isNull():
             return QIcon()
 
@@ -2539,7 +2652,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{self._filtered_total_status_text(selected_row=index)} {record.image_path}")
 
     def _show_image(self, image_path: Path) -> None:
-        pixmap = QPixmap(str(image_path))
+        pixmap = self._load_normalized_pixmap(image_path)
         if pixmap.isNull():
             self.image_label.setText(f"Unable to load image:\n{image_path.name}")
             self.image_label.setPixmap(QPixmap())

@@ -561,6 +561,7 @@ class FixupDialog(QDialog):
         self._last_action_table_row: int | None = None
         self._image_path = Path(image_path) if isinstance(image_path, str) else image_path
         self._image_label: ScalableImageLabel | None = None
+        self._image_header_label: QLabel | None = None
         self._provider_session = provider_session
         self._regenerate_thread: QThread | None = None
         self._regenerate_worker: RegenerateWorker | None = None
@@ -769,8 +770,13 @@ class FixupDialog(QDialog):
         for search_query in fixup_data.search_matches:
             self._add_search_match_item(search_query)
 
-        self.accept_button = QPushButton("Accept", self)
-        self.accept_button.setToolTip("Accept all proposed rows and merge")
+        self.accept_button = QPushButton("&Accept", self)
+        accept_shortcut = platform_key_sequence("Alt+A", "Alt+A")
+        self.accept_button.setShortcut(accept_shortcut)
+        self._accept_shortcut_hint = native_shortcut_text(accept_shortcut)
+        self.accept_button.setToolTip(
+            f"Accept all proposed rows and merge ({self._accept_shortcut_hint})"
+        )
         self.accept_button.clicked.connect(self._accept_all_without_close)
 
         self.merge_button = QPushButton("Merge", self)
@@ -950,27 +956,51 @@ class FixupDialog(QDialog):
         if current_mtime != self._watched_image_mtime_ns:
             self._schedule_pending_image_reload()
 
+    @staticmethod
+    def _load_normalized_pixmap(image_path: Path) -> QPixmap:
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            return pixmap
+        # Normalize high-DPI asset naming semantics (for example "@2x") so
+        # preview sizing is consistent across file names and formats.
+        pixmap.setDevicePixelRatio(1.0)
+        return pixmap
+
     def _load_dialog_image_preview(self, image_path: Path | None) -> bool:
         image_label = self._image_label
         if image_label is None:
             return False
 
         if image_path is None:
+            self._set_image_header_text(None, None)
             image_label.clear_original_image("No image path provided")
             return False
 
         if not image_path.exists() or not image_path.is_file():
+            self._set_image_header_text(None, None)
             image_label.clear_original_image(f"File not found:\n{image_path.name}")
             return False
 
-        pixmap = QPixmap(str(image_path))
+        pixmap = self._load_normalized_pixmap(image_path)
         if pixmap.isNull():
+            self._set_image_header_text(None, None)
             image_label.clear_original_image(f"Unsupported format:\n{image_path.name}")
             return False
 
+        self._set_image_header_text(pixmap.width(), pixmap.height())
         image_label.setText("")
         image_label.set_original_image(pixmap)
         return True
+
+    def _set_image_header_text(self, width: int | None, height: int | None) -> None:
+        label = self._image_header_label
+        if label is None:
+            return
+        if width is None or height is None or width <= 0 or height <= 0:
+            label.setText("Image")
+            return
+        megapixels = (float(width) * float(height)) / 1_000_000.0
+        label.setText(f"Image: {width}x{height} - {megapixels:0.1f} MPx")
 
     def _apply_pending_image_reload(self) -> None:
         if not self._image_reload_pending:
@@ -1402,16 +1432,24 @@ class FixupDialog(QDialog):
             self.merge_and_next_alt_action.setText("Merge")
 
     def _refresh_button_state(self) -> None:
-        has_right_items = self.right_list.count() > 0
-        is_resolved = self._resolved
+        has_acceptable_proposals = self._has_acceptable_proposals()
         has_local_changes = self._has_local_changes()
         has_dialog_changes = self._has_dialog_state_changes()
         regenerate_in_progress = self._regenerate_thread is not None
         self._update_merge_next_button_presentation()
-        self.accept_button.setEnabled(has_right_items and not is_resolved and not regenerate_in_progress)
+        self.accept_button.setEnabled(has_acceptable_proposals and not regenerate_in_progress)
         self.merge_button.setEnabled(has_local_changes and not regenerate_in_progress)
         self.undo_button.setEnabled((self._undo_available or has_dialog_changes) and not regenerate_in_progress)
         self.merge_next_button.setEnabled(not regenerate_in_progress)
+        self._set_comparison_action_buttons_enabled(not regenerate_in_progress)
+
+    def _set_comparison_action_buttons_enabled(self, enabled: bool) -> None:
+        for row in range(self.comparison_table.rowCount()):
+            action_host = self.comparison_table.cellWidget(row, 1)
+            if action_host is None:
+                continue
+            for button in action_host.findChildren(QPushButton):
+                button.setEnabled(enabled)
 
     def _has_local_changes(self) -> bool:
         current = [
@@ -1425,6 +1463,43 @@ class FixupDialog(QDialog):
             if self._normalized_compare_text(text)
         ]
         return current != last_merged
+
+    def _merged_values_for_accept_all(self) -> list[str]:
+        proposed_values: list[str] = []
+        for index, value in enumerate(self._current_texts(self.right_list)):
+            if not value.strip():
+                continue
+            normalized = self._normalize_proposed_text_for_merge(value, index)
+            if normalized:
+                proposed_values.append(normalized)
+
+        preserved_values = [
+            value.strip()
+            for value in self._current_texts(self.left_list)
+            if value.strip() and self._is_protected_existing_text(value)
+        ]
+
+        merged_values: list[str] = []
+        seen: set[str] = set()
+        for value in preserved_values + proposed_values:
+            key = self._normalized_compare_key(value)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_values.append(value)
+        return merged_values
+
+    def _has_acceptable_proposals(self) -> bool:
+        current_values = [
+            value.strip()
+            for value in self._current_texts(self.left_list)
+            if value.strip()
+        ]
+        merged_values = self._merged_values_for_accept_all()
+
+        current_normalized = [self._normalized_compare_text(value) for value in current_values]
+        merged_normalized = [self._normalized_compare_text(value) for value in merged_values]
+        return current_normalized != merged_normalized
 
     def _has_proposed_changes(self) -> bool:
         current = [
@@ -1807,6 +1882,7 @@ class FixupDialog(QDialog):
             button = QPushButton(action_text, action_host)
             button.setFixedWidth(self._action_button_width)
             button.setFixedHeight(self._action_button_height)
+            button.setEnabled(self._regenerate_thread is None)
             if action_text == "✕":
                 button.setStyleSheet(_danger_button_stylesheet(button.palette()))
             button.clicked.connect(lambda _checked=False, cb=callback: cb())
@@ -1995,28 +2071,7 @@ class FixupDialog(QDialog):
         self._schedule_refresh_after_edit()
 
     def accept_all(self) -> None:
-        proposed_values: list[str] = []
-        for index, value in enumerate(self._current_texts(self.right_list)):
-            if not value.strip():
-                continue
-            normalized = self._normalize_proposed_text_for_merge(value, index)
-            if normalized:
-                proposed_values.append(normalized)
-        preserved_values = [
-            value.strip()
-            for value in self._current_texts(self.left_list)
-            if value.strip() and self._is_protected_existing_text(value)
-        ]
-
-        merged_values: list[str] = []
-        seen: set[str] = set()
-
-        for value in preserved_values + proposed_values:
-            key = self._normalized_compare_key(value)
-            if key in seen:
-                continue
-            seen.add(key)
-            merged_values.append(value)
+        merged_values = self._merged_values_for_accept_all()
 
         self.left_list.clear()
         for value in merged_values:
@@ -2069,6 +2124,10 @@ class FixupDialog(QDialog):
         if comparison_table is None or left_tag_input is None:
             return super().eventFilter(watched, event)
 
+        def _is_plain_arrow_modifiers(modifiers: Qt.KeyboardModifier) -> bool:
+            # Some macOS keyboards report arrow keys with KeypadModifier.
+            return not bool(modifiers & ~Qt.KeyboardModifier.KeypadModifier)
+
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             modifiers = event.modifiers()
             allowed_modifiers = Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.KeypadModifier
@@ -2083,35 +2142,9 @@ class FixupDialog(QDialog):
             if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 if event.modifiers() == Qt.KeyboardModifier.NoModifier and self._trigger_action_for_current_row():
                     return True
-            if event.key() == Qt.Key.Key_Left:
-                selected_rows = sorted({index.row() for index in comparison_table.selectedIndexes()})
-                right_indexes: list[int] = []
-                for row in selected_rows:
-                    if row < 0 or row >= len(self._table_row_map):
-                        continue
-                    _left_index, right_index = self._table_row_map[row]
-                    if right_index is None:
-                        continue
-                    cell_widget = comparison_table.cellWidget(row, 1)
-                    if cell_widget is not None:
-                        for btn in cell_widget.findChildren(QPushButton):
-                            if btn.text() == "←":
-                                right_indexes.append(right_index)
-                                break
-                if right_indexes:
-                    current_row = comparison_table.currentRow()
-                    self._remember_last_action_table_row(current_row)
-                    self._apply_proposed_rows(right_indexes)
-                    self._refresh_button_state()
-                    self._update_difference_highlights()
-                    new_row_count = comparison_table.rowCount()
-                    if new_row_count > 0 and current_row >= 0:
-                        target_row = min(current_row, new_row_count - 1)
-                        self._select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
-                    return True
-            if event.key() == Qt.Key.Key_Home and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            if event.key() == Qt.Key.Key_Home and _is_plain_arrow_modifiers(event.modifiers()):
                 return self._activate_first_comparison_row()
-            if event.key() == Qt.Key.Key_End and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            if event.key() == Qt.Key.Key_End and _is_plain_arrow_modifiers(event.modifiers()):
                 return self._activate_last_comparison_row()
             if sys.platform == "darwin" and event.modifiers() == Qt.KeyboardModifier.MetaModifier:
                 if event.key() == Qt.Key.Key_Up:
@@ -2119,8 +2152,39 @@ class FixupDialog(QDialog):
                 if event.key() == Qt.Key.Key_Down:
                     return self._activate_last_comparison_row()
 
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Left
+            and _is_plain_arrow_modifiers(event.modifiers())
+        ):
+            selected_rows = sorted({index.row() for index in comparison_table.selectedIndexes()})
+            right_indexes: list[int] = []
+            for row in selected_rows:
+                if row < 0 or row >= len(self._table_row_map):
+                    continue
+                _left_index, right_index = self._table_row_map[row]
+                if right_index is None:
+                    continue
+                cell_widget = comparison_table.cellWidget(row, 1)
+                if cell_widget is not None:
+                    for btn in cell_widget.findChildren(QPushButton):
+                        if btn.text() == "←":
+                            right_indexes.append(right_index)
+                            break
+            if right_indexes:
+                current_row = comparison_table.currentRow()
+                self._remember_last_action_table_row(current_row)
+                self._apply_proposed_rows(right_indexes)
+                self._refresh_button_state()
+                self._update_difference_highlights()
+                new_row_count = comparison_table.rowCount()
+                if new_row_count > 0 and current_row >= 0:
+                    target_row = min(current_row, new_row_count - 1)
+                    self._select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
+                return True
+
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
-            if event.modifiers() != Qt.KeyboardModifier.NoModifier:
+            if not _is_plain_arrow_modifiers(event.modifiers()):
                 return super().eventFilter(watched, event)
 
             step = -1 if event.key() == Qt.Key.Key_Up else 1
@@ -2144,7 +2208,7 @@ class FixupDialog(QDialog):
             if focused is comparison_table or comparison_table.isAncestorOf(focused):
                 return super().eventFilter(watched, event)
 
-            if isinstance(focused, (QLineEdit, QTextEdit, QAbstractItemView, QPushButton, QCheckBox)):
+            if isinstance(focused, (QLineEdit, QTextEdit, QAbstractItemView, QPushButton, QCheckBox, QSplitter)):
                 return super().eventFilter(watched, event)
 
             if self.isAncestorOf(focused):
@@ -2152,9 +2216,10 @@ class FixupDialog(QDialog):
                     return True
                 if event.key() == Qt.Key.Key_Down and self._activate_first_comparison_row():
                     return True
+                return True
 
         if event.type() == QEvent.Type.KeyPress:
-            is_home_end = event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End) and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            is_home_end = event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End) and _is_plain_arrow_modifiers(event.modifiers())
             is_macos_cmd_home_end = (
                 sys.platform == "darwin"
                 and event.modifiers() == Qt.KeyboardModifier.MetaModifier
@@ -2184,7 +2249,7 @@ class FixupDialog(QDialog):
             if focused is comparison_table or comparison_table.isAncestorOf(focused):
                 return super().eventFilter(watched, event)
 
-            if isinstance(focused, (QLineEdit, QTextEdit, QAbstractItemView, QPushButton, QCheckBox)):
+            if isinstance(focused, (QLineEdit, QTextEdit, QAbstractItemView, QPushButton, QCheckBox, QSplitter)):
                 return super().eventFilter(watched, event)
 
             if self.isAncestorOf(focused):
@@ -2604,7 +2669,8 @@ class FixupDialog(QDialog):
         pane = QWidget(self)
         pane_layout = QVBoxLayout(pane)
         pane_layout.setContentsMargins(0, 0, 0, 0)
-        pane_layout.addWidget(self._create_pane_header_label("Image"))
+        self._image_header_label = self._create_pane_header_label("Image")
+        pane_layout.addWidget(self._image_header_label)
         pane_layout.addSpacing(self._PANE_HEADER_BOTTOM_SPACING)
 
         scroll = QScrollArea(self)

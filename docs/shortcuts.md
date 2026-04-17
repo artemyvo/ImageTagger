@@ -34,6 +34,7 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Undo merge/local changes | Ctrl+Z | Command+Z | Dialog action + Undo button |
 | Previous actionable row | Alt+Up | Option+Up | Dialog action |
 | Next actionable row | Alt+Down | Option+Down | Dialog action |
+| Accept all proposed rows and merge | Alt+A | Option+A | Accept button |
 | Regenerate proposed annotations | Alt+R | Option+R | Regenerate button |
 | Previous image | Alt+Left | Command+[ | Prev button |
 | Next image | Alt+Right | Command+] | Next button |

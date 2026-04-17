@@ -94,6 +94,7 @@ Navigation:
 Quick Actions:
 
 - Alt+T: Quick add a new tag not present in existing rows.
+- Alt+A: Accept all proposed rows and merge.
 - Alt+R: Start regeneration to create fresh candidates.
 - Alt+Enter: Merge current change (save left/current pane to image and proceed to next image).
 - Left arrow key: Accept proposed change from right into result.
@@ -107,23 +108,30 @@ Use the image list filter to narrow large datasets quickly.
 
 Supported terms:
 
-- fixup: images with a fixup file.
-- "tag": exact tag match.
-- 'text': case-insensitive text match against annotation content.
+- `fixup`: images with a fixup file.
+- `untagged`: images that have no annotation (.txt) file at all.
+- `resolution <, >, <=, >=`: images matching a resolution threshold in megapixels.
+- `"tag"`: exact tag match.
+- `'text'`: case-insensitive text match against annotation content.
 
 Operators:
 
-- &: AND (binds tighter than OR)
-- |: OR
-- ( ... ): grouping (highest precedence)
+- `!` or `~`: NOT (negates the following term or group)
+- `&`: AND
+- `|`: OR
+- `( ... )`: grouping
 
-Precedence: `&` evaluates before `|`, so `a | b & c` is interpreted as `a | (b & c)`.
+Precedence (highest to lowest): NOT, AND, OR — same as C. So `a | b & c` is `a | (b & c)` and `!a & b` is `(!a) & b`.
 
 Examples:
 
-- fixup & "portrait"
-- "landscape" | 'sunset'
-- (fixup & "animal") | 'night'
+- `!fixup` — images without fixup files
+- `resolution < 1.0` — images with resolution lower than 1 MPx
+- `resolution >= 5` — images with resolution 5 MPx or higher
+- `(resolution > 5) & 'landscape'` — high-res landscape images
+- `fixup & "portrait"`
+- `!"landscape" | 'sunset'`
+- `~fixup & ("animal" | 'night')`
 
 ## Keyboard Shortcuts
 
