@@ -6,7 +6,7 @@ from typing import Callable, Literal
 from PyQt6.QtWidgets import QDialog, QMessageBox, QStyle, QWidget
 
 from imagetagger.io_utils import atomic_write_text
-from imagetagger.llm_provider import VisionLlmSession
+from imagetagger.llm_provider import VisionLlmProvider, VisionLlmSession
 from imagetagger.merge_dialog import FixupDialog, parse_fixup_data
 
 
@@ -211,12 +211,15 @@ def open_fixup_dialog_for_image(
     can_navigate_next: bool = False,
     tag_suggestions: list[str] | None = None,
     provider_session: VisionLlmSession | None = None,
+    provider: VisionLlmProvider | None = None,
     regenerate_tags_enabled: bool = True,
     regenerate_description_enabled: bool = True,
+    regenerate_description_prompt: str | None = None,
+    regenerate_tagging_prompt: str | None = None,
     regenerate_timeout_seconds: int = 300,
     regenerate_retry_count: int = 3,
     regenerate_max_resolution_mpx: float = 5.0,
-    save_regenerate_settings: Callable[[dict[str, int | float | bool]], None] | None = None,
+    save_regenerate_settings: Callable[[dict[str, int | float | bool | str]], None] | None = None,
 ) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
     fixup_path = existing_fixup_path_for_image(image_path)
     if fixup_path is None:
@@ -269,8 +272,11 @@ def open_fixup_dialog_for_image(
         tag_suggestions=tag_suggestions,
         normalize_annotation=sanitize_annotation,
         provider_session=provider_session,
+        provider=provider,
         regenerate_tags_enabled=regenerate_tags_enabled,
         regenerate_description_enabled=regenerate_description_enabled,
+        regenerate_description_prompt=regenerate_description_prompt,
+        regenerate_tagging_prompt=regenerate_tagging_prompt,
         regenerate_timeout_seconds=regenerate_timeout_seconds,
         regenerate_retry_count=regenerate_retry_count,
         regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
@@ -335,6 +341,8 @@ def open_fixup_dialog_for_image(
                 "timeout_seconds": max(1, timeout_value),
                 "retry_count": max(0, retry_value),
                 "max_resolution_mpx": max_resolution_value,
+                "description_prompt": dialog.regenerate_description_prompt_text(),
+                "tagging_prompt": dialog.regenerate_tagging_prompt_text(),
             }
         )
 

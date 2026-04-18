@@ -15,10 +15,10 @@ from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QCompleter,
     QDialog,
     QFileDialog,
-    QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -46,11 +47,11 @@ from imagetagger.llm_provider import (
     LlmProviderCancelled,
     LlmProviderError,
     LlmRequestCancellation,
+    VisionLlmProvider,
     VisionLlmSession,
 )
 from imagetagger.llm_queries import (
-    prepare_description_query,
-    prepare_tagging_query,
+    active_prompt_for_kind,
 )
 from imagetagger.external_editors import (
     ExternalEditor,
@@ -59,6 +60,7 @@ from imagetagger.external_editors import (
     launch_image_in_system_default,
 )
 from imagetagger.shortcuts import native_shortcut_text, platform_key_sequence, platform_key_sequences
+from imagetagger.server_settings_frame import create_server_settings_frame
 from imagetagger.theme_colors import danger_accent_color
 
 
@@ -528,8 +530,11 @@ class FixupDialog(QDialog):
         tag_suggestions: list[str] | None = None,
         normalize_annotation: Callable[[str], str] | None = None,
         provider_session: VisionLlmSession | None = None,
+        provider: VisionLlmProvider | None = None,
         regenerate_tags_enabled: bool = True,
         regenerate_description_enabled: bool = True,
+        regenerate_description_prompt: str | None = None,
+        regenerate_tagging_prompt: str | None = None,
         regenerate_timeout_seconds: int = 300,
         regenerate_retry_count: int = 3,
         regenerate_max_resolution_mpx: float = 5.0,
@@ -563,12 +568,27 @@ class FixupDialog(QDialog):
         self._image_label: ScalableImageLabel | None = None
         self._image_header_label: QLabel | None = None
         self._provider_session = provider_session
+        self._llm_provider = provider
+        self._llm_endpoint = ""
+        self._llm_model_name = ""
+        self._regenerate_prompt_editors: dict[str, QTextEdit] = {}
+        self._initial_regenerate_description_prompt = (
+            regenerate_description_prompt.strip()
+            if isinstance(regenerate_description_prompt, str)
+            else active_prompt_for_kind("description")
+        )
+        self._initial_regenerate_tagging_prompt = (
+            regenerate_tagging_prompt.strip()
+            if isinstance(regenerate_tagging_prompt, str)
+            else active_prompt_for_kind("tagging")
+        )
         self._regenerate_thread: QThread | None = None
         self._regenerate_worker: RegenerateWorker | None = None
         self._regenerate_cancel: LlmRequestCancellation | None = None
         self._regenerate_started_at: float | None = None
         self._discard_regenerate_result = False
         self._global_key_filter_installed = False
+        self._text_edit_active_until = 0.0
         self._search_matches = fixup_data.search_matches or []
         self._detected_external_editors: list[ExternalEditor] | None = None
         self._watched_image_path: Path | None = None
@@ -647,6 +667,7 @@ class FixupDialog(QDialog):
         self.left_tag_input.setToolTip(
             f"Type a tag and press Enter. {self._focus_tag_input_shortcut_hint} clears and focuses this field."
         )
+        self.left_tag_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
         self.left_tag_input.returnPressed.connect(self._add_left_tag_from_input)
 
         self._tag_suggestions_model = QStringListModel(tag_suggestions or [], self)
@@ -715,11 +736,13 @@ class FixupDialog(QDialog):
         self.regenerate_timeout_input.setValidator(QIntValidator(1, 86400, self))
         self.regenerate_timeout_input.setText(str(max(1, int(regenerate_timeout_seconds))))
         self.regenerate_timeout_input.setMaximumWidth(90)
+        self.regenerate_timeout_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
 
         self.regenerate_retry_input = QLineEdit(self)
         self.regenerate_retry_input.setValidator(QIntValidator(0, 10, self))
         self.regenerate_retry_input.setText(str(max(0, int(regenerate_retry_count))))
         self.regenerate_retry_input.setMaximumWidth(60)
+        self.regenerate_retry_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
 
         self.regenerate_max_resolution_input = QLineEdit(self)
         max_resolution_validator = QDoubleValidator(0.01, 1000.0, 3, self)
@@ -733,15 +756,37 @@ class FixupDialog(QDialog):
             max_resolution_value = 5.0
         self.regenerate_max_resolution_input.setText(self._format_mpx(max_resolution_value))
         self.regenerate_max_resolution_input.setMaximumWidth(80)
+        self.regenerate_max_resolution_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
 
-        self.regenerate_button = QPushButton("&Regenerate", self)
+        # Server controls for model selection during merge
+        self.llm_endpoint_input = QLineEdit(self)
+        self.llm_endpoint_input.setPlaceholderText("http://127.0.0.1:11434 (Ollama) or :8000 (OpenAI-compatible)")
+        self.llm_endpoint_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
+        if self._llm_provider is not None:
+            self.llm_endpoint_input.setText(self._llm_provider.default_endpoint)
+
+        self.llm_fetch_button = QPushButton("Fetch models", self)
+        self.llm_fetch_button.clicked.connect(self._fetch_provider_models)
+
+        self.llm_model_combo = QComboBox(self)
+        self.llm_model_combo.setEditable(False)
+
+        self.llm_use_button = QPushButton("Use", self)
+        self.llm_use_button.clicked.connect(self._use_selected_provider_model)
+
+        self.regenerate_button = QPushButton("Regenerate", self)
         regenerate_shortcut = platform_key_sequence("Alt+R", "Alt+R")
-        self.regenerate_button.setShortcut(regenerate_shortcut)
         self._regenerate_shortcut_hint = native_shortcut_text(regenerate_shortcut)
         self.regenerate_button.setToolTip(
             f"Regenerate proposed annotations ({self._regenerate_shortcut_hint})"
         )
         self.regenerate_button.clicked.connect(self._regenerate_proposed_annotations)
+
+        self.regenerate_alt_action = QAction("Regenerate", self)
+        self.regenerate_alt_action.setShortcut(regenerate_shortcut)
+        self.regenerate_alt_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.regenerate_alt_action.triggered.connect(self._regenerate_proposed_annotations)
+        self.addAction(self.regenerate_alt_action)
 
         self.regenerate_status_label = QLabel(self)
         self.regenerate_status_label.setWordWrap(True)
@@ -874,6 +919,7 @@ class FixupDialog(QDialog):
         self._refresh_button_state()
         self._update_difference_highlights()
         self._refresh_widget_item_sizes()
+        self._initialize_provider_controls()
         self._update_regenerate_controls()
         self._set_watched_image(self._image_path)
 
@@ -1312,11 +1358,18 @@ class FixupDialog(QDialog):
         return True
 
     def _activate_adjacent_row_for_last_action(self, step: int) -> bool:
-        if self._last_action_table_row is None:
-            return False
-
         row_count = self.comparison_table.rowCount()
         if row_count <= 0:
+            return False
+
+        current_row = self.comparison_table.currentRow()
+        if 0 <= current_row < row_count:
+            target_row = current_row + step
+            if 0 <= target_row < row_count:
+                return self._select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
+            return False
+
+        if self._last_action_table_row is None:
             return False
 
         if step < 0:
@@ -2045,6 +2098,12 @@ class FixupDialog(QDialog):
 
         QTimer.singleShot(0, _run_refresh)
 
+    def _mark_text_edit_activity(self, *, seconds: float = 1.5) -> None:
+        self._text_edit_active_until = max(self._text_edit_active_until, time.monotonic() + max(0.1, seconds))
+
+    def _is_text_editing_active(self) -> bool:
+        return time.monotonic() < self._text_edit_active_until
+
     def _on_comparison_item_changed(self, item: QTableWidgetItem) -> None:
         if self._updating_comparison_table:
             return
@@ -2128,13 +2187,24 @@ class FixupDialog(QDialog):
             # Some macOS keyboards report arrow keys with KeypadModifier.
             return not bool(modifiers & ~Qt.KeyboardModifier.KeypadModifier)
 
+        if event.type() == QEvent.Type.KeyPress and isinstance(watched, (QLineEdit, QTextEdit)):
+            if self.isAncestorOf(watched):
+                self._mark_text_edit_activity()
+
+        if event.type() == QEvent.Type.MouseButtonPress and isinstance(watched, QWidget):
+            if self.isAncestorOf(watched) and not isinstance(watched, (QLineEdit, QTextEdit)):
+                self._text_edit_active_until = 0.0
+
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             modifiers = event.modifiers()
             allowed_modifiers = Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.KeypadModifier
             has_alt_only = bool(modifiers & Qt.KeyboardModifier.AltModifier) and not bool(modifiers & ~allowed_modifiers)
             if has_alt_only:
                 focused = self.focusWidget()
-                if not isinstance(focused, QTextEdit):
+                table_cell_editing = comparison_table.state() == QAbstractItemView.State.EditingState
+                editing_focus = isinstance(focused, (QLineEdit, QTextEdit)) and self.isAncestorOf(focused)
+                left_tag_input_empty_focus = focused is left_tag_input and not left_tag_input.text().strip()
+                if (not editing_focus or left_tag_input_empty_focus) and not table_cell_editing:
                     self._merge_and_next()
                     return True
 
@@ -2158,11 +2228,13 @@ class FixupDialog(QDialog):
             and _is_plain_arrow_modifiers(event.modifiers())
         ):
             focused = self.focusWidget()
-            if isinstance(focused, (QLineEdit, QTextEdit)):
-                return super().eventFilter(watched, event)
-            if focused is not None and not (
-                focused is comparison_table or comparison_table.isAncestorOf(focused)
+            if (
+                isinstance(focused, (QLineEdit, QTextEdit))
+                and self.isAncestorOf(focused)
+                and self._is_text_editing_active()
             ):
+                return super().eventFilter(watched, event)
+            if focused is not None and not self.isAncestorOf(focused):
                 return super().eventFilter(watched, event)
 
             selected_rows = sorted({index.row() for index in comparison_table.selectedIndexes()})
@@ -2367,7 +2439,7 @@ class FixupDialog(QDialog):
         return value
 
     def _update_regenerate_controls(self) -> None:
-        connected = self._provider_session is not None
+        connected = self._active_regenerate_session(show_errors=False) is not None
         working = self._regenerate_thread is not None
         options_selected = (
             self.regenerate_tags_checkbox.isChecked()
@@ -2379,16 +2451,58 @@ class FixupDialog(QDialog):
         self.regenerate_timeout_input.setEnabled(not working)
         self.regenerate_retry_input.setEnabled(not working)
         self.regenerate_max_resolution_input.setEnabled(not working)
+        self.llm_endpoint_input.setEnabled(not working)
+        self.llm_fetch_button.setEnabled(not working and self._llm_provider is not None)
+        self.llm_model_combo.setEnabled(not working)
+        self.llm_use_button.setEnabled(not working and self.llm_model_combo.count() > 0 and self._llm_provider is not None)
 
         if working:
             self.regenerate_button.setEnabled(False)
             self.regenerate_button.setText("Regenerating...")
+            self.regenerate_alt_action.setEnabled(False)
             return
 
-        self.regenerate_button.setText("&Regenerate")
-        self.regenerate_button.setEnabled(connected and options_selected and self._image_path is not None)
+        regenerate_enabled = connected and options_selected and self._image_path is not None
+        self.regenerate_button.setText("Regenerate")
+        self.regenerate_button.setEnabled(regenerate_enabled)
+        self.regenerate_alt_action.setEnabled(regenerate_enabled)
         if not connected:
-            self.regenerate_status_label.setText("Regenerate is disabled until an Ollama model is connected in the main window.")
+            self.regenerate_status_label.setText("Regenerate is disabled until a model is selected in this dialog or in the main window.")
+
+    def _active_regenerate_session(self, *, show_errors: bool) -> VisionLlmSession | None:
+        if self._llm_provider is not None and self._llm_model_name.strip():
+            endpoint = self._llm_endpoint.strip() or self.llm_endpoint_input.text().strip()
+            if not endpoint:
+                if show_errors:
+                    QMessageBox.warning(self, "Server required", "Enter a server endpoint before regenerating.")
+                return None
+            try:
+                normalized_endpoint = self._llm_provider.normalize_endpoint(endpoint)
+            except LlmProviderError as exc:
+                if show_errors:
+                    QMessageBox.warning(self, "Invalid server", str(exc))
+                return None
+            self._llm_endpoint = normalized_endpoint
+            self.llm_endpoint_input.setText(normalized_endpoint)
+            return self._llm_provider.create_session(normalized_endpoint, self._llm_model_name)
+        return self._provider_session
+
+    def _initialize_provider_controls(self) -> None:
+        if self._provider_session is None:
+            return
+
+        session_endpoint = str(getattr(self._provider_session, "endpoint", "")).strip()
+        session_model = str(getattr(self._provider_session, "model_name", "")).strip()
+
+        if session_endpoint:
+            self._llm_endpoint = session_endpoint
+            self.llm_endpoint_input.setText(session_endpoint)
+
+        if session_model:
+            self._llm_model_name = session_model
+            if self.llm_model_combo.findText(session_model) == -1:
+                self.llm_model_combo.addItem(session_model)
+            self.llm_model_combo.setCurrentText(session_model)
 
     def _set_proposed_annotations(
         self,
@@ -2433,34 +2547,76 @@ class FixupDialog(QDialog):
             self._add_search_match_item(search_query)
 
     def _create_regenerate_frame(self) -> QWidget:
-        frame = QFrame(self)
-        frame.setFrameShape(QFrame.Shape.StyledPanel)
-        frame.setFrameShadow(QFrame.Shadow.Sunken)
+        return create_server_settings_frame(
+            parent=self,
+            endpoint_input=self.llm_endpoint_input,
+            fetch_button=self.llm_fetch_button,
+            model_combo=self.llm_model_combo,
+            use_button=self.llm_use_button,
+            include_tags_checkbox=self.regenerate_tags_checkbox,
+            include_description_checkbox=self.regenerate_description_checkbox,
+            timeout_input=self.regenerate_timeout_input,
+            retry_input=self.regenerate_retry_input,
+            max_resolution_input=self.regenerate_max_resolution_input,
+        )
 
-        layout = QVBoxLayout(frame)
+    def _create_regenerate_prompt_tab(self, kind: str) -> QWidget:
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        controls_row = QHBoxLayout()
-        controls_row.setContentsMargins(0, 0, 0, 0)
-        controls_row.addWidget(self.regenerate_tags_checkbox)
-        controls_row.addWidget(self.regenerate_description_checkbox)
-        controls_row.addSpacing(12)
-        controls_row.addWidget(QLabel("Timeout", self))
-        controls_row.addWidget(self.regenerate_timeout_input)
-        controls_row.addSpacing(8)
-        controls_row.addWidget(QLabel("Retries", self))
-        controls_row.addWidget(self.regenerate_retry_input)
-        controls_row.addSpacing(8)
-        controls_row.addWidget(QLabel("Query downscale", self))
-        controls_row.addWidget(self.regenerate_max_resolution_input)
-        controls_row.addWidget(QLabel("(MPx)", self))
-        controls_row.addStretch(1)
+        editor = QTextEdit(self)
+        editor.setAcceptRichText(False)
+        if kind == "description":
+            editor.setPlainText(self._initial_regenerate_description_prompt)
+        elif kind == "tagging":
+            editor.setPlainText(self._initial_regenerate_tagging_prompt)
+        else:
+            editor.setPlainText(active_prompt_for_kind(kind))
+        self._regenerate_prompt_editors[kind] = editor
 
-        layout.addLayout(controls_row)
-        layout.addWidget(self.regenerate_button, stretch=0)
-        layout.addWidget(self.regenerate_status_label, stretch=0)
-        return frame
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        reset_button = QPushButton("Reset", self)
+        reset_button.clicked.connect(
+            lambda _checked=False, prompt_kind=kind: self._reset_regenerate_prompt_to_main(prompt_kind)
+        )
+        button_row.addWidget(reset_button)
+        button_row.addStretch(1)
+
+        layout.addWidget(editor, stretch=1)
+        layout.addLayout(button_row)
+        return tab
+
+    def _create_regenerate_tabs(self) -> QTabWidget:
+        tabs = QTabWidget(self)
+        tabs.addTab(self._create_regenerate_frame(), "Regeneration")
+        tabs.addTab(self._create_regenerate_prompt_tab("description"), "Description")
+        tabs.addTab(self._create_regenerate_prompt_tab("tagging"), "Tags")
+        return tabs
+
+    def _reset_regenerate_prompt_to_main(self, kind: str) -> None:
+        editor = self._regenerate_prompt_editors.get(kind)
+        if editor is None:
+            return
+        editor.setPlainText(active_prompt_for_kind(kind))
+        if kind == "description":
+            self.regenerate_status_label.setText("Reset Description prompt to current main-window prompt.")
+        elif kind == "tagging":
+            self.regenerate_status_label.setText("Reset Tags prompt to current main-window prompt.")
+
+    def _regenerate_prompt_text(self, kind: str) -> str:
+        editor = self._regenerate_prompt_editors.get(kind)
+        if editor is not None:
+            return editor.toPlainText().strip()
+        return active_prompt_for_kind(kind)
+
+    def regenerate_description_prompt_text(self) -> str:
+        return self._regenerate_prompt_text("description")
+
+    def regenerate_tagging_prompt_text(self) -> str:
+        return self._regenerate_prompt_text("tagging")
 
     def _regenerate_proposed_annotations(self) -> None:
         if self._regenerate_thread is not None:
@@ -2470,7 +2626,8 @@ class FixupDialog(QDialog):
         if not self.regenerate_tags_checkbox.isChecked() and not self.regenerate_description_checkbox.isChecked():
             QMessageBox.information(self, "Nothing selected", "Enable Tags or Description before regenerating.")
             return
-        if self._provider_session is None:
+        active_session = self._active_regenerate_session(show_errors=True)
+        if active_session is None:
             return
 
         try:
@@ -2486,8 +2643,8 @@ class FixupDialog(QDialog):
         cancel_token = LlmRequestCancellation()
         self._regenerate_cancel = cancel_token
         self._discard_regenerate_result = False
-        description_query = prepare_description_query() if self.regenerate_description_checkbox.isChecked() else None
-        tags_query = prepare_tagging_query() if self.regenerate_tags_checkbox.isChecked() else None
+        description_prompt = self._regenerate_prompt_text("description") if self.regenerate_description_checkbox.isChecked() else None
+        tags_prompt = self._regenerate_prompt_text("tagging") if self.regenerate_tags_checkbox.isChecked() else None
 
         def task(report_progress: Callable[[str], None]) -> object:
             timeout = self._regenerate_timeout_seconds()
@@ -2515,23 +2672,25 @@ class FixupDialog(QDialog):
                 try:
                     description = ""
                     tags: list[str] = []
-                    if description_query is not None:
+                    if description_prompt is not None:
                         description = self._normalize_annotation(
-                            self._provider_session.generate(
+                            active_session.generate(
                                 self._image_path,
-                                description_query.prompt,
+                                description_prompt,
                                 timeout=remaining_timeout(),
                                 cancellation=cancel_token,
+                                thread_count=1,
                             ).strip()
                         )
-                    if tags_query is not None:
+                    if tags_prompt is not None:
                         tags = self._dedupe_preserve_order(
                             self._parse_regenerated_tags(
-                                self._provider_session.generate(
+                                active_session.generate(
                                     self._image_path,
-                                    tags_query.prompt,
+                                    tags_prompt,
                                     timeout=remaining_timeout(),
                                     cancellation=cancel_token,
+                                    thread_count=1,
                                 )
                             )
                         )
@@ -2692,7 +2851,9 @@ class FixupDialog(QDialog):
 
         scroll.setWidget(image_label)
         pane_layout.addWidget(scroll, stretch=1)
-        pane_layout.addWidget(self._create_regenerate_frame(), stretch=0)
+        pane_layout.addWidget(self._create_regenerate_tabs(), stretch=0)
+        pane_layout.addWidget(self.regenerate_button, stretch=0)
+        pane_layout.addWidget(self.regenerate_status_label, stretch=0)
         return pane
 
     def _create_pane_header_label(self, text: str) -> QLabel:
@@ -2807,6 +2968,62 @@ class FixupDialog(QDialog):
             editors = []
         self._detected_external_editors = editors
         return list(editors)
+
+    def _fetch_provider_models(self) -> None:
+        """Fetch available models from the configured server endpoint."""
+        if self._llm_provider is None:
+            QMessageBox.warning(self, "No provider", "No LLM provider is configured.")
+            return
+
+        server = self.llm_endpoint_input.text().strip()
+        if not server:
+            QMessageBox.warning(self, "Server required", "Enter a server endpoint before fetching models.")
+            return
+
+        self.llm_fetch_button.setEnabled(False)
+        try:
+            model_names = self._llm_provider.fetch_models(server, timeout=10.0)
+            normalized_server = self._llm_provider.normalize_endpoint(server)
+        except LlmProviderError as exc:
+            QMessageBox.warning(self, f"{self._llm_provider.display_name} connection failed", str(exc))
+            return
+        finally:
+            self.llm_fetch_button.setEnabled(True)
+
+        self.llm_endpoint_input.setText(normalized_server)
+        self.llm_model_combo.clear()
+        self.llm_model_combo.addItems(model_names)
+        if model_names:
+            self.llm_model_combo.setCurrentIndex(0)
+        if model_names:
+            self.regenerate_status_label.setText(f"Fetched {len(model_names)} model(s)")
+        else:
+            self.regenerate_status_label.setText(f"No models found at {normalized_server}")
+            QMessageBox.information(self, "No models found", f"The {self._llm_provider.display_name} server returned no models.")
+        self._update_regenerate_controls()
+
+    def _use_selected_provider_model(self) -> None:
+        """Use the selected model for regenerate operations in this dialog."""
+        if self._llm_provider is None:
+            QMessageBox.warning(self, "No provider", "No LLM provider is configured.")
+            return
+
+        model_name = self.llm_model_combo.currentText().strip()
+        if not model_name:
+            QMessageBox.warning(self, "No model selected", "Fetch models and choose one before using it.")
+            return
+
+        try:
+            normalized_server = self._llm_provider.normalize_endpoint(self.llm_endpoint_input.text())
+        except LlmProviderError as exc:
+            QMessageBox.warning(self, "Invalid server", str(exc))
+            return
+
+        self._llm_endpoint = normalized_server
+        self._llm_model_name = model_name
+        self.llm_endpoint_input.setText(normalized_server)
+        self.regenerate_status_label.setText(f"Model selected: {self._llm_model_name}")
+        self._update_regenerate_controls()
 
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)

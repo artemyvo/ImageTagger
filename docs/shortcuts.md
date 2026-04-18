@@ -29,7 +29,7 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Action | Win/Linux | macOS | Where |
 |---|---|---|---|
 | Remove selected existing tags | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) | Left/current list |
-| Merge and next | Alt+Enter (also Alt+Return) | Option+Enter (also Option+Return) | Dialog action + Merge and Next button |
+| Merge and next | Alt+Enter (also Alt+Return) | Option+Enter (also Option+Return) | Dialog action + Merge and Next button (suppressed when edit boxes have focus or a comparison-table cell editor is active, except when quick-add tag input is focused and empty) |
 | Focus quick-add tag input | Alt+T | Option+T | Dialog action |
 | Undo merge/local changes | Ctrl+Z | Command+Z | Dialog action + Undo button |
 | Previous actionable row | Alt+Up | Option+Up | Dialog action |
@@ -46,7 +46,7 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Move row selection | Up/Down arrows | Up/Down arrows |
 | Jump to first comparison row | Home | Home, Fn+Left, or Command+Up |
 | Jump to last comparison row | End | End, Fn+Right, or Command+Down |
-| Apply proposed value for selected row | Left arrow | Left arrow |
+| Apply proposed value for selected row | Left arrow (default dialog intent; suppressed while actively editing text) | Left arrow (default dialog intent; suppressed while actively editing text) |
 | Trigger current row action | Enter/Return | Enter/Return |
 | Delete selected current rows | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) |
 

@@ -83,6 +83,7 @@ from imagetagger.llm_queries import (
     set_prompt_override,
 )
 from imagetagger.shortcuts import platform_key_sequence
+from imagetagger.server_settings_frame import create_server_settings_frame
 from imagetagger.theme_colors import danger_accent_color, danger_text_on_accent_color
 
 
@@ -965,36 +966,26 @@ class MainWindow(QMainWindow):
         self.llm_threads_input.setMaximumWidth(50)
         self.llm_threads_input.setToolTip("0 = auto")
 
-        server_row = QHBoxLayout()
-        server_row.addWidget(self.llm_endpoint_input, stretch=1)
-        server_row.addWidget(self.llm_fetch_button)
-
-        model_row = QHBoxLayout()
-        model_row.addWidget(self.llm_model_combo, stretch=1)
-        model_row.addWidget(self.llm_use_button)
-
-        generate_options_row = QHBoxLayout()
         self.generate_tags_checkbox = QCheckBox("Tags", self)
         self.generate_tags_checkbox.setChecked(True)
         self.generate_tags_checkbox.checkStateChanged.connect(lambda _state: self._update_llm_controls())
         self.generate_description_checkbox = QCheckBox("Description", self)
         self.generate_description_checkbox.setChecked(True)
         self.generate_description_checkbox.checkStateChanged.connect(lambda _state: self._update_llm_controls())
-        generate_options_row.addWidget(self.generate_tags_checkbox)
-        generate_options_row.addWidget(self.generate_description_checkbox)
-        generate_options_row.addSpacing(12)
-        generate_options_row.addWidget(QLabel("Timeout", self))
-        generate_options_row.addWidget(self.llm_timeout_input)
-        generate_options_row.addSpacing(8)
-        generate_options_row.addWidget(QLabel("Retries", self))
-        generate_options_row.addWidget(self.llm_retry_input)
-        generate_options_row.addSpacing(8)
-        generate_options_row.addWidget(QLabel("Downscale", self))
-        generate_options_row.addWidget(self.llm_max_resolution_input)
-        generate_options_row.addSpacing(8)
-        generate_options_row.addWidget(QLabel("Threads", self))
-        generate_options_row.addWidget(self.llm_threads_input)
-        generate_options_row.addStretch(1)
+
+        server_settings_frame = create_server_settings_frame(
+            parent=self,
+            endpoint_input=self.llm_endpoint_input,
+            fetch_button=self.llm_fetch_button,
+            model_combo=self.llm_model_combo,
+            use_button=self.llm_use_button,
+            include_tags_checkbox=self.generate_tags_checkbox,
+            include_description_checkbox=self.generate_description_checkbox,
+            timeout_input=self.llm_timeout_input,
+            retry_input=self.llm_retry_input,
+            max_resolution_input=self.llm_max_resolution_input,
+            threads_input=self.llm_threads_input,
+        )
 
         gen_row = QHBoxLayout()
         self.generate_button = QPushButton("Generate", self)
@@ -1018,9 +1009,7 @@ class MainWindow(QMainWindow):
         ai_find_row.addWidget(self.ai_find_input, stretch=1)
         ai_find_row.addWidget(self.ai_find_button)
 
-        autotag_layout.addLayout(server_row)
-        autotag_layout.addLayout(model_row)
-        autotag_layout.addLayout(generate_options_row)
+        autotag_layout.addWidget(server_settings_frame)
         autotag_layout.addLayout(gen_row)
         autotag_layout.addLayout(buttons_row)
         autotag_layout.addLayout(ai_find_row)
@@ -2162,6 +2151,8 @@ class MainWindow(QMainWindow):
 
         regenerate_tags_enabled = self.generate_tags_checkbox.isChecked()
         regenerate_description_enabled = self.generate_description_checkbox.isChecked()
+        regenerate_description_prompt = active_prompt_for_kind("description")
+        regenerate_tagging_prompt = active_prompt_for_kind("tagging")
         timeout_text = self.llm_timeout_input.text().strip()
         retry_text = self.llm_retry_input.text().strip()
         try:
@@ -2173,9 +2164,11 @@ class MainWindow(QMainWindow):
         except ValueError:
             regenerate_retry_count = 0
 
-        def _capture_regenerate_settings(values: dict[str, int | float | bool]) -> None:
+        def _capture_regenerate_settings(values: dict[str, int | float | bool | str]) -> None:
             nonlocal regenerate_tags_enabled
             nonlocal regenerate_description_enabled
+            nonlocal regenerate_description_prompt
+            nonlocal regenerate_tagging_prompt
             nonlocal regenerate_timeout_seconds
             nonlocal regenerate_retry_count
             nonlocal regenerate_max_resolution_mpx
@@ -2185,6 +2178,8 @@ class MainWindow(QMainWindow):
             timeout_seconds = values.get("timeout_seconds")
             retry_count = values.get("retry_count")
             max_resolution_mpx = values.get("max_resolution_mpx")
+            description_prompt = values.get("description_prompt")
+            tagging_prompt = values.get("tagging_prompt")
 
             if isinstance(tags_enabled, bool):
                 regenerate_tags_enabled = tags_enabled
@@ -2198,6 +2193,10 @@ class MainWindow(QMainWindow):
                 regenerate_max_resolution_mpx = float(max_resolution_mpx)
                 self.llm_max_resolution_input.setText(self._format_mpx(regenerate_max_resolution_mpx))
                 configure_image_preparation(max_image_pixels=max(1, int(regenerate_max_resolution_mpx * 1_000_000)))
+            if isinstance(description_prompt, str):
+                regenerate_description_prompt = description_prompt
+            if isinstance(tagging_prompt, str):
+                regenerate_tagging_prompt = tagging_prompt
 
         while True:
             record = self._current_record()
@@ -2243,8 +2242,11 @@ class MainWindow(QMainWindow):
                 can_navigate_next=next_fixup_index is not None,
                 tag_suggestions=self._sorted_tag_suggestions(),
                 provider_session=self._active_provider_session(),
+                provider=self._llm_provider,
                 regenerate_tags_enabled=regenerate_tags_enabled,
                 regenerate_description_enabled=regenerate_description_enabled,
+                regenerate_description_prompt=regenerate_description_prompt,
+                regenerate_tagging_prompt=regenerate_tagging_prompt,
                 regenerate_timeout_seconds=regenerate_timeout_seconds,
                 regenerate_retry_count=regenerate_retry_count,
                 regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,

@@ -156,6 +156,7 @@ def generate_with_image(
     prompt: str,
     timeout: float = DEFAULT_TIMEOUT,
     cancellation: LlmRequestCancellation | None = None,
+    thread_count: int | None = None,
 ) -> str:
     payload: dict[str, object] = {
         "model": connection.model_name,
@@ -163,6 +164,9 @@ def generate_with_image(
         "images": [_encode_image(image_path)],
         "stream": False,
     }
+
+    if thread_count is not None:
+        payload["options"] = {"num_thread": max(1, int(thread_count))}
 
     payload = _request_json(
         connection.server_url,

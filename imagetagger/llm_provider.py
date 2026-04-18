@@ -72,6 +72,7 @@ class VisionLlmSession(Protocol):
         *,
         timeout: float,
         cancellation: LlmRequestCancellation | None = None,
+        thread_count: int | None = None,
     ) -> str: ...
 
 
@@ -98,6 +99,7 @@ class _OllamaSession:
         *,
         timeout: float,
         cancellation: LlmRequestCancellation | None = None,
+        thread_count: int | None = None,
     ) -> str:
         from imagetagger.ollama import OllamaConnection, generate_with_image
 
@@ -107,6 +109,7 @@ class _OllamaSession:
             prompt,
             timeout=timeout,
             cancellation=cancellation,
+            thread_count=thread_count,
         )
 
 
@@ -167,6 +170,7 @@ class _OpenAiCompatSession:
         *,
         timeout: float,
         cancellation: LlmRequestCancellation | None = None,
+        thread_count: int | None = None,
     ) -> str:
         from imagetagger.openai_compat import OpenAiCompatConnection, generate_with_image
 
