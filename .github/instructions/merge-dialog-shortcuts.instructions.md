@@ -39,7 +39,7 @@ These rules define intended behavior for merge dialog keyboard interaction. Keep
 ## Left Arrow Priority and Exceptions
 
 - Left arrow defaults to row-apply intent in the merge dialog (apply proposed value on the selected row).
-- Do not steal Left arrow only while the user is actively editing text. If the user has resumed dialog-level review/navigation (for example after returning focus via non-control click), Left should continue to perform row-apply.
+- Do not steal Left arrow while a dialog text input has focus (for example quick-add QLineEdit or QTextEdit-based editors).
 - Do not steal Left arrow while editing a tag/value cell inside the comparison table; in-cell editing keeps normal cursor movement behavior.
 - Do not override Left arrow behavior for focused controls that have their own Left-arrow semantics (for example slider/spinbox/other navigable controls).
 - Only trigger row-apply when no focused control has a more specific Left-arrow meaning.

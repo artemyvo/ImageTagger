@@ -4,6 +4,8 @@ Navigation: [Project README](../README.md) | [Docs Index](README.md) | [Usage Gu
 
 This page explains ImageTagger Ollama settings with a focus on auto thread mode.
 
+For fixup regeneration troubleshooting, the merge dialog also provides local server/model controls and local Description/Tags prompt overrides. These are useful when the current model struggles to regenerate quality tags or descriptions with default settings.
+
 ## Scope
 
 These settings affect Generate, Validate, and AI Find when `llm_threads` is set to `0` (auto mode).

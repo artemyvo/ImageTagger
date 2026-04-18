@@ -46,7 +46,7 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Move row selection | Up/Down arrows | Up/Down arrows |
 | Jump to first comparison row | Home | Home, Fn+Left, or Command+Up |
 | Jump to last comparison row | End | End, Fn+Right, or Command+Down |
-| Apply proposed value for selected row | Left arrow (default dialog intent; suppressed while actively editing text) | Left arrow (default dialog intent; suppressed while actively editing text) |
+| Apply proposed value for selected row | Left arrow (default dialog intent; suppressed while a dialog text input has focus) | Left arrow (default dialog intent; suppressed while a dialog text input has focus) |
 | Trigger current row action | Enter/Return | Enter/Return |
 | Delete selected current rows | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) |
 

@@ -588,7 +588,6 @@ class FixupDialog(QDialog):
         self._regenerate_started_at: float | None = None
         self._discard_regenerate_result = False
         self._global_key_filter_installed = False
-        self._text_edit_active_until = 0.0
         self._search_matches = fixup_data.search_matches or []
         self._detected_external_editors: list[ExternalEditor] | None = None
         self._watched_image_path: Path | None = None
@@ -667,7 +666,6 @@ class FixupDialog(QDialog):
         self.left_tag_input.setToolTip(
             f"Type a tag and press Enter. {self._focus_tag_input_shortcut_hint} clears and focuses this field."
         )
-        self.left_tag_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
         self.left_tag_input.returnPressed.connect(self._add_left_tag_from_input)
 
         self._tag_suggestions_model = QStringListModel(tag_suggestions or [], self)
@@ -736,13 +734,11 @@ class FixupDialog(QDialog):
         self.regenerate_timeout_input.setValidator(QIntValidator(1, 86400, self))
         self.regenerate_timeout_input.setText(str(max(1, int(regenerate_timeout_seconds))))
         self.regenerate_timeout_input.setMaximumWidth(90)
-        self.regenerate_timeout_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
 
         self.regenerate_retry_input = QLineEdit(self)
         self.regenerate_retry_input.setValidator(QIntValidator(0, 10, self))
         self.regenerate_retry_input.setText(str(max(0, int(regenerate_retry_count))))
         self.regenerate_retry_input.setMaximumWidth(60)
-        self.regenerate_retry_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
 
         self.regenerate_max_resolution_input = QLineEdit(self)
         max_resolution_validator = QDoubleValidator(0.01, 1000.0, 3, self)
@@ -756,12 +752,10 @@ class FixupDialog(QDialog):
             max_resolution_value = 5.0
         self.regenerate_max_resolution_input.setText(self._format_mpx(max_resolution_value))
         self.regenerate_max_resolution_input.setMaximumWidth(80)
-        self.regenerate_max_resolution_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
 
         # Server controls for model selection during merge
         self.llm_endpoint_input = QLineEdit(self)
         self.llm_endpoint_input.setPlaceholderText("http://127.0.0.1:11434 (Ollama) or :8000 (OpenAI-compatible)")
-        self.llm_endpoint_input.textEdited.connect(lambda _text: self._mark_text_edit_activity())
         if self._llm_provider is not None:
             self.llm_endpoint_input.setText(self._llm_provider.default_endpoint)
 
@@ -2098,12 +2092,6 @@ class FixupDialog(QDialog):
 
         QTimer.singleShot(0, _run_refresh)
 
-    def _mark_text_edit_activity(self, *, seconds: float = 1.5) -> None:
-        self._text_edit_active_until = max(self._text_edit_active_until, time.monotonic() + max(0.1, seconds))
-
-    def _is_text_editing_active(self) -> bool:
-        return time.monotonic() < self._text_edit_active_until
-
     def _on_comparison_item_changed(self, item: QTableWidgetItem) -> None:
         if self._updating_comparison_table:
             return
@@ -2187,14 +2175,6 @@ class FixupDialog(QDialog):
             # Some macOS keyboards report arrow keys with KeypadModifier.
             return not bool(modifiers & ~Qt.KeyboardModifier.KeypadModifier)
 
-        if event.type() == QEvent.Type.KeyPress and isinstance(watched, (QLineEdit, QTextEdit)):
-            if self.isAncestorOf(watched):
-                self._mark_text_edit_activity()
-
-        if event.type() == QEvent.Type.MouseButtonPress and isinstance(watched, QWidget):
-            if self.isAncestorOf(watched) and not isinstance(watched, (QLineEdit, QTextEdit)):
-                self._text_edit_active_until = 0.0
-
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             modifiers = event.modifiers()
             allowed_modifiers = Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.KeypadModifier
@@ -2227,11 +2207,12 @@ class FixupDialog(QDialog):
             and event.key() == Qt.Key.Key_Left
             and _is_plain_arrow_modifiers(event.modifiers())
         ):
+            if comparison_table.state() == QAbstractItemView.State.EditingState:
+                return super().eventFilter(watched, event)
             focused = self.focusWidget()
             if (
                 isinstance(focused, (QLineEdit, QTextEdit))
                 and self.isAncestorOf(focused)
-                and self._is_text_editing_active()
             ):
                 return super().eventFilter(watched, event)
             if focused is not None and not self.isAncestorOf(focused):

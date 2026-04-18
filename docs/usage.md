@@ -79,6 +79,16 @@ Fixup opens the merge dialog for the current image when a fixup exists.
 - Regenerate can be run from inside the fixup dialog with its own controls.
   - Useful when existing tags and description are completely messed up; regenerate fresh candidates and compare side-by-side before merging.
 
+### Merge Dialog Regenerate Overrides
+
+Inside the merge dialog, regeneration has local controls that can override your main-window defaults for the current fixup pass:
+
+- Server URL input, Fetch models, model dropdown, and Use button let you switch regenerate calls to a different Ollama/OpenAI-compatible endpoint and model.
+- Description prompt and Tags prompt tabs let you locally edit prompt text used by regenerate.
+- These overrides are scoped to merge-dialog regenerate behavior and do not replace your main-window model selection.
+
+This is especially useful when a model struggles to regenerate good tags or description with its default settings. You can test a stronger model, a different endpoint, or stricter local prompt wording immediately, then compare results side-by-side before merging.
+
 ### Merge Dialog Interface
 
 The merge dialog presents a meld-like 2-way comparison:
