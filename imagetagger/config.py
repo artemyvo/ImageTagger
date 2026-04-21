@@ -7,6 +7,25 @@ from typing import Any
 # config.json lives in the project root (one level above this package directory)
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
+# Horizontal scroll row targeting modes for merge dialog actions.
+MERGE_TABLE_HSCROLL_TARGET_POINTER_ROW = 1
+MERGE_TABLE_HSCROLL_TARGET_SELECTED_ROW = 2
+MERGE_TABLE_HSCROLL_TARGET_POINTER_ON_SELECTED = 3
+MERGE_TABLE_HSCROLL_TARGET_ALLOWED_MODES = {
+    MERGE_TABLE_HSCROLL_TARGET_POINTER_ROW,
+    MERGE_TABLE_HSCROLL_TARGET_SELECTED_ROW,
+    MERGE_TABLE_HSCROLL_TARGET_POINTER_ON_SELECTED,
+}
+
+_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS: dict[str, Any] = {
+    "double_click_action_enabled": True,
+    "swipe_actions_enabled": False,
+    "horizontal_scroll_actions_enabled": False,
+    "horizontal_scroll_reverse_enabled": False,
+    "horizontal_scroll_stop_idle_seconds": 0.45,
+    "horizontal_scroll_row_target_mode": MERGE_TABLE_HSCROLL_TARGET_POINTER_ON_SELECTED,
+}
+
 _DEFAULTS: dict = {
     "last_open_directory": "",
     "main_window_geometry": {},
@@ -21,6 +40,7 @@ _DEFAULTS: dict = {
     "font_point_size": 0,
     "directory_loader_max_threads": 8,
     "last_selected_image": "",
+    "merge_table_mouse_actions": dict(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS),
 }
 
 
@@ -43,6 +63,56 @@ def _normalize_number(value: Any, default: float, minimum: float | None = None) 
     if minimum is not None and numeric_value < minimum:
         return default
     return numeric_value
+
+
+def _normalize_bool(value: Any, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _normalize_int_choice(value: Any, default: int, allowed: set[int]) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return value if value in allowed else default
+
+
+def _normalize_merge_table_mouse_actions(data: dict[str, Any]) -> dict[str, Any]:
+    raw = data.get("merge_table_mouse_actions")
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def _value(key: str, legacy_key: str) -> Any:
+        if key in raw:
+            return raw.get(key)
+        return data.get(legacy_key)
+
+    return {
+        "double_click_action_enabled": _normalize_bool(
+            _value("double_click_action_enabled", "merge_table_double_click_action_enabled"),
+            bool(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS["double_click_action_enabled"]),
+        ),
+        "swipe_actions_enabled": _normalize_bool(
+            _value("swipe_actions_enabled", "merge_table_swipe_actions_enabled"),
+            bool(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS["swipe_actions_enabled"]),
+        ),
+        "horizontal_scroll_actions_enabled": _normalize_bool(
+            _value("horizontal_scroll_actions_enabled", "merge_table_horizontal_scroll_actions_enabled"),
+            bool(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS["horizontal_scroll_actions_enabled"]),
+        ),
+        "horizontal_scroll_reverse_enabled": _normalize_bool(
+            _value("horizontal_scroll_reverse_enabled", "merge_table_horizontal_scroll_reverse_enabled"),
+            bool(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS["horizontal_scroll_reverse_enabled"]),
+        ),
+        "horizontal_scroll_stop_idle_seconds": _normalize_number(
+            _value("horizontal_scroll_stop_idle_seconds", "merge_table_horizontal_scroll_stop_idle_seconds"),
+            float(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS["horizontal_scroll_stop_idle_seconds"]),
+            minimum=0.0,
+        ),
+        "horizontal_scroll_row_target_mode": _normalize_int_choice(
+            _value("horizontal_scroll_row_target_mode", "merge_table_horizontal_scroll_row_target_mode"),
+            int(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS["horizontal_scroll_row_target_mode"]),
+            MERGE_TABLE_HSCROLL_TARGET_ALLOWED_MODES,
+        ),
+    }
 
 
 def _normalize_geometry(value: Any) -> dict[str, int]:
@@ -124,6 +194,7 @@ def _normalize_loaded_config(data: Any) -> dict:
         data.get("last_selected_image"),
         _DEFAULTS["last_selected_image"],
     )
+    normalized["merge_table_mouse_actions"] = _normalize_merge_table_mouse_actions(data)
     return normalized
 
 

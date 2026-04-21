@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,6 +17,7 @@ class PreparedVisionQuery:
 
 
 _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
+_USER_HINT_PLACEHOLDER = "{user_hint}"
 
 
 def _load_prompt(filename: str, default: str) -> str:
@@ -46,7 +48,10 @@ _DEFAULT_TAGS_PROMPT = (
     "casual style\n"
     "green foliage\n"
     "shallow depth\n"
-    "soft shadows"
+    "soft shadows\n\n"
+    "Optional user hint for this revalidation:\n"
+    f"{_USER_HINT_PLACEHOLDER}\n"
+    "If provided, treat the hint as a correction constraint for this output."
 )
 
 _DEFAULT_DESCRIPTION_PROMPT = (
@@ -59,7 +64,10 @@ _DEFAULT_DESCRIPTION_PROMPT = (
     "- Avoid comma-separated lists.\n"
     "- Do NOT include any introductory text, greetings, or meta-talk.\n\n"
     "Example (if subject is a cat):\n"
-    "Cat with orange tabby fur sits on a blue velvet sofa in a sunlit room. Cat gazes out a large window while twitching its tail in a playful manner. Soft dust motes dance in the light to create a peaceful atmosphere."
+    "Cat with orange tabby fur sits on a blue velvet sofa in a sunlit room. Cat gazes out a large window while twitching its tail in a playful manner. Soft dust motes dance in the light to create a peaceful atmosphere.\n\n"
+    "Optional user hint for this revalidation:\n"
+    f"{_USER_HINT_PLACEHOLDER}\n"
+    "If provided, treat the hint as a correction constraint for this output."
 )
 
 _DEFAULT_VALIDATION_PROMPT = (
@@ -177,6 +185,12 @@ def active_prompt_for_kind(kind: str) -> str:
     return _active_prompt(kind)
 
 
+def render_prompt_with_user_hint(prompt: str, user_hint: str | None = None) -> str:
+    normalized_hint = user_hint.strip() if isinstance(user_hint, str) else ""
+    replacement = normalized_hint if normalized_hint else "none"
+    return prompt.replace(_USER_HINT_PLACEHOLDER, replacement)
+
+
 def format_annotations_for_validation(annotations: str) -> str:
     lines = [part.strip() for part in annotations.replace("\n", ",").split(",") if part.strip()]
     return "\n".join(f"- {line}" for line in lines)
@@ -185,7 +199,7 @@ def format_annotations_for_validation(annotations: str) -> str:
 def prepare_tagging_query() -> PreparedVisionQuery:
     return PreparedVisionQuery(
         kind="tagging",
-        prompt=_active_prompt("tagging"),
+        prompt=render_prompt_with_user_hint(_active_prompt("tagging")),
         metadata={"task": "tags"},
     )
 
@@ -193,7 +207,7 @@ def prepare_tagging_query() -> PreparedVisionQuery:
 def prepare_description_query() -> PreparedVisionQuery:
     return PreparedVisionQuery(
         kind="description",
-        prompt=_active_prompt("description"),
+        prompt=render_prompt_with_user_hint(_active_prompt("description")),
         metadata={"task": "description"},
     )
 
@@ -219,10 +233,13 @@ def prepare_search_query(query: str) -> PreparedVisionQuery:
 
 
 def parse_yes_no_response(response: str, *, context: str = "AI Find") -> bool:
-    cleaned_response = response.strip()
-    upper = cleaned_response.upper()
-    if upper.startswith("YES"):
-        return True
-    if upper.startswith("NO"):
-        return False
-    raise LlmQueryError(f"Model returned ambiguous {context} response: {cleaned_response}")
+    from imagetagger.llm_provider import LlmProviderError
+
+    match = re.search(r"\b(YES|NO)\b", response, re.IGNORECASE)
+    if match:
+        val = match.group(1).upper()
+        if val == "YES":
+            return True
+        if val == "NO":
+            return False
+    raise LlmProviderError(f"Model returned ambiguous {context} response: {response.strip()}")

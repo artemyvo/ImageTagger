@@ -43,7 +43,7 @@ from PyQt6.QtWidgets import (
 )
 
 from imagetagger import config as _config
-from imagetagger.annotations import parse_tags_text, sanitize_annotation_text
+from imagetagger.annotations import normalize_description_text, parse_tags_text, sanitize_annotation_text
 from imagetagger.image_prep import configure_image_preparation, consume_image_preparation_warning
 from imagetagger.io_utils import atomic_write_text
 from imagetagger.llm_provider import (
@@ -2151,8 +2151,6 @@ class MainWindow(QMainWindow):
 
         regenerate_tags_enabled = self.generate_tags_checkbox.isChecked()
         regenerate_description_enabled = self.generate_description_checkbox.isChecked()
-        regenerate_description_prompt = active_prompt_for_kind("description")
-        regenerate_tagging_prompt = active_prompt_for_kind("tagging")
         timeout_text = self.llm_timeout_input.text().strip()
         retry_text = self.llm_retry_input.text().strip()
         try:
@@ -2167,8 +2165,6 @@ class MainWindow(QMainWindow):
         def _capture_regenerate_settings(values: dict[str, int | float | bool | str]) -> None:
             nonlocal regenerate_tags_enabled
             nonlocal regenerate_description_enabled
-            nonlocal regenerate_description_prompt
-            nonlocal regenerate_tagging_prompt
             nonlocal regenerate_timeout_seconds
             nonlocal regenerate_retry_count
             nonlocal regenerate_max_resolution_mpx
@@ -2178,8 +2174,6 @@ class MainWindow(QMainWindow):
             timeout_seconds = values.get("timeout_seconds")
             retry_count = values.get("retry_count")
             max_resolution_mpx = values.get("max_resolution_mpx")
-            description_prompt = values.get("description_prompt")
-            tagging_prompt = values.get("tagging_prompt")
 
             if isinstance(tags_enabled, bool):
                 regenerate_tags_enabled = tags_enabled
@@ -2193,10 +2187,6 @@ class MainWindow(QMainWindow):
                 regenerate_max_resolution_mpx = float(max_resolution_mpx)
                 self.llm_max_resolution_input.setText(self._format_mpx(regenerate_max_resolution_mpx))
                 configure_image_preparation(max_image_pixels=max(1, int(regenerate_max_resolution_mpx * 1_000_000)))
-            if isinstance(description_prompt, str):
-                regenerate_description_prompt = description_prompt
-            if isinstance(tagging_prompt, str):
-                regenerate_tagging_prompt = tagging_prompt
 
         while True:
             record = self._current_record()
@@ -2221,6 +2211,9 @@ class MainWindow(QMainWindow):
 
             prev_fixup_index = self._find_adjacent_fixup_index(self.current_index, -1)
             next_fixup_index = self._find_adjacent_fixup_index(self.current_index, 1)
+            mouse_actions_cfg = self._cfg.get("merge_table_mouse_actions", {})
+            if not isinstance(mouse_actions_cfg, dict):
+                mouse_actions_cfg = {}
 
             outcome = open_fixup_dialog_for_image(
                 parent=self,
@@ -2245,11 +2238,30 @@ class MainWindow(QMainWindow):
                 provider=self._llm_provider,
                 regenerate_tags_enabled=regenerate_tags_enabled,
                 regenerate_description_enabled=regenerate_description_enabled,
-                regenerate_description_prompt=regenerate_description_prompt,
-                regenerate_tagging_prompt=regenerate_tagging_prompt,
                 regenerate_timeout_seconds=regenerate_timeout_seconds,
                 regenerate_retry_count=regenerate_retry_count,
                 regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
+                merge_table_double_click_action_enabled=bool(
+                    mouse_actions_cfg.get("double_click_action_enabled", True)
+                ),
+                merge_table_swipe_actions_enabled=bool(
+                    mouse_actions_cfg.get("swipe_actions_enabled", False)
+                ),
+                merge_table_horizontal_scroll_actions_enabled=bool(
+                    mouse_actions_cfg.get("horizontal_scroll_actions_enabled", False)
+                ),
+                merge_table_horizontal_scroll_reverse_enabled=bool(
+                    mouse_actions_cfg.get("horizontal_scroll_reverse_enabled", False)
+                ),
+                merge_table_horizontal_scroll_stop_idle_seconds=float(
+                    mouse_actions_cfg.get("horizontal_scroll_stop_idle_seconds", 0.45)
+                ),
+                merge_table_horizontal_scroll_row_target_mode=int(
+                    mouse_actions_cfg.get(
+                        "horizontal_scroll_row_target_mode",
+                        _config.MERGE_TABLE_HSCROLL_TARGET_POINTER_ON_SELECTED,
+                    )
+                ),
                 save_regenerate_settings=_capture_regenerate_settings,
             )
 
@@ -3163,7 +3175,7 @@ class MainWindow(QMainWindow):
                     retry_needed = False
                     try:
                         if description_query is not None:
-                            description = self._sanitize_annotation_text(
+                            description = normalize_description_text(
                                 session.generate(
                                     record.image_path,
                                     description_query.prompt,
@@ -3343,6 +3355,17 @@ class MainWindow(QMainWindow):
                             timeout=remaining_timeout(),
                             cancellation=cancel_token,
                         )
+
+                        # Detect format hallucination and trigger retry
+                        if validation_result.strip().upper() != "OK":
+                            from imagetagger.merge_dialog import parse_fixup_data
+                            parsed_check = parse_fixup_data(
+                                validation_result,
+                                self._parse_tags,
+                                self._sanitize_annotation_text
+                            )
+                            if not parsed_check.has_headers:
+                                raise LlmProviderError("Model hallucinated output format (missing headers).")
                     except LlmProviderCancelled:
                         raise
                     except LlmProviderError as exc:

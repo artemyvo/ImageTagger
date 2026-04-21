@@ -112,6 +112,52 @@ Quick Actions:
 
 Use Merge/Reject buttons to apply your final decision and navigate to the next fixup image.
 
+### Merge Dialog Mouse Actions
+
+The merge comparison table also supports mouse and trackpad actions:
+
+- Double-click (left button): triggers the current row action (apply proposed value, delete current value, or add suggested tag depending on row/action state).
+- Right-click opens row context menu.
+- On macOS trackpads, a two-finger tap maps to right-click and opens the same row context menu.
+- Horizontal swipe/drag can trigger row actions when enabled.
+- Horizontal scroll (mouse horizontal wheel or trackpad horizontal two-finger scroll) can trigger row actions when enabled.
+
+Defaults:
+
+- Double-click action: enabled.
+- Swipe actions: disabled.
+- Horizontal scroll actions: disabled.
+- Horizontal scroll reverse: disabled.
+- Horizontal scroll stop-idle seconds: 0.45.
+- Horizontal scroll row-target mode: 3 (safest mode).
+
+Configuration is stored in config.json under `merge_table_mouse_actions`:
+
+```json
+"merge_table_mouse_actions": {
+  "double_click_action_enabled": true,
+  "swipe_actions_enabled": false,
+  "horizontal_scroll_actions_enabled": false,
+  "horizontal_scroll_reverse_enabled": false,
+  "horizontal_scroll_stop_idle_seconds": 0.45,
+  "horizontal_scroll_row_target_mode": 3
+}
+```
+
+Possible values:
+
+- `double_click_action_enabled`: `true` or `false`.
+- `swipe_actions_enabled`: `true` or `false`.
+- `horizontal_scroll_actions_enabled`: `true` or `false`.
+- `horizontal_scroll_reverse_enabled`: `true` or `false`.
+- `horizontal_scroll_stop_idle_seconds`: number `>= 0`.
+  - `0` disables stop-before-rearm gating, so long continuous scrolling can trigger repeated actions.
+  - `> 0` requires scrolling to stop/idle for that many seconds before another scroll action can trigger.
+- `horizontal_scroll_row_target_mode`: `1`, `2`, or `3`.
+  - `1`: action applies to row under mouse pointer.
+  - `2`: action applies to selected row regardless of pointer position.
+  - `3`: action applies only when pointer is over selected row (default).
+
 ## Filter Syntax
 
 Use the image list filter to narrow large datasets quickly.
@@ -192,6 +238,7 @@ config.json stores session and UI state, including:
 - query downscale value (llm_max_resolution_mpx)
 - thread setting
 - window geometry state
+- merge-dialog mouse action settings in `merge_table_mouse_actions`
 
 For a full list of Ollama and auto-mode keys, see [ollama_settings.md](ollama_settings.md).
 

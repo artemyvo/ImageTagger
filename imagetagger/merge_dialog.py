@@ -3,6 +3,7 @@ from __future__ import annotations
 from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 import os
+import re
 import sys
 import time
 from typing import Callable
@@ -14,6 +15,8 @@ from PyQt6.QtGui import QAction, QColor, QDoubleValidator, QIntValidator, QKeySe
 from PyQt6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QAbstractSlider,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QCompleter,
@@ -33,7 +36,6 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QStyle,
-    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -42,6 +44,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from imagetagger.annotations import normalize_description_text
 from imagetagger.image_prep import configure_image_preparation, consume_image_preparation_warning
 from imagetagger.llm_provider import (
     LlmProviderCancelled,
@@ -52,6 +55,7 @@ from imagetagger.llm_provider import (
 )
 from imagetagger.llm_queries import (
     active_prompt_for_kind,
+    render_prompt_with_user_hint,
 )
 from imagetagger.external_editors import (
     ExternalEditor,
@@ -154,6 +158,7 @@ class FixupData:
     corrected_description: str
     corrected_tags: list[str]
     search_matches: list[str] = field(default_factory=list)
+    has_headers: bool = False
 
 
 class RegenerateWorker(QObject):
@@ -441,41 +446,42 @@ def parse_fixup_data(
 ) -> FixupData:
     sections: dict[str, list[str]] = {"issues": [], "tags": [], "description": [], "ai_find": []}
     current_section = "issues"
+    has_headers = False
+
+    # Robust regex for headers like "ISSUES:", "### Tags :", "**Description**:", etc.
+    header_pattern = re.compile(r"^[#*_\s>\-]*(ISSUES|TAGS|DESCRIPTION|AI_FIND_MATCHES)\b\s*[:\s]*", re.IGNORECASE)
 
     for raw_line in content.splitlines():
         line = raw_line.strip()
-        upper_line = line.upper()
-        
-        # Check if line starts with section header (handle both "HEADER:" and "HEADER: content")
-        if upper_line.startswith("ISSUES:"):
-            current_section = "issues"
-            inline_content = line[7:].strip()  # Content after "ISSUES:"
-            if inline_content:
-                sections["issues"].append(inline_content)
+        if not line:
             continue
-        if upper_line.startswith("TAGS:"):
-            current_section = "tags"
-            inline_content = line[5:].strip()  # Content after "TAGS:"
+
+        match = header_pattern.match(line)
+        if match:
+            has_headers = True
+            header_keyword = match.group(1).upper()
+            if header_keyword == "ISSUES":
+                current_section = "issues"
+            elif header_keyword == "TAGS":
+                current_section = "tags"
+            elif header_keyword == "DESCRIPTION":
+                current_section = "description"
+            elif header_keyword == "AI_FIND_MATCHES":
+                current_section = "ai_find"
+
+            # Handle content on the same line after the header (after colon or match end)
+            sep_idx = line.find(":")
+            content_start = sep_idx + 1 if sep_idx != -1 else match.end()
+            inline_content = line[content_start:].strip()
             if inline_content:
-                sections["tags"].append(inline_content)
+                sections[current_section].append(inline_content)
             continue
-        if upper_line.startswith("DESCRIPTION:"):
-            current_section = "description"
-            inline_content = line[12:].strip()  # Content after "DESCRIPTION:"
-            if inline_content:
-                sections["description"].append(inline_content)
-            continue
-        if upper_line.startswith("AI_FIND_MATCHES:"):
-            current_section = "ai_find"
-            inline_content = line[16:].strip()  # Content after "AI_FIND_MATCHES:"
-            if inline_content:
-                sections["ai_find"].append(inline_content)
-            continue
+
         sections[current_section].append(raw_line.rstrip())
 
     issues = "\n".join(line for line in sections["issues"] if line.strip()).strip()
     corrected_description_raw = "\n".join(line for line in sections["description"] if line.strip()).strip()
-    corrected_description = sanitize_annotation(corrected_description_raw)
+    corrected_description = normalize_description_text(corrected_description_raw)
     tags_text = "\n".join(line.strip() for line in sections["tags"] if line.strip())
     corrected_tags = [
         cleaned
@@ -502,6 +508,7 @@ def parse_fixup_data(
         corrected_description=corrected_description,
         corrected_tags=corrected_tags,
         search_matches=search_matches,
+        has_headers=has_headers,
     )
 
 
@@ -514,6 +521,15 @@ class FixupDialog(QDialog):
     _ROW_WIDGET_UNSELECTED_STYLE = "background-color: transparent;"
     _TEXT_WIDGET_SELECTED_STYLE = "background-color: palette(highlight); color: palette(highlighted-text);"
     _TEXT_WIDGET_UNSELECTED_STYLE = "background-color: transparent; color: palette(text);"
+    _SWIPE_MIN_DISTANCE_PX = 90
+    _SWIPE_MAX_VERTICAL_DRIFT_PX = 48
+    _SWIPE_HORIZONTAL_BIAS = 1.2
+    _HSCROLL_TRACKPAD_THRESHOLD_PX = 84.0
+    _HSCROLL_MOUSE_NOTCH_EQUIVALENT_PX = 96.0
+    _HSCROLL_DEFAULT_STOP_IDLE_SECONDS = 0.45
+    _HSCROLL_TARGET_POINTER_ROW = 1
+    _HSCROLL_TARGET_SELECTED_ROW = 2
+    _HSCROLL_TARGET_POINTER_ON_SELECTED = 3
 
     def __init__(
         self,
@@ -533,15 +549,20 @@ class FixupDialog(QDialog):
         provider: VisionLlmProvider | None = None,
         regenerate_tags_enabled: bool = True,
         regenerate_description_enabled: bool = True,
-        regenerate_description_prompt: str | None = None,
-        regenerate_tagging_prompt: str | None = None,
         regenerate_timeout_seconds: int = 300,
         regenerate_retry_count: int = 3,
         regenerate_max_resolution_mpx: float = 5.0,
+        merge_table_double_click_action_enabled: bool = True,
+        merge_table_swipe_actions_enabled: bool = False,
+        merge_table_horizontal_scroll_actions_enabled: bool = False,
+        merge_table_horizontal_scroll_reverse_enabled: bool = False,
+        merge_table_horizontal_scroll_stop_idle_seconds: float = 0.45,
+        merge_table_horizontal_scroll_row_target_mode: int = 3,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(title_text or "Fixup")
+        self._window_title_base = title_text or "Fixup"
+        self.setWindowTitle(self._window_title_base)
         self.resize(1280, 640)
         self._apply_annotations = apply_annotations
         self._normalize_annotation = normalize_annotation or (lambda text: text)
@@ -564,6 +585,29 @@ class FixupDialog(QDialog):
         self._updating_comparison_table = False
         self._pending_edit_refresh = False
         self._last_action_table_row: int | None = None
+        self._merge_table_double_click_action_enabled = bool(merge_table_double_click_action_enabled)
+        self._merge_table_swipe_actions_enabled = bool(merge_table_swipe_actions_enabled)
+        self._merge_table_horizontal_scroll_actions_enabled = bool(merge_table_horizontal_scroll_actions_enabled)
+        self._merge_table_horizontal_scroll_reverse_enabled = bool(merge_table_horizontal_scroll_reverse_enabled)
+        self._merge_table_horizontal_scroll_stop_idle_seconds = max(
+            0.0,
+            float(merge_table_horizontal_scroll_stop_idle_seconds),
+        )
+        if merge_table_horizontal_scroll_row_target_mode in (
+            self._HSCROLL_TARGET_POINTER_ROW,
+            self._HSCROLL_TARGET_SELECTED_ROW,
+            self._HSCROLL_TARGET_POINTER_ON_SELECTED,
+        ):
+            self._merge_table_horizontal_scroll_row_target_mode = int(merge_table_horizontal_scroll_row_target_mode)
+        else:
+            self._merge_table_horizontal_scroll_row_target_mode = self._HSCROLL_TARGET_POINTER_ON_SELECTED
+        self._comparison_swipe_drag_active = False
+        self._comparison_swipe_start_pos: tuple[float, float] | None = None
+        self._comparison_swipe_row = -1
+        self._comparison_hscroll_accumulator_x = 0.0
+        self._comparison_hscroll_row = -1
+        self._comparison_hscroll_wait_for_stop = False
+        self._comparison_hscroll_rearm_after = 0.0
         self._image_path = Path(image_path) if isinstance(image_path, str) else image_path
         self._image_label: ScalableImageLabel | None = None
         self._image_header_label: QLabel | None = None
@@ -571,17 +615,6 @@ class FixupDialog(QDialog):
         self._llm_provider = provider
         self._llm_endpoint = ""
         self._llm_model_name = ""
-        self._regenerate_prompt_editors: dict[str, QTextEdit] = {}
-        self._initial_regenerate_description_prompt = (
-            regenerate_description_prompt.strip()
-            if isinstance(regenerate_description_prompt, str)
-            else active_prompt_for_kind("description")
-        )
-        self._initial_regenerate_tagging_prompt = (
-            regenerate_tagging_prompt.strip()
-            if isinstance(regenerate_tagging_prompt, str)
-            else active_prompt_for_kind("tagging")
-        )
         self._regenerate_thread: QThread | None = None
         self._regenerate_worker: RegenerateWorker | None = None
         self._regenerate_cancel: LlmRequestCancellation | None = None
@@ -705,9 +738,12 @@ class FixupDialog(QDialog):
             "jump actionable rows, Left applies proposed rows, "
             f"Enter triggers current row action, {self._delete_rows_shortcut_hint} removes selected current rows."
         )
+        self.comparison_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.comparison_table.customContextMenuRequested.connect(self._show_comparison_table_context_menu)
         self.comparison_table.itemChanged.connect(self._on_comparison_item_changed)
         self.comparison_table.itemSelectionChanged.connect(self._on_comparison_selection_changed)
         self.comparison_table.installEventFilter(self)
+        self.comparison_table.viewport().installEventFilter(self)
         header = self.comparison_table.horizontalHeader()
         header.setVisible(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -768,11 +804,26 @@ class FixupDialog(QDialog):
         self.llm_use_button = QPushButton("Use", self)
         self.llm_use_button.clicked.connect(self._use_selected_provider_model)
 
+        self.regenerate_user_hint_input = QTextEdit(self)
+        self.regenerate_user_hint_input.setAcceptRichText(False)
+        self.regenerate_user_hint_input.setPlaceholderText(
+            "User hint (optional). Example: The cat is not a Maine Coon."
+        )
+        self.regenerate_user_hint_input.setToolTip(
+            "Optional guidance used only for this regenerate run."
+        )
+        user_hint_height = (self.regenerate_user_hint_input.fontMetrics().lineSpacing() * 2) + 14
+        self.regenerate_user_hint_input.setFixedHeight(user_hint_height)
+
+        self.regenerate_user_hint_clear_button = QPushButton("Clear", self)
+        self.regenerate_user_hint_clear_button.setToolTip("Clear the current user hint.")
+        self.regenerate_user_hint_clear_button.clicked.connect(self._clear_regenerate_user_hint)
+
         self.regenerate_button = QPushButton("Regenerate", self)
         regenerate_shortcut = platform_key_sequence("Alt+R", "Alt+R")
         self._regenerate_shortcut_hint = native_shortcut_text(regenerate_shortcut)
         self.regenerate_button.setToolTip(
-            f"Regenerate proposed annotations ({self._regenerate_shortcut_hint})"
+            f"Regenerate proposed annotations with the selected model ({self._regenerate_shortcut_hint})"
         )
         self.regenerate_button.clicked.connect(self._regenerate_proposed_annotations)
 
@@ -1428,26 +1479,216 @@ class FixupDialog(QDialog):
         # clamped to the last row if start_row is now past the end.
         self._select_comparison_row(min(start_row, row_count - 1), Qt.FocusReason.ShortcutFocusReason)
 
-    def _trigger_action_for_current_row(self) -> bool:
-        row = self.comparison_table.currentRow()
-        if row < 0:
+    def _swipe_min_distance_px(self) -> int:
+        return max(self._SWIPE_MIN_DISTANCE_PX, QApplication.startDragDistance() * 6)
+
+    def _reset_comparison_swipe_tracking(self) -> None:
+        self._comparison_swipe_drag_active = False
+        self._comparison_swipe_start_pos = None
+        self._comparison_swipe_row = -1
+
+    def _reset_comparison_hscroll_tracking(self) -> None:
+        self._comparison_hscroll_accumulator_x = 0.0
+        self._comparison_hscroll_row = -1
+
+    def _reset_comparison_hscroll_blocking(self) -> None:
+        self._comparison_hscroll_wait_for_stop = False
+        self._comparison_hscroll_rearm_after = 0.0
+
+    def _horizontal_scroll_delta_from_wheel(self, event) -> float:
+        pixel_delta = event.pixelDelta()  # type: ignore[attr-defined]
+        if not pixel_delta.isNull():
+            return float(pixel_delta.x())
+
+        angle_delta = event.angleDelta()  # type: ignore[attr-defined]
+        if angle_delta.x() == 0:
+            return 0.0
+
+        # Typical wheel notches report angleDelta.x() of +/-120.
+        # Convert notches to a px-like scale so threshold logic can be shared.
+        return (float(angle_delta.x()) / 120.0) * self._HSCROLL_MOUSE_NOTCH_EQUIVALENT_PX
+
+    @staticmethod
+    def _wheel_is_mostly_horizontal(event) -> bool:
+        pixel_delta = event.pixelDelta()  # type: ignore[attr-defined]
+        if not pixel_delta.isNull():
+            return abs(pixel_delta.x()) > abs(pixel_delta.y()) * 1.1
+
+        angle_delta = event.angleDelta()  # type: ignore[attr-defined]
+        if angle_delta.x() == 0:
             return False
+        return abs(angle_delta.x()) > abs(angle_delta.y()) * 1.1
+
+    def _handle_comparison_table_horizontal_scroll(self, row: int, delta_x: float) -> bool:
+        now = time.monotonic()
+        if self._comparison_hscroll_wait_for_stop:
+            stop_idle_seconds = self._merge_table_horizontal_scroll_stop_idle_seconds
+            if now < self._comparison_hscroll_rearm_after:
+                self._comparison_hscroll_rearm_after = now + stop_idle_seconds
+                return True
+            # Scrolling was idle long enough: arm the next gesture.
+            self._reset_comparison_hscroll_blocking()
+            self._reset_comparison_hscroll_tracking()
+
+        if row != self._comparison_hscroll_row:
+            self._comparison_hscroll_row = row
+            self._comparison_hscroll_accumulator_x = 0.0
+
+        self._comparison_hscroll_accumulator_x += delta_x
+        if abs(self._comparison_hscroll_accumulator_x) < self._HSCROLL_TRACKPAD_THRESHOLD_PX:
+            return True
+
+        self._select_comparison_row(row, Qt.FocusReason.MouseFocusReason)
+        handled_action = False
+        direction_is_right = self._comparison_hscroll_accumulator_x > 0
+        if self._merge_table_horizontal_scroll_reverse_enabled:
+            direction_is_right = not direction_is_right
+
+        if direction_is_right:
+            handled_action = self._remove_value_for_table_row(row)
+        else:
+            handled_action = self._apply_proposed_value_for_table_row(row)
+
+        self._comparison_hscroll_accumulator_x = 0.0
+        self._comparison_hscroll_row = -1
+        if handled_action:
+            if self._merge_table_horizontal_scroll_stop_idle_seconds > 0.0:
+                self._comparison_hscroll_wait_for_stop = True
+                self._comparison_hscroll_rearm_after = (
+                    now + self._merge_table_horizontal_scroll_stop_idle_seconds
+                )
+            return True
+        return False
+
+    def _horizontal_scroll_target_row(self, pointer_row: int) -> int | None:
+        mode = self._merge_table_horizontal_scroll_row_target_mode
+        selected_row = self.comparison_table.currentRow()
+
+        if mode == self._HSCROLL_TARGET_POINTER_ROW:
+            return pointer_row if pointer_row >= 0 else None
+
+        if mode == self._HSCROLL_TARGET_SELECTED_ROW:
+            return selected_row if selected_row >= 0 else None
+
+        # Default/safest mode: only act when pointer is over the selected row.
+        if selected_row >= 0 and pointer_row == selected_row:
+            return selected_row
+        return None
+
+    def _remove_value_for_table_row(self, row: int) -> bool:
+        if row < 0 or row >= len(self._table_row_map):
+            return False
+
+        left_index, _right_index = self._table_row_map[row]
+        if left_index is None:
+            return False
+
+        left_item = self.comparison_table.item(row, 0)
+        if left_item is None:
+            return False
+
+        left_text = left_item.text().strip()
+        if not left_text:
+            return False
+
+        before_count = self.left_list.count()
+        self._remove_left_item_from_table(row, left_text)
+        return self.left_list.count() < before_count
+
+    def _apply_proposed_value_for_table_row(self, row: int) -> bool:
+        if row < 0 or row >= len(self._table_row_map):
+            return False
+
+        _left_index, right_index = self._table_row_map[row]
+        if right_index is None:
+            return False
+
+        # Prefer the existing row action button path so swipe behavior
+        # stays in sync with button and Enter-triggered actions.
+        button = self._action_button_for_row(row)
+        if button is not None and button.text() in ("←", "🔍"):
+            return self._trigger_action_for_table_row(row)
+
+        self._remember_last_action_table_row(row)
+        self._apply_proposed_rows([right_index])
+        self._refresh_button_state()
+        self._update_difference_highlights()
+        self._advance_to_next_actionable_from(row + 1)
+        return True
+
+    def _handle_comparison_table_swipe(self, row: int, delta_x: float, delta_y: float) -> bool:
+        min_distance = float(self._swipe_min_distance_px())
+        max_vertical_drift = max(float(self._SWIPE_MAX_VERTICAL_DRIFT_PX), min_distance * 0.6)
+
+        if abs(delta_x) < min_distance:
+            return False
+        if abs(delta_y) > max_vertical_drift:
+            return False
+        if abs(delta_x) < abs(delta_y) * self._SWIPE_HORIZONTAL_BIAS:
+            return False
+
+        self._select_comparison_row(row, Qt.FocusReason.MouseFocusReason)
+        if delta_x > 0:
+            return self._remove_value_for_table_row(row)
+        return self._apply_proposed_value_for_table_row(row)
+
+    def _action_button_for_row(self, row: int) -> QPushButton | None:
+        if row < 0 or row >= self.comparison_table.rowCount():
+            return None
 
         action_host = self.comparison_table.cellWidget(row, 1)
         if action_host is None:
-            return False
+            return None
 
         for button in action_host.findChildren(QPushButton):
             if button.isEnabled():
-                # ✕ removes the row so rows below shift up by 1: scan from
-                # start_row in the rebuilt table (it now points to the old
-                # start_row+1).  ← / 🔍 keep the row so we skip past it.
-                removes_row = button.text() == "✕"
-                button.click()
-                advance_from = row if removes_row else row + 1
-                self._advance_to_next_actionable_from(advance_from)
-                return True
-        return False
+                return button
+        return None
+
+    @staticmethod
+    def _action_context_menu_label(symbol: str) -> str:
+        if symbol == "←":
+            return "Apply Proposed Value"
+        if symbol == "✕":
+            return "Delete Current Value"
+        if symbol == "🔍":
+            return "Add Suggested Tag"
+        return "Run Row Action"
+
+    def _trigger_action_for_table_row(self, row: int) -> bool:
+        button = self._action_button_for_row(row)
+        if button is None:
+            return False
+
+        # ✕ removes the row so rows below shift up by 1: scan from
+        # start_row in the rebuilt table (it now points to the old
+        # start_row+1).  ← / 🔍 keep the row so we skip past it.
+        removes_row = button.text() == "✕"
+        button.click()
+        advance_from = row if removes_row else row + 1
+        self._advance_to_next_actionable_from(advance_from)
+        return True
+
+    def _trigger_action_for_current_row(self) -> bool:
+        row = self.comparison_table.currentRow()
+        return self._trigger_action_for_table_row(row)
+
+    def _show_comparison_table_context_menu(self, position) -> None:
+        row = self.comparison_table.rowAt(position.y())
+        if row < 0:
+            return
+
+        self._select_comparison_row(row, Qt.FocusReason.MouseFocusReason)
+
+        button = self._action_button_for_row(row)
+        if button is None:
+            return
+
+        menu = QMenu(self)
+        label = self._action_context_menu_label(button.text())
+        row_action = menu.addAction(label)
+        row_action.triggered.connect(lambda _checked=False, table_row=row: self._trigger_action_for_table_row(table_row))
+        menu.exec(self.comparison_table.viewport().mapToGlobal(position))
 
     def _merge_proposed_row_from_table(self, table_row: int, right_index: int) -> None:
         self._remember_last_action_table_row(table_row)
@@ -1489,6 +1730,22 @@ class FixupDialog(QDialog):
         self.undo_button.setEnabled((self._undo_available or has_dialog_changes) and not regenerate_in_progress)
         self.merge_next_button.setEnabled(not regenerate_in_progress)
         self._set_comparison_action_buttons_enabled(not regenerate_in_progress)
+        self._update_window_title_unsaved_marker(has_local_changes)
+
+    def _update_window_title_unsaved_marker(self, has_unsaved_changes: bool) -> None:
+        if not has_unsaved_changes:
+            self.setWindowTitle(self._window_title_base)
+            return
+
+        # Keep the item-position suffix untouched: "... (x of y)".
+        match = re.search(r"\s\(\d+\s+of\s+\d+\)$", self._window_title_base)
+        if match is None:
+            self.setWindowTitle(f"{self._window_title_base} *")
+            return
+
+        title_prefix = self._window_title_base[:match.start()]
+        title_suffix = self._window_title_base[match.start():]
+        self.setWindowTitle(f"{title_prefix} *{title_suffix}")
 
     def _set_comparison_action_buttons_enabled(self, enabled: bool) -> None:
         for row in range(self.comparison_table.rowCount()):
@@ -2175,6 +2432,67 @@ class FixupDialog(QDialog):
             # Some macOS keyboards report arrow keys with KeypadModifier.
             return not bool(modifiers & ~Qt.KeyboardModifier.KeypadModifier)
 
+        if self._merge_table_swipe_actions_enabled and watched is comparison_table.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
+                row = comparison_table.rowAt(int(event.position().y()))  # type: ignore[attr-defined]
+                if row >= 0:
+                    position = event.position()  # type: ignore[attr-defined]
+                    self._comparison_swipe_drag_active = True
+                    self._comparison_swipe_start_pos = (float(position.x()), float(position.y()))
+                    self._comparison_swipe_row = row
+                else:
+                    self._reset_comparison_swipe_tracking()
+            elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
+                handled_swipe = False
+                if (
+                    self._comparison_swipe_drag_active
+                    and self._comparison_swipe_start_pos is not None
+                    and self._comparison_swipe_row >= 0
+                ):
+                    start_x, start_y = self._comparison_swipe_start_pos
+                    position = event.position()  # type: ignore[attr-defined]
+                    row = comparison_table.rowAt(int(position.y()))
+                    if row == self._comparison_swipe_row:
+                        delta_x = float(position.x()) - start_x
+                        delta_y = float(position.y()) - start_y
+                        handled_swipe = self._handle_comparison_table_swipe(row, delta_x, delta_y)
+                self._reset_comparison_swipe_tracking()
+                if handled_swipe:
+                    return True
+            elif event.type() == QEvent.Type.Leave:
+                self._reset_comparison_swipe_tracking()
+
+        if self._merge_table_horizontal_scroll_actions_enabled and watched is comparison_table.viewport():
+            if event.type() == QEvent.Type.Wheel:
+                if not self._wheel_is_mostly_horizontal(event):
+                    return super().eventFilter(watched, event)
+                pointer_row = comparison_table.rowAt(int(event.position().y()))  # type: ignore[attr-defined]
+                row = self._horizontal_scroll_target_row(pointer_row)
+                if row is None:
+                    self._reset_comparison_hscroll_tracking()
+                    self._reset_comparison_hscroll_blocking()
+                    return super().eventFilter(watched, event)
+                delta_x = self._horizontal_scroll_delta_from_wheel(event)
+                if delta_x == 0.0:
+                    return super().eventFilter(watched, event)
+                if self._handle_comparison_table_horizontal_scroll(row, delta_x):
+                    return True
+            elif event.type() == QEvent.Type.Leave:
+                self._reset_comparison_hscroll_tracking()
+                self._reset_comparison_hscroll_blocking()
+
+        if (
+            self._merge_table_double_click_action_enabled
+            and watched is comparison_table.viewport()
+            and event.type() == QEvent.Type.MouseButtonDblClick
+            and event.button() == Qt.MouseButton.LeftButton  # type: ignore[attr-defined]
+        ):
+            row = comparison_table.rowAt(int(event.position().y()))  # type: ignore[attr-defined]
+            if row >= 0:
+                comparison_table.setCurrentCell(row, max(comparison_table.currentColumn(), 0))
+                if self._trigger_action_for_current_row():
+                    return True
+
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             modifiers = event.modifiers()
             allowed_modifiers = Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.KeypadModifier
@@ -2208,15 +2526,20 @@ class FixupDialog(QDialog):
             and _is_plain_arrow_modifiers(event.modifiers())
         ):
             if comparison_table.state() == QAbstractItemView.State.EditingState:
-                return super().eventFilter(watched, event)
+                return False
             focused = self.focusWidget()
             if (
                 isinstance(focused, (QLineEdit, QTextEdit))
                 and self.isAncestorOf(focused)
             ):
-                return super().eventFilter(watched, event)
+                return False
+            if focused is not None and comparison_table.isAncestorOf(focused):
+                if isinstance(focused, (QLineEdit, QTextEdit, QAbstractSlider, QAbstractSpinBox, QComboBox)):
+                    return False
             if focused is not None and not self.isAncestorOf(focused):
-                return super().eventFilter(watched, event)
+                return False
+            if isinstance(focused, (QAbstractSlider, QAbstractSpinBox, QComboBox)):
+                return False
 
             selected_rows = sorted({index.row() for index in comparison_table.selectedIndexes()})
             right_indexes: list[int] = []
@@ -2436,6 +2759,8 @@ class FixupDialog(QDialog):
         self.llm_fetch_button.setEnabled(not working and self._llm_provider is not None)
         self.llm_model_combo.setEnabled(not working)
         self.llm_use_button.setEnabled(not working and self.llm_model_combo.count() > 0 and self._llm_provider is not None)
+        self.regenerate_user_hint_input.setEnabled(not working)
+        self.regenerate_user_hint_clear_button.setEnabled(not working)
 
         if working:
             self.regenerate_button.setEnabled(False)
@@ -2448,7 +2773,9 @@ class FixupDialog(QDialog):
         self.regenerate_button.setEnabled(regenerate_enabled)
         self.regenerate_alt_action.setEnabled(regenerate_enabled)
         if not connected:
-            self.regenerate_status_label.setText("Regenerate is disabled until a model is selected in this dialog or in the main window.")
+            self.regenerate_status_label.setText(
+                "Regenerate is disabled until a model is selected in this dialog or in the main window."
+            )
 
     def _active_regenerate_session(self, *, show_errors: bool) -> VisionLlmSession | None:
         if self._llm_provider is not None and self._llm_model_name.strip():
@@ -2541,63 +2868,29 @@ class FixupDialog(QDialog):
             max_resolution_input=self.regenerate_max_resolution_input,
         )
 
-    def _create_regenerate_prompt_tab(self, kind: str) -> QWidget:
-        tab = QWidget(self)
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(6, 6, 6, 6)
+    def _create_regenerate_panel(self) -> QWidget:
+        panel = QWidget(self)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
+        layout.addWidget(self._create_regenerate_frame(), stretch=0)
 
-        editor = QTextEdit(self)
-        editor.setAcceptRichText(False)
-        if kind == "description":
-            editor.setPlainText(self._initial_regenerate_description_prompt)
-        elif kind == "tagging":
-            editor.setPlainText(self._initial_regenerate_tagging_prompt)
-        else:
-            editor.setPlainText(active_prompt_for_kind(kind))
-        self._regenerate_prompt_editors[kind] = editor
+        user_hint_row = QHBoxLayout()
+        user_hint_row.setContentsMargins(0, 0, 0, 0)
+        user_hint_row.setSpacing(6)
+        user_hint_row.addWidget(self.regenerate_user_hint_input, stretch=1)
+        user_hint_row.addWidget(self.regenerate_user_hint_clear_button, stretch=0)
+        layout.addLayout(user_hint_row)
 
-        button_row = QHBoxLayout()
-        button_row.setContentsMargins(0, 0, 0, 0)
-        reset_button = QPushButton("Reset", self)
-        reset_button.clicked.connect(
-            lambda _checked=False, prompt_kind=kind: self._reset_regenerate_prompt_to_main(prompt_kind)
-        )
-        button_row.addWidget(reset_button)
-        button_row.addStretch(1)
+        return panel
 
-        layout.addWidget(editor, stretch=1)
-        layout.addLayout(button_row)
-        return tab
+    def _regenerate_user_hint_text(self) -> str:
+        return self.regenerate_user_hint_input.toPlainText().strip()
 
-    def _create_regenerate_tabs(self) -> QTabWidget:
-        tabs = QTabWidget(self)
-        tabs.addTab(self._create_regenerate_frame(), "Regeneration")
-        tabs.addTab(self._create_regenerate_prompt_tab("description"), "Description")
-        tabs.addTab(self._create_regenerate_prompt_tab("tagging"), "Tags")
-        return tabs
-
-    def _reset_regenerate_prompt_to_main(self, kind: str) -> None:
-        editor = self._regenerate_prompt_editors.get(kind)
-        if editor is None:
-            return
-        editor.setPlainText(active_prompt_for_kind(kind))
-        if kind == "description":
-            self.regenerate_status_label.setText("Reset Description prompt to current main-window prompt.")
-        elif kind == "tagging":
-            self.regenerate_status_label.setText("Reset Tags prompt to current main-window prompt.")
-
-    def _regenerate_prompt_text(self, kind: str) -> str:
-        editor = self._regenerate_prompt_editors.get(kind)
-        if editor is not None:
-            return editor.toPlainText().strip()
-        return active_prompt_for_kind(kind)
-
-    def regenerate_description_prompt_text(self) -> str:
-        return self._regenerate_prompt_text("description")
-
-    def regenerate_tagging_prompt_text(self) -> str:
-        return self._regenerate_prompt_text("tagging")
+    def _clear_regenerate_user_hint(self) -> None:
+        if self.regenerate_user_hint_input.toPlainText():
+            self.regenerate_user_hint_input.clear()
+            self.regenerate_status_label.setText("User hint cleared.")
 
     def _regenerate_proposed_annotations(self) -> None:
         if self._regenerate_thread is not None:
@@ -2624,22 +2917,40 @@ class FixupDialog(QDialog):
         cancel_token = LlmRequestCancellation()
         self._regenerate_cancel = cancel_token
         self._discard_regenerate_result = False
-        description_prompt = self._regenerate_prompt_text("description") if self.regenerate_description_checkbox.isChecked() else None
-        tags_prompt = self._regenerate_prompt_text("tagging") if self.regenerate_tags_checkbox.isChecked() else None
+        user_hint = self._regenerate_user_hint_text()
+        description_prompt = (
+            render_prompt_with_user_hint(active_prompt_for_kind("description"), user_hint)
+            if self.regenerate_description_checkbox.isChecked()
+            else None
+        )
+        tags_prompt = (
+            render_prompt_with_user_hint(active_prompt_for_kind("tagging"), user_hint)
+            if self.regenerate_tags_checkbox.isChecked()
+            else None
+        )
 
         def task(report_progress: Callable[[str], None]) -> object:
             timeout = self._regenerate_timeout_seconds()
             retry_count = self._regenerate_retry_count()
             image_name = self._image_path.name
             last_error: LlmProviderError | None = None
+            has_user_hint = bool(user_hint)
 
             for attempt in range(retry_count + 1):
                 cancel_token.raise_if_cancelled()
                 attempt_start = time.monotonic()
                 if attempt == 0:
-                    report_progress(f"Regenerating {image_name}...")
+                    if has_user_hint:
+                        report_progress(f"Regenerating {image_name} with user hint...")
+                    else:
+                        report_progress(f"Regenerating {image_name}...")
                 else:
-                    report_progress(f"Regenerating {image_name} (retry {attempt}/{retry_count})...")
+                    if has_user_hint:
+                        report_progress(
+                            f"Regenerating {image_name} with user hint (retry {attempt}/{retry_count})..."
+                        )
+                    else:
+                        report_progress(f"Regenerating {image_name} (retry {attempt}/{retry_count})...")
 
                 def remaining_timeout() -> float:
                     elapsed = time.monotonic() - attempt_start
@@ -2654,7 +2965,7 @@ class FixupDialog(QDialog):
                     description = ""
                     tags: list[str] = []
                     if description_prompt is not None:
-                        description = self._normalize_annotation(
+                        description = normalize_description_text(
                             active_session.generate(
                                 self._image_path,
                                 description_prompt,
@@ -2783,7 +3094,7 @@ class FixupDialog(QDialog):
             else:
                 self.regenerate_status_label.setText("Regenerated proposed annotations.")
         else:
-            self.regenerate_status_label.setText("Ollama returned no annotations.")
+            self.regenerate_status_label.setText("Model returned no annotations.")
 
     def _on_regenerate_failed(self, message: str) -> None:
         QMessageBox.warning(self, "Regenerate failed", message)
@@ -2832,7 +3143,7 @@ class FixupDialog(QDialog):
 
         scroll.setWidget(image_label)
         pane_layout.addWidget(scroll, stretch=1)
-        pane_layout.addWidget(self._create_regenerate_tabs(), stretch=0)
+        pane_layout.addWidget(self._create_regenerate_panel(), stretch=0)
         pane_layout.addWidget(self.regenerate_button, stretch=0)
         pane_layout.addWidget(self.regenerate_status_label, stretch=0)
         return pane

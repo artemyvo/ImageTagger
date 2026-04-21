@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Callable, Literal
 
 from PyQt6.QtWidgets import QDialog, QMessageBox, QStyle, QWidget
 
+from imagetagger.annotations import sanitize_annotation_text
 from imagetagger.io_utils import atomic_write_text
 from imagetagger.llm_provider import VisionLlmProvider, VisionLlmSession
 from imagetagger.merge_dialog import FixupDialog, parse_fixup_data
@@ -78,7 +80,7 @@ def _dedupe_fixup_tags_content(content: str) -> str:
             unique_tags: list[str] = []
             seen_keys: set[str] = set()
             for value in raw_tags:
-                normalized = _normalize_fixup_section_entry(value)
+                normalized = sanitize_annotation_text(_normalize_fixup_section_entry(value))
                 if not normalized:
                     continue
                 key = normalized.casefold()
@@ -139,9 +141,13 @@ def record_ai_find_match_for_image(
         except OSError as exc:
             raise OSError(f"Could not read fixup file: {exc}") from exc
 
+    # Header regex compatible with the improved parser
+    ai_find_header_re = re.compile(r"^[#*_\s>\-]*AI_FIND_MATCHES\b\s*[:\s]*", re.IGNORECASE)
+    any_header_re = re.compile(r"^[#*_\s>\-]*(ISSUES|TAGS|DESCRIPTION|AI_FIND_MATCHES)\b\s*[:\s]*", re.IGNORECASE)
+
     header_index: int | None = None
     for index, line in enumerate(lines):
-        if line.strip().upper() == _AI_FIND_SECTION_HEADER:
+        if ai_find_header_re.match(line):
             header_index = index
             break
 
@@ -152,7 +158,7 @@ def record_ai_find_match_for_image(
         section_start = header_index + 1
         section_end = len(lines)
         for index in range(section_start, len(lines)):
-            if lines[index].strip().upper() in _KNOWN_FIXUP_HEADERS:
+            if any_header_re.match(lines[index]):
                 section_end = index
                 break
 
@@ -214,11 +220,15 @@ def open_fixup_dialog_for_image(
     provider: VisionLlmProvider | None = None,
     regenerate_tags_enabled: bool = True,
     regenerate_description_enabled: bool = True,
-    regenerate_description_prompt: str | None = None,
-    regenerate_tagging_prompt: str | None = None,
     regenerate_timeout_seconds: int = 300,
     regenerate_retry_count: int = 3,
     regenerate_max_resolution_mpx: float = 5.0,
+    merge_table_double_click_action_enabled: bool = True,
+    merge_table_swipe_actions_enabled: bool = False,
+    merge_table_horizontal_scroll_actions_enabled: bool = False,
+    merge_table_horizontal_scroll_reverse_enabled: bool = False,
+    merge_table_horizontal_scroll_stop_idle_seconds: float = 0.45,
+    merge_table_horizontal_scroll_row_target_mode: int = 3,
     save_regenerate_settings: Callable[[dict[str, int | float | bool | str]], None] | None = None,
 ) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
     fixup_path = existing_fixup_path_for_image(image_path)
@@ -275,11 +285,15 @@ def open_fixup_dialog_for_image(
         provider=provider,
         regenerate_tags_enabled=regenerate_tags_enabled,
         regenerate_description_enabled=regenerate_description_enabled,
-        regenerate_description_prompt=regenerate_description_prompt,
-        regenerate_tagging_prompt=regenerate_tagging_prompt,
         regenerate_timeout_seconds=regenerate_timeout_seconds,
         regenerate_retry_count=regenerate_retry_count,
         regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
+        merge_table_double_click_action_enabled=merge_table_double_click_action_enabled,
+        merge_table_swipe_actions_enabled=merge_table_swipe_actions_enabled,
+        merge_table_horizontal_scroll_actions_enabled=merge_table_horizontal_scroll_actions_enabled,
+        merge_table_horizontal_scroll_reverse_enabled=merge_table_horizontal_scroll_reverse_enabled,
+        merge_table_horizontal_scroll_stop_idle_seconds=merge_table_horizontal_scroll_stop_idle_seconds,
+        merge_table_horizontal_scroll_row_target_mode=merge_table_horizontal_scroll_row_target_mode,
         parent=parent,
     )
 
@@ -341,8 +355,6 @@ def open_fixup_dialog_for_image(
                 "timeout_seconds": max(1, timeout_value),
                 "retry_count": max(0, retry_value),
                 "max_resolution_mpx": max_resolution_value,
-                "description_prompt": dialog.regenerate_description_prompt_text(),
-                "tagging_prompt": dialog.regenerate_tagging_prompt_text(),
             }
         )
 
