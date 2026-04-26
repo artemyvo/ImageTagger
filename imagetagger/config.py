@@ -39,7 +39,11 @@ _DEFAULTS: dict = {
     "merge_dialog_geometry": {},
     "font_point_size": 0,
     "directory_loader_max_threads": 8,
+    "confirm_on_delete": True,
     "last_selected_image": "",
+    "debug_regenerate_prompt_console": False,
+    "integrity_check_enabled": False,
+    "integrity_check_auto_fix": False,
     "merge_table_mouse_actions": dict(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS),
 }
 
@@ -190,9 +194,25 @@ def _normalize_loaded_config(data: Any) -> dict:
         _DEFAULTS["directory_loader_max_threads"],
         minimum=1,
     )
+    normalized["confirm_on_delete"] = _normalize_bool(
+        data.get("confirm_on_delete"),
+        _DEFAULTS["confirm_on_delete"],
+    )
     normalized["last_selected_image"] = _normalize_string(
         data.get("last_selected_image"),
         _DEFAULTS["last_selected_image"],
+    )
+    normalized["debug_regenerate_prompt_console"] = _normalize_bool(
+        data.get("debug_regenerate_prompt_console"),
+        _DEFAULTS["debug_regenerate_prompt_console"],
+    )
+    normalized["integrity_check_enabled"] = _normalize_bool(
+        data.get("integrity_check_enabled"),
+        _DEFAULTS["integrity_check_enabled"],
+    )
+    normalized["integrity_check_auto_fix"] = _normalize_bool(
+        data.get("integrity_check_auto_fix"),
+        _DEFAULTS["integrity_check_auto_fix"],
     )
     normalized["merge_table_mouse_actions"] = _normalize_merge_table_mouse_actions(data)
     return normalized

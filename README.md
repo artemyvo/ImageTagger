@@ -48,6 +48,8 @@ Supported image formats: jpg, jpeg, png, bmp, gif, webp.
 - Expression-based filtering with fixup, untagged, resolution, quoted tags, freetext, NOT/AND/OR, and parentheses.
 - Editable prompt tabs for Description, Tagging, Validation, and AI Search.
 - Preview context menu with Open in Default App and Open With support.
+- Preview context menu Delete file action removes image, matching .txt, and matching .fixup files.
+- Config key `confirm_on_delete` (default `true`) controls delete confirmation dialog behavior.
 
 ## Screenshots
 

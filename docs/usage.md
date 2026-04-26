@@ -29,6 +29,24 @@ ImageTagger works with image and sidecar text pairs.
 4. Select one or more images in the left panel.
 5. Run Generate, Validate, AI Find, and Fixup as needed.
 
+## Image Context Menu
+
+Right-click the image preview in both the main window and merge dialog to open image actions.
+
+- Open in Default App
+- Open With (detected editors or custom executable)
+- Delete file
+
+Delete file removes:
+
+- image file
+- matching .txt sidecar
+- matching .fixup files (both preferred and legacy naming)
+
+In the main window, after delete, selection moves to the next image; if deleted item was last, selection moves to the new last image.
+
+In the merge dialog, deleting the current file proceeds to the next fixup file when available. If no fixup files remain, the merge table is cleared, image preview is disabled, action buttons are disabled, and you can close the dialog with Esc.
+
 ## Ollama and Model Recommendations
 
 - Ollama is the local model runtime used by ImageTagger. If you do not already have it, install it from https://ollama.com.
@@ -239,6 +257,7 @@ config.json stores session and UI state, including:
 - thread setting
 - window geometry state
 - merge-dialog mouse action settings in `merge_table_mouse_actions`
+- `confirm_on_delete` (default `true`): show confirmation dialog before deleting from image context menu
 
 For a full list of Ollama and auto-mode keys, see [ollama_settings.md](ollama_settings.md).
 
