@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from imagetagger.utils.annotations import normalize_description_text, remove_commas_from_description
+from imagetagger.utils.annotations import sanitize_description_text
 from imagetagger import config as _config
 from imagetagger.utils.image_prep import configure_image_preparation, consume_image_preparation_warning
 from imagetagger.utils.image_reload_helper import ImageReloadHelper
@@ -156,9 +156,7 @@ def parse_fixup_data(
 
     issues = "\n".join(line for line in sections["issues"] if line.strip()).strip()
     corrected_description_raw = "\n".join(line for line in sections["description"] if line.strip()).strip()
-    corrected_description = normalize_description_text(corrected_description_raw)
-    # Remove any commas that may have snuck into the description from the fixup file
-    corrected_description = remove_commas_from_description(corrected_description)
+    corrected_description = sanitize_description_text(corrected_description_raw)
     tags_text = "\n".join(line.strip() for line in sections["tags"] if line.strip())
     corrected_tags = [
         cleaned
@@ -223,6 +221,7 @@ class FixupDialog(QDialog):
         can_navigate_next: bool = False,
         tag_suggestions: list[str] | None = None,
         normalize_annotation: Callable[[str], str] | None = None,
+        normalize_tag: Callable[[str], str] | None = None,
         provider_session: VisionLlmSession | None = None,
         provider: VisionLlmProvider | None = None,
         regenerate_tags_enabled: bool = True,
@@ -249,6 +248,7 @@ class FixupDialog(QDialog):
         self.resize(1280, 640)
         self._apply_annotations = apply_annotations
         self._normalize_annotation = normalize_annotation or (lambda text: text)
+        self._normalize_tag = normalize_tag or (lambda text: text)
         self._initial_annotations = [tag.strip() for tag in current_tags if tag.strip()]
         self._last_merged_annotations = list(self._initial_annotations)
         self._initial_proposed_description = fixup_data.corrected_description.strip()
@@ -744,7 +744,7 @@ class FixupDialog(QDialog):
         self.left_list.addItem(item)
 
     def _add_left_tag_from_input(self) -> None:
-        new_tag = self.left_tag_input.text().strip()
+        new_tag = self._normalize_tag(self.left_tag_input.text())
         if not new_tag:
             return
 
@@ -757,8 +757,12 @@ class FixupDialog(QDialog):
         }
         if normalized_new_key in existing_keys:
             self._select_existing_tag_row(normalized_new_key)
+            # Keep quick-add empty after duplicate detection. This avoids stale text when
+            # a completion popup commits after returnPressed, and it matches the expected
+            # next action: either type another tag or press Alt+Enter to merge and proceed.
             self.left_tag_input.clear()
-            self.left_tag_input.setFocus(Qt.FocusReason.OtherFocusReason)
+            QTimer.singleShot(0, self.left_tag_input.clear)
+            QTimer.singleShot(0, self.left_tag_input.setFocus)
             return
 
         self._add_left_item(new_tag)
@@ -770,7 +774,7 @@ class FixupDialog(QDialog):
 
     def _add_search_match_to_tags(self, search_query: str) -> None:
         """Add search query to current tags (left list) and remove from search matches."""
-        normalized = search_query.strip()
+        normalized = self._normalize_tag(search_query)
         if not normalized:
             return
         
@@ -950,7 +954,7 @@ class FixupDialog(QDialog):
         # Row 0 is reserved for description when present; other proposed rows are tags.
         if self._has_proposed_description and right_row == 0:
             return normalized
-        return self._strip_tag_list_prefix(normalized)
+        return self._normalize_tag(self._strip_tag_list_prefix(normalized))
 
     def _apply_proposed_rows(self, rows: list[int]) -> None:
         """Accept proposed rows by replacing matched existing items or appending new ones."""
@@ -975,6 +979,8 @@ class FixupDialog(QDialog):
             if not proposed_text:
                 continue
 
+            key = self._normalized_compare_key(proposed_text)
+
             matched_left_row = right_matches.get(right_row)
             if matched_left_row is not None and 0 <= matched_left_row < self.left_list.count():
                 left_item = self.left_list.item(matched_left_row)
@@ -983,10 +989,29 @@ class FixupDialog(QDialog):
                     self.left_list.setItemWidget(left_item, None)
                 left_item.setText(proposed_text)
                 left_item.setData(ITEM_TEXT_ROLE, proposed_text)
-                existing_keys.add(self._normalized_compare_key(proposed_text))
+                existing_keys.add(key)
                 continue
 
-            key = self._normalized_compare_key(proposed_text)
+            # Description rows can appear as right-only when the current description is too short
+            # to satisfy _is_description_like(). If a normalized-equivalent left entry exists,
+            # replace it in-place so arrow action never becomes a no-op.
+            if self._has_proposed_description and right_row == 0:
+                replacement_index = self._find_description_like_index(left_texts)
+                if replacement_index is None:
+                    for left_index, left_text in enumerate(left_texts):
+                        if self._normalized_compare_key(left_text) == key:
+                            replacement_index = left_index
+                            break
+
+                if replacement_index is not None and 0 <= replacement_index < self.left_list.count():
+                    replacement_item = self.left_list.item(replacement_index)
+                    if self.left_list.itemWidget(replacement_item) is not None:
+                        self.left_list.setItemWidget(replacement_item, None)
+                    replacement_item.setText(proposed_text)
+                    replacement_item.setData(ITEM_TEXT_ROLE, proposed_text)
+                    existing_keys.add(key)
+                    continue
+
             if key not in existing_keys:
                 # Special handling for descriptions: find existing description and replace it in-place
                 # rather than always inserting at position 0 (which could reorder existing items)
@@ -1517,9 +1542,11 @@ class FixupDialog(QDialog):
                 if description_right_index not in search_match_indexes:
                     left_matches[left_description_index] = 0
                     right_matches[0] = left_description_index
-                    left_description_key = self._normalized_compare_key(left_texts[left_description_index])
-                    right_description_key = self._normalized_compare_key(right_texts[0])
-                    right_match_kind[0] = "exact" if left_description_key == right_description_key else "description"
+                    # Use case-sensitive comparison for descriptions: capital letters are meaningful
+                    # and a case-only difference should still show the ← button.
+                    left_description_norm = self._normalized_compare_text(left_texts[left_description_index])
+                    right_description_norm = self._normalized_compare_text(right_texts[0])
+                    right_match_kind[0] = "exact" if left_description_norm == right_description_norm else "description"
 
         # Pass 1: exact matches
         for left_index, text in enumerate(left_texts):
@@ -2639,7 +2666,7 @@ class FixupDialog(QDialog):
                     description = ""
                     tags: list[str] = []
                     if description_prompt is not None:
-                        description = normalize_description_text(
+                        description = sanitize_description_text(
                             active_session.generate(
                                 self._image_path,
                                 description_prompt,
@@ -2648,8 +2675,6 @@ class FixupDialog(QDialog):
                                 thread_count=1,
                             ).strip()
                         )
-                        # Remove any commas from regenerated description (critical for .txt file format)
-                        description = remove_commas_from_description(description)
                     if tags_prompt is not None:
                         tags = self._dedupe_preserve_order(
                             self._parse_regenerated_tags(
@@ -2695,9 +2720,9 @@ class FixupDialog(QDialog):
         normalized = text.replace("\r", "").replace("\n", ",")
         tags: list[str] = []
         for part in normalized.split(","):
-            cleaned = self._normalize_annotation(part).strip()
+            cleaned = self._normalize_tag(part)
             if cleaned:
-                tags.append(cleaned.lower())
+                tags.append(cleaned)
         return tags
 
     def _dedupe_preserve_order(self, values: list[str]) -> list[str]:

@@ -43,7 +43,7 @@ from PyQt6.QtWidgets import (
 )
 
 from imagetagger import config as _config
-from imagetagger.utils.annotations import normalize_description_text, parse_tags_text, sanitize_annotation_text, remove_commas_from_description
+from imagetagger.utils.annotations import parse_tags_text, sanitize_annotation_text, sanitize_description_text, sanitize_tag_text
 from imagetagger.utils.integrity_check import check_all_patterns
 from imagetagger.utils.image_prep import configure_image_preparation, consume_image_preparation_warning
 from imagetagger.utils.image_reload_helper import ImageReloadHelper
@@ -2868,7 +2868,7 @@ class MainWindow(QMainWindow):
 
         self._show_image(record.image_path)
 
-        tags = self._parse_tags(record.text)
+        tags = self._parse_annotations_for_tag_list(record.text)
         self._populate_tag_list(tags)
         self.tag_input.clear()
         self._update_fixup_button_state()
@@ -2961,6 +2961,38 @@ class MainWindow(QMainWindow):
     def _parse_tags(self, text: str) -> list[str]:
         return parse_tags_text(text)
 
+    def _parse_annotations_for_tag_list(self, text: str) -> list[str]:
+        parts = self._split_record_annotations(text)
+        if not parts:
+            return []
+
+        description_index = self._find_description_like_index(parts)
+        description_text = ""
+        if description_index is not None:
+            description_text = sanitize_description_text(parts[description_index])
+
+        parsed: list[str] = []
+        if description_text:
+            parsed.append(description_text)
+
+        description_key = sanitize_annotation_text(description_text).casefold() if description_text else ""
+        seen: set[str] = set()
+        for idx, value in enumerate(parts):
+            if idx == description_index:
+                continue
+            normalized_tag = sanitize_tag_text(value)
+            if not normalized_tag:
+                continue
+            if description_key and sanitize_annotation_text(normalized_tag).casefold() == description_key:
+                continue
+            key = normalized_tag.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed.append(normalized_tag)
+
+        return parsed
+
     def _sanitize_annotation_text(self, text: str) -> str:
         return sanitize_annotation_text(text)
 
@@ -3025,12 +3057,16 @@ class MainWindow(QMainWindow):
         if self.current_index < 0 or self.current_index >= len(self.records):
             return
 
-        new_tag = self.tag_input.text().strip()
+        new_tag = sanitize_tag_text(self.tag_input.text())
         if not new_tag:
             return
 
-        existing_tags = self._current_tags()
-        if new_tag in existing_tags:
+        existing_keys = {
+            sanitize_tag_text(existing_tag)
+            for existing_tag in self._current_tags()
+            if sanitize_tag_text(existing_tag)
+        }
+        if new_tag in existing_keys:
             self.statusBar().showMessage(f"Tag already exists: {new_tag}")
             self.tag_input.selectAll()
             return
@@ -3338,7 +3374,8 @@ class MainWindow(QMainWindow):
             def process_one(position: int, record_index: int) -> dict:
                 record = self.records[record_index]
                 image_name = self._display_image_path(record.image_path)
-                generated_items: list[str] = []
+                generated_description = ""
+                generated_tags: list[str] = []
                 image_retried = False
                 image_timed_out = False
                 image_started_at = time.monotonic()
@@ -3370,11 +3407,12 @@ class MainWindow(QMainWindow):
                             )
                         return remaining
 
-                    attempt_items: list[str] = []
+                    attempt_description = ""
+                    attempt_tags: list[str] = []
                     retry_needed = False
                     try:
                         if description_query is not None:
-                            description = normalize_description_text(
+                            description = sanitize_description_text(
                                 session.generate(
                                     record.image_path,
                                     description_query.prompt,
@@ -3383,16 +3421,10 @@ class MainWindow(QMainWindow):
                                 ).strip()
                             )
                             if description:
-                                # Sanitize description to remove commas and punctuation
-                                # so it can be safely mixed with comma-separated tags
-                                sanitized_desc = sanitize_annotation_text(description)
-                                # Extra safety: ensure no commas remain (critical for .txt file parsing)
-                                sanitized_desc = remove_commas_from_description(sanitized_desc)
-                                if sanitized_desc:
-                                    attempt_items.append(sanitized_desc)
+                                attempt_description = description
 
                         if tags_query is not None:
-                            attempt_items.extend(
+                            attempt_tags.extend(
                                 [
                                     tag.lower()
                                     for tag in self._parse_tags(
@@ -3406,7 +3438,7 @@ class MainWindow(QMainWindow):
                                 ]
                             )
 
-                        if not attempt_items:
+                        if not attempt_description and not attempt_tags:
                             retry_needed = True
                     except LlmProviderCancelled:
                         raise
@@ -3417,7 +3449,8 @@ class MainWindow(QMainWindow):
 
                     elapsed_seconds = time.monotonic() - attempt_start
                     if not retry_needed:
-                        generated_items = attempt_items
+                        generated_description = attempt_description
+                        generated_tags = attempt_tags
                         print(
                             f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_done image={image_name} elapsed_s={elapsed_seconds:.2f}",
                             flush=True,
@@ -3432,7 +3465,8 @@ class MainWindow(QMainWindow):
                 return {
                     "kind": "generate_item",
                     "index": record_index,
-                    "items": generated_items,
+                    "description": generated_description,
+                    "tags": generated_tags,
                     "retried": image_retried,
                     "timed_out": image_timed_out,
                     "elapsed_s": max(0.0, time.monotonic() - image_started_at),
@@ -3902,7 +3936,7 @@ class MainWindow(QMainWindow):
                 self._update_list_item_preview(index)
 
             if 0 <= self.current_index < len(self.records) and self.current_index in updated_indices:
-                self._populate_tag_list(self._parse_tags(self.records[self.current_index].text))
+                self._populate_tag_list(self._parse_annotations_for_tag_list(self.records[self.current_index].text))
 
             # Rebuild completions once after all updates to avoid O(N^2) stalls.
             self._rebuild_known_tags_from_records()
@@ -4140,34 +4174,108 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(message or f"{action} stopped.")
 
-    def _apply_generated_items_to_record(self, record_index: int, items: list[str]) -> tuple[bool, int]:
+    @staticmethod
+    def _is_description_like_annotation(text: str) -> bool:
+        normalized = text.strip()
+        if not normalized:
+            return False
+        if normalized[0].isupper() and normalized.endswith(".") and (" " in normalized or len(normalized) >= 8):
+            return True
+        word_count = len(normalized.split())
+        return word_count >= 5 or len(normalized) >= 40
+
+    def _find_description_like_index(self, values: list[str]) -> int | None:
+        best_index: int | None = None
+        best_length = -1
+        for index, value in enumerate(values):
+            normalized = value.strip()
+            if not self._is_description_like_annotation(normalized):
+                continue
+            if len(normalized) > best_length:
+                best_length = len(normalized)
+                best_index = index
+        return best_index
+
+    def _split_record_annotations(self, text: str) -> list[str]:
+        raw = text.replace("\r", "").replace("\n", ",")
+        return [part.strip() for part in raw.split(",") if part.strip()]
+
+    def _apply_generated_items_to_record(
+        self,
+        record_index: int,
+        description: str,
+        tags: list[str],
+    ) -> tuple[bool, int]:
         if record_index < 0 or record_index >= len(self.records):
             return (False, 0)
 
         record = self.records[record_index]
-        existing_tags = self._parse_tags(record.text)
-        seen = {tag.casefold() for tag in existing_tags}
+        existing_annotations = self._split_record_annotations(record.text)
+        existing_description_index = self._find_description_like_index(existing_annotations)
+        existing_description = (
+            existing_annotations[existing_description_index]
+            if existing_description_index is not None
+            else ""
+        )
+
+        existing_tags = [
+            value
+            for idx, value in enumerate(existing_annotations)
+            if idx != existing_description_index
+        ]
+        seen = {
+            sanitize_tag_text(tag).casefold()
+            for tag in existing_tags
+            if sanitize_tag_text(tag)
+        }
         merged_tags = list(existing_tags)
         added = 0
 
-        for item in items:
-            key = item.casefold()
+        for item in tags:
+            normalized_item = sanitize_tag_text(item)
+            if not normalized_item:
+                continue
+            key = normalized_item.casefold()
             if key in seen:
                 continue
             seen.add(key)
-            merged_tags.append(item)
+            merged_tags.append(normalized_item)
             added += 1
 
-        if added == 0:
+        next_description = description.strip() or existing_description
+        if next_description:
+            description_key = sanitize_annotation_text(next_description).casefold()
+            before_filter_count = len(merged_tags)
+            merged_tags = [
+                tag for tag in merged_tags if sanitize_annotation_text(tag).casefold() != description_key
+            ]
+            removed_count = before_filter_count - len(merged_tags)
+            if removed_count > 0:
+                added = max(0, added - removed_count)
+
+        description_changed = bool(next_description) and (
+            sanitize_annotation_text(next_description).casefold()
+            != sanitize_annotation_text(existing_description).casefold()
+        )
+        if description_changed:
+            added += 1
+
+        final_annotations: list[str] = []
+        if next_description:
+            final_annotations.append(next_description)
+        final_annotations.extend(merged_tags)
+
+        new_text = self._serialize_tags(final_annotations)
+        if not new_text or new_text == record.text:
             return (False, 0)
 
-        record.text = self._serialize_tags(merged_tags)
+        record.text = new_text
         if self._write_record_text(record, status_prefix="Generate + auto-saved"):
             self._update_list_item_preview(record_index)
 
             if self.current_index == record_index and not self.tag_input.hasFocus():
                 if self.tag_list.state() != QAbstractItemView.State.EditingState:
-                    self._populate_tag_list(self._parse_tags(record.text))
+                    self._populate_tag_list(self._parse_annotations_for_tag_list(record.text))
 
             return (True, added)
 
@@ -4179,7 +4287,8 @@ class MainWindow(QMainWindow):
         kind = payload.get("kind")
         if kind == "generate_item":
             raw_index = payload.get("index")
-            raw_items = payload.get("items")
+            raw_description = payload.get("description")
+            raw_tags = payload.get("tags")
             raw_retried = payload.get("retried")
             raw_position = payload.get("position")
             raw_total = payload.get("total")
@@ -4188,10 +4297,11 @@ class MainWindow(QMainWindow):
                 return
             if raw_index < 0 or raw_index >= len(self.records):
                 return
-            items = [str(item).strip() for item in raw_items] if isinstance(raw_items, list) else []
-            items = [item for item in items if item]
+            description = str(raw_description).strip() if isinstance(raw_description, str) else ""
+            tags = [str(item).strip() for item in raw_tags] if isinstance(raw_tags, list) else []
+            tags = [item for item in tags if item]
 
-            updated, added = self._apply_generated_items_to_record(raw_index, items)
+            updated, added = self._apply_generated_items_to_record(raw_index, description, tags)
             self._generate_batch_processed += 1
             if isinstance(raw_retried, bool) and raw_retried:
                 self._generate_batch_retry_images += 1
@@ -4424,7 +4534,7 @@ class MainWindow(QMainWindow):
             self._refresh_tag_completions()
 
             if 0 <= self.current_index < len(self.records):
-                self._populate_tag_list(self._parse_tags(self.records[self.current_index].text))
+                self._populate_tag_list(self._parse_annotations_for_tag_list(self.records[self.current_index].text))
 
             self.statusBar().showMessage(
                 f"{action_name} complete via {self._llm_provider.display_name} ({updated} image{'s' if updated != 1 else ''}, {with_new} new annotation{'s' if with_new != 1 else ''})"

@@ -6,7 +6,7 @@ from typing import Callable, Literal
 
 from PyQt6.QtWidgets import QDialog, QMessageBox, QStyle, QWidget
 
-from imagetagger.utils.annotations import sanitize_annotation_text
+from imagetagger.utils.annotations import sanitize_annotation_text, sanitize_tag_text, sanitize_description_text
 from imagetagger.utils.io_utils import atomic_write_text
 from imagetagger.providers.llm_provider import VisionLlmProvider, VisionLlmSession
 from imagetagger.ui.merge_dialog import FixupDialog, parse_fixup_data
@@ -80,7 +80,7 @@ def _dedupe_fixup_tags_content(content: str) -> str:
             unique_tags: list[str] = []
             seen_keys: set[str] = set()
             for value in raw_tags:
-                normalized = sanitize_annotation_text(_normalize_fixup_section_entry(value))
+                normalized = sanitize_tag_text(_normalize_fixup_section_entry(value))
                 if not normalized:
                     continue
                 key = normalized.casefold()
@@ -286,6 +286,7 @@ def open_fixup_dialog_for_image(
         can_navigate_next,
         tag_suggestions=tag_suggestions,
         normalize_annotation=sanitize_annotation,
+        normalize_tag=sanitize_tag_text,
         provider_session=provider_session,
         provider=provider,
         regenerate_tags_enabled=regenerate_tags_enabled,
