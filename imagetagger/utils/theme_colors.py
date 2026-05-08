@@ -29,3 +29,29 @@ def danger_accent_color(palette: QPalette) -> QColor:
 def danger_text_on_accent_color(palette: QPalette) -> QColor:
     """Return text color intended to sit on top of danger accents."""
     return palette.color(QPalette.ColorRole.HighlightedText)
+
+
+def info_accent_color(palette: QPalette) -> QColor:
+    """Return a theme-aware info accent color (blue-toned) for sidecar/vision badges."""
+    link = palette.color(QPalette.ColorRole.Link)
+    base = palette.color(QPalette.ColorRole.Base)
+    is_dark_theme = base.lightness() < 128
+    return link.lighter(130) if is_dark_theme else link.darker(110)
+
+
+def info_text_on_accent_color(palette: QPalette) -> QColor:
+    """Return text/icon color intended to sit on top of info accents."""
+    return palette.color(QPalette.ColorRole.HighlightedText)
+
+
+def success_accent_color(palette: QPalette) -> QColor:
+    """Return a theme-aware success accent color (green-toned) for validated badges."""
+    base = palette.color(QPalette.ColorRole.Base)
+    is_dark_theme = base.lightness() < 128
+    green = QColor(80, 200, 80)
+    return green.lighter(120) if is_dark_theme else green.darker(130)
+
+
+def success_text_on_accent_color(palette: QPalette) -> QColor:
+    """Return text/icon color intended to sit on top of success accents."""
+    return palette.color(QPalette.ColorRole.HighlightedText)

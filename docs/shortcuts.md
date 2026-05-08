@@ -15,9 +15,12 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Action | Win/Linux | macOS | Where |
 |---|---|---|---|
 | Select all visible images | Ctrl+A | Command+A | Image list |
+| Select previous image | Alt+Up | Option+Up | Anywhere in main window |
+| Select next image | Alt+Down | Option+Down | Anywhere in main window |
 | Jump to first fixup | Alt+F | Option+F | Image list |
 | Jump to last fixup | Alt+L | Option+L | Image list |
-| Remove selected tag | Delete | Delete (or Fn+Delete on some keyboards) | Tag list |
+| Remove selected tag | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) | Tag list |
+| Purge tag(s) from entire dataset | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) | Global Tags list (Controls panel) — supports multi-selection via Shift-click / Ctrl-click; shows confirmation dialog before writing |
 | Open folder | Ctrl+L | Command+O | File menu |
 | Refresh folder | Ctrl+R | Command+R | File menu |
 | Exit app | Ctrl+Q | Command+Q | File menu |

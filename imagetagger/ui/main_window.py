@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image, ImageCms, UnidentifiedImageError
 
-from PyQt6.QtCore import QEvent, QObject, QRect, QStringListModel, QThread, Qt, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QModelIndex, QObject, QRect, QStringListModel, QThread, Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QKeySequence, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStatusBar,
+    QStyle,
     QStyledItemDelegate,
     QTabWidget,
     QTextEdit,
@@ -44,9 +45,8 @@ from PyQt6.QtWidgets import (
 
 from imagetagger import config as _config
 from imagetagger.utils.annotations import parse_tags_text, sanitize_annotation_text, sanitize_description_text, sanitize_tag_text
-from imagetagger.utils.integrity_check import check_all_patterns
 from imagetagger.utils.image_prep import configure_image_preparation, consume_image_preparation_warning
-from imagetagger.utils.image_reload_helper import ImageReloadHelper
+from imagetagger.ui.image_reload_helper import ImageReloadHelper
 from imagetagger.utils.input_validators import InputValidator
 from imagetagger.utils.validators import (
     create_max_resolution_validator,
@@ -55,6 +55,7 @@ from imagetagger.utils.validators import (
     create_timeout_validator,
 )
 from imagetagger.utils.io_utils import atomic_write_text
+from imagetagger.utils.sidecar import SidecarData, get_sidecar_json_path, read_sidecar_data, write_sidecar_data
 from imagetagger.providers.llm_provider import (
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_VISION_PROVIDER,
@@ -64,11 +65,13 @@ from imagetagger.providers.llm_provider import (
     VisionLlmSession,
 )
 from imagetagger.ui.merge_actions import (
-    clear_fixup_files_for_image,
-    existing_fixup_path_for_image,
+    clear_fixup_sidecar,
+    clear_validation_fields_sidecar,
+    delete_sidecar_for_image,
     open_fixup_dialog_for_image,
     record_ai_find_match_for_image,
-    write_fixup_for_image,
+    record_refine_result_for_image,
+    write_fixup_sidecar,
 )
 from imagetagger.utils.external_editors import (
     ExternalEditor,
@@ -79,690 +82,50 @@ from imagetagger.utils.external_editors import (
 from imagetagger.utils.llm_queries import (
     active_prompt_for_kind,
     clear_prompt_override,
+    format_annotations_for_validation,
     get_default_prompt,
     load_prompt_for_kind,
+    parse_refine_response,
+    parse_vision_response,
     parse_yes_no_response,
     prepare_description_query,
+    prepare_refine_query,
     prepare_search_query,
     prepare_tagging_query,
     prepare_validation_query,
+    prepare_vision_query,
     prompt_source_for_kind,
     reset_prompt_to_default,
     save_prompt_for_kind,
     set_prompt_override,
 )
+from imagetagger.ui.workers import (
+    IMAGE_EXTENSIONS,
+    THUMB_SIZE,
+    MIN_FONT_POINT_SIZE,
+    MAX_FONT_POINT_SIZE,
+    FolderLoadWorker,
+    LlmTaskWorker,
+    RegenerateWorker,
+    TagPurgeWorker,
+)
 from imagetagger.ui.shortcuts import platform_key_sequence
 from imagetagger.ui.server_settings_frame import create_server_settings_frame
-from imagetagger.utils.theme_colors import danger_accent_color, danger_text_on_accent_color
+from imagetagger.utils.theme_colors import danger_accent_color, danger_text_on_accent_color, info_accent_color, info_text_on_accent_color, success_accent_color, success_text_on_accent_color
 
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
-THUMB_SIZE = QSize(96, 96)
-MIN_FONT_POINT_SIZE = 8
-MAX_FONT_POINT_SIZE = 40
 
 
-@dataclass
-class ImageRecord:
-    image_path: Path
-    text_path: Path
-    text: str
 
+from imagetagger.utils.filter_parser import (
+    FilterSyntaxError,
+    _FilterNode,
+    _FilterRuntime,
+    _parse_filter_expression,
+)
+from imagetagger.ui.models import ImageRecord
 
-class FilterSyntaxError(ValueError):
-    pass
 
-
-@dataclass(frozen=True)
-class _FilterToken:
-    kind: str
-    value: str
-    position: int
-
-
-class _FilterNode:
-    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
-        raise NotImplementedError()
-
-
-@dataclass(frozen=True)
-class _NamedFilterNode(_FilterNode):
-    name: str
-
-    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
-        predicate = runtime.named_filters.get(self.name.casefold())
-        if predicate is None:
-            return False
-        return predicate(record)
-
-
-@dataclass(frozen=True)
-class _TagFilterNode(_FilterNode):
-    tag: str
-
-    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
-        return runtime.tag_filter(record, self.tag)
-
-
-@dataclass(frozen=True)
-class _FreetextFilterNode(_FilterNode):
-    text: str
-
-    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
-        return runtime.freetext_filter(record, self.text)
-
-
-@dataclass(frozen=True)
-class _AndFilterNode(_FilterNode):
-    left: _FilterNode
-    right: _FilterNode
-
-    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
-        return self.left.evaluate(record, runtime) and self.right.evaluate(record, runtime)
-
-
-@dataclass(frozen=True)
-class _OrFilterNode(_FilterNode):
-    left: _FilterNode
-    right: _FilterNode
-
-    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
-        return self.left.evaluate(record, runtime) or self.right.evaluate(record, runtime)
-
-
-@dataclass(frozen=True)
-class _NotFilterNode(_FilterNode):
-    operand: _FilterNode
-
-    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
-        return not self.operand.evaluate(record, runtime)
-
-
-@dataclass(frozen=True)
-class _ComparisonFilterNode(_FilterNode):
-    operator: str  # "<", ">", "<=", ">="
-    value: float
-
-    def evaluate(self, record: ImageRecord, runtime: "_FilterRuntime") -> bool:
-        resolution_mpx = runtime.get_resolution_mpx(record)
-        if resolution_mpx is None:
-            return False
-        if self.operator == "<":
-            return resolution_mpx < self.value
-        elif self.operator == "<=":
-            return resolution_mpx <= self.value
-        elif self.operator == ">":
-            return resolution_mpx > self.value
-        elif self.operator == ">=":
-            return resolution_mpx >= self.value
-        return False
-
-
-@dataclass
-class _FilterRuntime:
-    named_filters: dict[str, Callable[[ImageRecord], bool]]
-    tag_filter: Callable[[ImageRecord, str], bool]
-    freetext_filter: Callable[[ImageRecord, str], bool]
-    get_resolution_mpx: Callable[[ImageRecord], float | None]
-
-
-def _tokenize_filter_expression(expression: str) -> list[_FilterToken]:
-    tokens: list[_FilterToken] = []
-    index = 0
-    length = len(expression)
-
-    while index < length:
-        char = expression[index]
-
-        if char.isspace():
-            index += 1
-            continue
-
-        if char in "&|()": 
-            tokens.append(_FilterToken(kind=char, value=char, position=index))
-            index += 1
-            continue
-
-        if char in "<>":
-            start = index
-            if char == "<" and index + 1 < length and expression[index + 1] == "=":
-                tokens.append(_FilterToken(kind="COMP", value="<=", position=index))
-                index += 2
-            elif char == ">" and index + 1 < length and expression[index + 1] == "=":
-                tokens.append(_FilterToken(kind="COMP", value=">=", position=index))
-                index += 2
-            else:
-                tokens.append(_FilterToken(kind="COMP", value=char, position=index))
-                index += 1
-            continue
-
-        if char.isdigit() or (char == "." and index + 1 < length and expression[index + 1].isdigit()):
-            start = index
-            while index < length and (expression[index].isdigit() or expression[index] == "."):
-                index += 1
-            value = expression[start:index]
-            try:
-                num_value = float(value)
-                tokens.append(_FilterToken(kind="NUMBER", value=value, position=start))
-            except ValueError:
-                raise FilterSyntaxError(f"Invalid number '{value}' at position {start + 1}.")
-            continue
-
-        if char in "!~":
-            tokens.append(_FilterToken(kind="NOT", value=char, position=index))
-            index += 1
-            continue
-
-        if char == '"':
-            start = index
-            index += 1
-            value_chars: list[str] = []
-            while index < length:
-                current = expression[index]
-                if current == "\\":
-                    index += 1
-                    if index >= length:
-                        raise FilterSyntaxError(f"Unfinished escape sequence at position {start + 1}.")
-                    value_chars.append(expression[index])
-                    index += 1
-                    continue
-                if current == '"':
-                    index += 1
-                    break
-                value_chars.append(current)
-                index += 1
-            else:
-                raise FilterSyntaxError(f"Missing closing quote for tag at position {start + 1}.")
-
-            tokens.append(_FilterToken(kind="STRING", value="".join(value_chars), position=start))
-            continue
-
-        if char == "'":
-            start = index
-            index += 1
-            value_chars: list[str] = []
-            while index < length:
-                current = expression[index]
-                if current == "\\":
-                    index += 1
-                    if index >= length:
-                        raise FilterSyntaxError(f"Unfinished escape sequence at position {start + 1}.")
-                    value_chars.append(expression[index])
-                    index += 1
-                    continue
-                if current == "'":
-                    index += 1
-                    break
-                value_chars.append(current)
-                index += 1
-            else:
-                raise FilterSyntaxError(f"Missing closing quote for freetext at position {start + 1}.")
-
-            tokens.append(_FilterToken(kind="FREETEXT", value="".join(value_chars), position=start))
-            continue
-
-        start = index
-        while index < length and (not expression[index].isspace()) and expression[index] not in "&|()\"!~<>":
-            index += 1
-
-        value = expression[start:index]
-        if not value:
-            raise FilterSyntaxError(f"Unexpected character at position {start + 1}.")
-        tokens.append(_FilterToken(kind="NAME", value=value, position=start))
-
-    return tokens
-
-
-def _parse_filter_expression(expression: str) -> _FilterNode | None:
-    tokens = _tokenize_filter_expression(expression)
-    if not tokens:
-        return None
-
-    position = 0
-
-    def _peek() -> _FilterToken | None:
-        if position >= len(tokens):
-            return None
-        return tokens[position]
-
-    def _consume(expected_kind: str | None = None) -> _FilterToken:
-        nonlocal position
-        token = _peek()
-        if token is None:
-            raise FilterSyntaxError("Unexpected end of filter expression.")
-        if expected_kind is not None and token.kind != expected_kind:
-            raise FilterSyntaxError(
-                f"Expected '{expected_kind}' at position {token.position + 1}, got '{token.value}'."
-            )
-        position += 1
-        return token
-
-    def _parse_primary() -> _FilterNode:
-        token = _peek()
-        if token is None:
-            raise FilterSyntaxError("Unexpected end of filter expression.")
-
-        if token.kind == "(":
-            _consume("(")
-            nested = _parse_or_expression()
-            closing = _peek()
-            if closing is None or closing.kind != ")":
-                at = token.position + 1 if closing is None else closing.position + 1
-                raise FilterSyntaxError(f"Missing ')' for group near position {at}.")
-            _consume(")")
-            return nested
-
-        if token.kind == "NAME":
-            name_token = _consume("NAME")
-            if name_token.value.casefold() == "resolution":
-                comp_token = _peek()
-                if comp_token is None or comp_token.kind != "COMP":
-                    raise FilterSyntaxError(
-                        f"Expected comparison operator after 'resolution' at position {name_token.position + len(name_token.value) + 1}."
-                    )
-                _consume("COMP")
-                num_token = _peek()
-                if num_token is None or num_token.kind != "NUMBER":
-                    raise FilterSyntaxError(
-                        f"Expected number after '{comp_token.value}' at position {comp_token.position + len(comp_token.value) + 1}."
-                    )
-                _consume("NUMBER")
-                try:
-                    num_value = float(num_token.value)
-                except ValueError:
-                    raise FilterSyntaxError(f"Invalid number '{num_token.value}' at position {num_token.position + 1}.")
-                return _ComparisonFilterNode(operator=comp_token.value, value=num_value)
-            return _NamedFilterNode(name=name_token.value)
-
-        if token.kind == "STRING":
-            _consume("STRING")
-            return _TagFilterNode(tag=token.value)
-
-        if token.kind == "FREETEXT":
-            _consume("FREETEXT")
-            return _FreetextFilterNode(text=token.value)
-
-        raise FilterSyntaxError(f"Unexpected token '{token.value}' at position {token.position + 1}.")
-
-    def _parse_not_expression() -> _FilterNode:
-        token = _peek()
-        if token is not None and token.kind == "NOT":
-            _consume("NOT")
-            return _NotFilterNode(operand=_parse_not_expression())
-        return _parse_primary()
-
-    def _parse_and_expression() -> _FilterNode:
-        node = _parse_not_expression()
-        while True:
-            token = _peek()
-            if token is None or token.kind != "&":
-                break
-            _consume("&")
-            node = _AndFilterNode(left=node, right=_parse_not_expression())
-        return node
-
-    def _parse_or_expression() -> _FilterNode:
-        node = _parse_and_expression()
-        while True:
-            token = _peek()
-            if token is None or token.kind != "|":
-                break
-            _consume("|")
-            node = _OrFilterNode(left=node, right=_parse_and_expression())
-        return node
-
-    parsed = _parse_or_expression()
-    trailing = _peek()
-    if trailing is not None:
-        raise FilterSyntaxError(
-            f"Unexpected token '{trailing.value}' at position {trailing.position + 1}."
-        )
-    return parsed
-
-
-class FolderLoadWorker(QObject):
-    scan_progress = pyqtSignal(int, int, int)
-    progress = pyqtSignal(int, int, int)
-    item_loaded = pyqtSignal(object)
-    finished = pyqtSignal(int, str)
-    failed = pyqtSignal(str)
-    icc_warning = pyqtSignal(str)
-    scan_ready = pyqtSignal(int)
-    collision_detected = pyqtSignal(str, str)
-
-    def __init__(self, folder: Path, max_thread_cap: int = 8) -> None:
-        super().__init__()
-        self.folder = folder
-        self._max_thread_cap = max(1, int(max_thread_cap))
-        self._cancelled = False
-        self._allow_processing = threading.Event()
-
-    def cancel(self) -> None:
-        self._cancelled = True
-        self._allow_processing.set()
-
-    def allow_processing(self) -> None:
-        self._allow_processing.set()
-
-    @staticmethod
-    def _has_invalid_icc_profile(image_path: Path) -> bool:
-        try:
-            with Image.open(image_path) as image:
-                raw_profile = image.info.get("icc_profile")
-                if not raw_profile:
-                    return False
-                if isinstance(raw_profile, str):
-                    raw_profile = raw_profile.encode("utf-8", errors="ignore")
-                if not isinstance(raw_profile, (bytes, bytearray)):
-                    return False
-
-                ImageCms.ImageCmsProfile(BytesIO(bytes(raw_profile)))
-                return False
-        except (OSError, ValueError, UnidentifiedImageError):
-            return False
-        except ImageCms.PyCMSError:
-            return True
-
-    def _scan_folder(self) -> tuple[list[Path], tuple[Path, Path] | None]:
-        """
-        Scan the folder once, returning sorted image paths and the first collision (if any).
-
-        Collision definition: two image files that would map to the same `.txt` file
-        (same stem after suffix replacement), but with different image extensions.
-        """
-        image_paths: list[Path] = []
-        discovered_files = 0
-        discovered_dirs = 0
-        emit_every = 200
-
-        try:
-            for root, dirnames, filenames in os.walk(self.folder):
-                if self._cancelled:
-                    return [], None
-
-                discovered_dirs += len(dirnames)
-                discovered_files += len(filenames)
-                root_path = Path(root)
-                for filename in filenames:
-                    image_path = root_path / filename
-                    if image_path.suffix.lower() in IMAGE_EXTENSIONS:
-                        image_paths.append(image_path)
-
-                if (discovered_files + discovered_dirs) % emit_every == 0:
-                    self.scan_progress.emit(discovered_files, discovered_dirs, len(image_paths))
-
-            self.scan_progress.emit(discovered_files, discovered_dirs, len(image_paths))
-            image_paths.sort(key=lambda p: p.relative_to(self.folder).as_posix().lower())
-        except OSError as exc:
-            raise exc
-
-        seen_by_txt_path: dict[str, Path] = {}
-        for image_path in image_paths:
-            txt_key = str(image_path.with_suffix(".txt")).casefold()
-            existing = seen_by_txt_path.get(txt_key)
-            if existing is None:
-                seen_by_txt_path[txt_key] = image_path
-                continue
-
-            if existing.suffix.lower() != image_path.suffix.lower():
-                return image_paths, (existing, image_path)
-
-        return image_paths, None
-
-    @staticmethod
-    def _thumbnail_rgba_bytes(image_path: Path) -> tuple[dict | None, bool]:
-        """
-        Build a small RGBA thumbnail using Pillow.
-
-        Returns: (thumbnail_payload, icc_invalid)
-        where thumbnail_payload is dict(width, height, bytes, bytes_per_line) suitable for
-        reconstructing a QImage on the GUI thread.
-        """
-        try:
-            img = Image.open(image_path)
-        except (OSError, UnidentifiedImageError):
-            return None, False
-
-        with img:
-            # Validate ICC profile using the raw ICC bytes (if present).
-            raw_profile = img.info.get("icc_profile")
-            icc_invalid = False
-            if raw_profile:
-                if isinstance(raw_profile, str):
-                    raw_profile = raw_profile.encode("utf-8", errors="ignore")
-                if isinstance(raw_profile, (bytes, bytearray)):
-                    try:
-                        ImageCms.ImageCmsProfile(BytesIO(bytes(raw_profile)))
-                    except ImageCms.PyCMSError:
-                        icc_invalid = True
-
-            # Pillow doesn't auto-apply EXIF orientation, so we transpose to match Qt behavior.
-            try:
-                from PIL import ImageOps
-
-                img = ImageOps.exif_transpose(img)
-            except Exception:
-                # If exif_transpose fails, fall back to the original decoded orientation.
-                pass
-
-            # Downscale aggressively to 96x96-ish so we don't decode full-size into memory.
-            thumb = img.convert("RGBA")
-            thumb.thumbnail((THUMB_SIZE.width(), THUMB_SIZE.height()), resample=Image.Resampling.LANCZOS)
-
-            rgba_bytes = thumb.tobytes()
-            width, height = thumb.size
-            bytes_per_line = width * 4
-            return (
-                {
-                    "width": width,
-                    "height": height,
-                    "bytes": rgba_bytes,
-                    "bytes_per_line": bytes_per_line,
-                },
-                icc_invalid,
-            )
-
-    def run(self) -> None:
-        try:
-            image_paths, collision = self._scan_folder()
-        except OSError as exc:
-            self.failed.emit(f"Failed to read folder: {exc}")
-            return
-        if self._cancelled:
-            return
-
-        if collision is not None:
-            first, second = collision
-            self.collision_detected.emit(str(first), str(second))
-            return
-
-        total = len(image_paths)
-        self.scan_ready.emit(total)
-        self.progress.emit(0, total, 0)
-
-        # Wait until the GUI thread resets its state and is ready for results.
-        while not self._allow_processing.is_set():
-            if self._cancelled:
-                return
-            self._allow_processing.wait(timeout=0.05)
-
-        if total == 0:
-            self.finished.emit(0, str(self.folder))
-            return
-
-        processed = 0
-
-        # Use a bounded worker pool to utilize multiple cores while avoiding huge memory spikes.
-        max_workers = max(1, (os.cpu_count() or 1) - 1)
-        # Cap to keep decoding and UI payloads bounded.
-        max_workers = min(max_workers, self._max_thread_cap)
-        chunk_size = 64
-
-        def process_one(image_path: Path) -> dict:
-            text_path = image_path.with_suffix(".txt")
-            try:
-                text = (
-                    text_path.read_text(encoding="utf-8", errors="replace")
-                    if text_path.exists()
-                    else ""
-                )
-            except OSError:
-                text = ""
-
-            thumb_payload, icc_invalid = self._thumbnail_rgba_bytes(image_path)
-            return {
-                "image_path": str(image_path),
-                "text_path": str(text_path),
-                "text": text,
-                "thumbnail": thumb_payload,
-                "icc_invalid": icc_invalid,
-            }
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            try:
-                for chunk_start in range(0, total, chunk_size):
-                    if self._cancelled:
-                        break
-
-                    chunk = image_paths[chunk_start : chunk_start + chunk_size]
-                    for result in executor.map(process_one, chunk):
-                        if self._cancelled:
-                            break
-                        processed += 1
-
-                        if result.get("icc_invalid"):
-                            self.icc_warning.emit(result["image_path"])
-
-                        # Keep emitted payload small; thumbnail bytes are only ~96x96 RGBA.
-                        self.item_loaded.emit(
-                            {
-                                "image_path": result["image_path"],
-                                "text_path": result["text_path"],
-                                "text": result["text"],
-                                "thumbnail": result["thumbnail"],
-                            }
-                        )
-
-                        percent = int((processed / total) * 100) if total else 100
-                        self.progress.emit(processed, total, percent)
-            except Exception as exc:
-                self.failed.emit(f"Failed while processing folder: {exc}")
-                return
-
-        self.finished.emit(processed, str(self.folder))
-
-
-class IntegrityCheckWorker(QObject):
-    """Worker thread for scanning records for data integrity issues."""
-    progress = pyqtSignal(str)  # Status message with progress
-    finished = pyqtSignal(int, int, object)  # (records_checked, issues_found, fixes_to_apply)
-    failed = pyqtSignal(str)  # Error message
-
-    def __init__(self, records: list[ImageRecord], indexes: list[int], auto_fix: bool = False) -> None:
-        super().__init__()
-        self.records = records
-        self.indexes = indexes
-        self.auto_fix = bool(auto_fix)
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
-        """Scan records for integrity issues."""
-        try:
-            issues_found = 0
-            records_checked = 0
-            total = len(self.indexes)
-            fixes_to_apply: list[tuple[int, object]] = []
-
-            for ordinal, index in enumerate(self.indexes, 1):
-                if self._cancelled:
-                    break
-
-                if index < 0 or index >= len(self.records):
-                    continue
-
-                record = self.records[index]
-                if record is None:
-                    continue
-
-                try:
-                    records_checked += 1
-
-                    # Check for integrity issues using the raw file text.
-                    # detect_corrupted_annotation returns at most one issue per file
-                    # (both bug patterns are unified into a single coherent result).
-                    issues_list = check_all_patterns(record.text)
-                    if issues_list:
-                        issues_found += 1
-                        issue = issues_list[0]
-
-                        if self.auto_fix:
-                            fixes_to_apply.append((index, issue))
-                        else:
-                            if issue.issue_type == "description_with_commas":
-                                issue_desc = "Description contained commas, splitting it into fake tags"
-                            elif issue.issue_type == "description_not_at_start":
-                                issue_desc = "Description was stored at a random position instead of the beginning"
-                            else:
-                                issue_desc = "Description contained commas and was not at the beginning"
-
-                            # Tags are written one per line so the deduplicator in
-                            # write_fixup_for_image does not confuse commas inside a
-                            # tag with field separators.
-                            tags_text = "\n".join(issue.tags)
-
-                            fixup_content = (
-                                f"ISSUES:\n"
-                                f"{issue_desc}\n\n"
-                                f"TAGS:\n"
-                                f"{tags_text}\n\n"
-                                f"DESCRIPTION:\n"
-                                f"{issue.description}\n"
-                            )
-                            write_fixup_for_image(record.image_path, fixup_content)
-
-                    # Emit progress
-                    if ordinal % 25 == 0 or ordinal == total:
-                        self.progress.emit(
-                            f"Integrity check: {ordinal}/{total} | Issues: {issues_found}"
-                        )
-
-                except Exception as e:
-                    print(f"Error checking integrity for record {index}: {e}", flush=True)
-                    continue
-
-            self.finished.emit(records_checked, issues_found, fixes_to_apply)
-
-        except Exception as e:
-            self.failed.emit(f"Integrity check failed: {str(e)}")
-
-
-class LlmTaskWorker(QObject):
-    finished = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    cancelled = pyqtSignal(str)
-    progress = pyqtSignal(str)
-    item_ready = pyqtSignal(object)
-
-    def __init__(self, task: Callable[[Callable[[str], None], Callable[[object], None]], object]) -> None:
-        super().__init__()
-        self.task = task
-
-    def run(self) -> None:
-        try:
-            result = self.task(self.progress.emit, self.item_ready.emit)
-        except LlmProviderCancelled as exc:
-            self.cancelled.emit(str(exc))
-            return
-        except LlmProviderError as exc:
-            self.failed.emit(str(exc))
-            return
-        except Exception as exc:
-            self.failed.emit(f"Unexpected LLM error: {exc}")
-            return
-        self.finished.emit(result)
 
 
 class TagListWidget(QListWidget):
@@ -779,6 +142,25 @@ class TagListWidget(QListWidget):
     def dropEvent(self, event) -> None:  # type: ignore[override]
         super().dropEvent(event)
         self.tags_reordered.emit()
+
+
+class GlobalTagListWidget(QListWidget):
+    delete_requested = pyqtSignal(list)  # list[str]
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            tags = [
+                item.data(Qt.ItemDataRole.UserRole)
+                for item in self.selectedItems()
+                if item.data(Qt.ItemDataRole.UserRole)
+            ]
+            if tags:
+                self.delete_requested.emit(tags)
+            return
+        super().keyPressEvent(event)
 
 
 class WrappedTagItemDelegate(QStyledItemDelegate):
@@ -834,7 +216,136 @@ class WrappedTagItemDelegate(QStyledItemDelegate):
         return super().eventFilter(editor, event)
 
 
+@dataclass(frozen=True)
+class _ListItemBadgeSpec:
+    text: str
+    background: QColor
+    foreground: QColor
+
+
+# Item data roles used by _ImageRowDelegate.
+_ROLE_PIXMAP = Qt.ItemDataRole.UserRole          # QPixmap | None — pre-scaled thumbnail
+_ROLE_BADGES = Qt.ItemDataRole.UserRole + 1      # frozenset[str] — active badge symbols
+
+
+class _ImageRowDelegate(QStyledItemDelegate):
+    """Paints image list rows directly with QPainter — no per-row widget trees.
+
+    This replaces the previous setItemWidget approach which created ~8 QObjects
+    per row and became prohibitively expensive at large folder sizes (≥8 k images).
+    """
+
+    _BADGE_COL_W = 64
+    _LEFT_MARGIN = 4
+    _RIGHT_MARGIN = 6
+    _V_MARGIN = 3
+    _SPACING = 8
+
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__(window.list_widget)
+        self._window = window
+
+    def sizeHint(self, option: object, index: QModelIndex) -> QSize:  # type: ignore[override]
+        return QSize(0, THUMB_SIZE.height() + 10)
+
+    def paint(self, painter: QPainter, option: object, index: QModelIndex) -> None:  # type: ignore[override]
+        from PyQt6.QtWidgets import QStyleOptionViewItem  # local import avoids circular
+        opt = option  # type: ignore[assignment]
+        painter.save()
+
+        is_selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        if is_selected:
+            painter.fillRect(opt.rect, opt.palette.highlight())
+            text_color = opt.palette.highlightedText().color()
+        else:
+            painter.fillRect(opt.rect, opt.palette.base())
+            text_color = opt.palette.text().color()
+
+        x = opt.rect.left() + self._LEFT_MARGIN
+        row_h = opt.rect.height()
+
+        # Thumbnail (pre-scaled; no per-paint scaling needed).
+        pixmap: QPixmap | None = index.data(_ROLE_PIXMAP)
+        if pixmap is not None and not pixmap.isNull():
+            py = opt.rect.top() + max(0, (row_h - pixmap.height()) // 2)
+            painter.drawPixmap(x, py, pixmap)
+        x += THUMB_SIZE.width() + self._SPACING
+
+        # Badges.
+        active_badges: frozenset[str] | None = index.data(_ROLE_BADGES)
+        w = self._window
+        if active_badges:
+            # Ensure palette color cache is warm (cheap if already cached).
+            if w._cached_danger_color is None:
+                w._badge_specs_from_active_set(frozenset())
+            danger_col: QColor = w._cached_danger_color  # type: ignore[assignment]
+            info_col: QColor = w._cached_info_color      # type: ignore[assignment]
+            success_col: QColor = w._cached_success_color  # type: ignore[assignment]
+            slot_count = len(w._IMAGE_ROW_BADGE_SLOT_ORDER)
+            slot_h = row_h / slot_count
+            for i, symbol in enumerate(w._IMAGE_ROW_BADGE_SLOT_ORDER):
+                if symbol in active_badges:
+                    if symbol == "\u2696\ufe0f":
+                        color = danger_col
+                    elif symbol == "\u2705":
+                        color = success_col
+                    else:
+                        color = info_col
+                    badge_rect = QRect(
+                        x,
+                        opt.rect.top() + round(i * slot_h),
+                        self._BADGE_COL_W,
+                        round(slot_h),
+                    )
+                    painter.setPen(color)
+                    painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, symbol)
+        x += self._BADGE_COL_W + self._SPACING
+
+        # Title text.
+        title = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        text_rect = QRect(
+            x,
+            opt.rect.top() + self._V_MARGIN,
+            opt.rect.right() - self._RIGHT_MARGIN - x,
+            row_h - 2 * self._V_MARGIN,
+        )
+        painter.setPen(text_color)
+        painter.drawText(
+            text_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap,
+            title,
+        )
+
+        painter.restore()
+
+    def helpEvent(  # type: ignore[override]
+        self,
+        event: object,
+        view: object,
+        option: object,
+        index: QModelIndex,
+    ) -> bool:
+        """Lazily build the item tooltip on first hover so load time is unaffected."""
+        from PyQt6.QtCore import QEvent as _QEvent
+        from PyQt6.QtWidgets import QAbstractItemView as _QAbstractItemView
+        ev = event  # type: ignore[assignment]
+        lw = view   # type: ignore[assignment]
+        if ev.type() == _QEvent.Type.ToolTip:
+            item = lw.item(index.row())
+            if item is not None and not item.toolTip():
+                row = index.row()
+                window = self._window
+                if 0 <= row < len(window.records):
+                    record = window.records[row]
+                    active: frozenset[str] = index.data(_ROLE_BADGES) or frozenset()
+                    badge_specs = window._badge_specs_from_active_set(active)
+                    item.setToolTip(window._build_list_item_tooltip(record, badge_specs=badge_specs))
+        return super().helpEvent(ev, lw, option, index)  # type: ignore[arg-type]
+
+
 class MainWindow(QMainWindow):
+    _IMAGE_ROW_BADGE_SLOT_ORDER = ("⚖️", "✨", "🔍", "✅")
+
     def __init__(self) -> None:
         super().__init__()
         self.resize(1400, 860)
@@ -846,8 +357,6 @@ class MainWindow(QMainWindow):
         self._llm_provider = DEFAULT_VISION_PROVIDER
         self._llm_thread: QThread | None = None
         self._llm_worker: LlmTaskWorker | None = None
-        self._integrity_check_thread: QThread | None = None
-        self._integrity_check_worker: IntegrityCheckWorker | None = None
         self.known_tags: set[str] = set()
         self.tag_counts: Counter[str] = Counter()
         self._updating_tag_list = False
@@ -855,6 +364,7 @@ class MainWindow(QMainWindow):
         self._generate_batch_total = 0
         self._generate_batch_processed = 0
         self._generate_batch_updated = 0
+        self._generate_batch_vision_updated = 0
         self._generate_batch_new_annotations = 0
         self._generate_batch_started_at: float | None = None
         self._generate_batch_retry_images = 0
@@ -866,16 +376,12 @@ class MainWindow(QMainWindow):
         self._validate_batch_started_at: float | None = None
         self._validate_batch_retry_images = 0
         self._validate_batch_llm_disobeyed = 0
+        self._validate_pending_indices: set[int] = set()
         self._ai_find_batch_total = 0
         self._ai_find_batch_processed = 0
         self._ai_find_batch_matched = 0
         self._ai_find_batch_started_at: float | None = None
         self._ai_find_batch_retry_images = 0
-        self._integrity_check_batch_total = 0
-        self._integrity_check_batch_processed = 0
-        self._integrity_check_batch_issues = 0
-        self._integrity_check_batch_fixed = 0
-        self._integrity_check_batch_started_at: float | None = None
         self._llm_action_name: str | None = None
         self._llm_cancel: LlmRequestCancellation | None = None
         self._llm_threads_auto_mode = False
@@ -884,6 +390,10 @@ class MainWindow(QMainWindow):
         self._right_splitter_initialized = False
         self.prompt_editors: dict[str, QTextEdit] = {}
         self.prompt_status_labels: dict[str, QLabel] = {}
+        self.prompt_role_inputs: dict[str, QLineEdit] = {}
+        self._vision_updating = False
+        self._vision_loaded_description = ""
+        self._vision_loaded_reasoning = ""
 
         self.open_action: QAction | None = None
         self.refresh_action: QAction | None = None
@@ -902,6 +412,26 @@ class MainWindow(QMainWindow):
 
         # Image reload detection for external editor changes
         self._image_reload_helper = ImageReloadHelper(self, self._on_image_reload)
+        self._prev_selected_rows: set[int] = set()
+
+        # Cached full-resolution pixmap for the currently displayed image.
+        # Avoids re-reading from disk on resize events and rapid re-selections.
+        self._cached_pixmap: QPixmap | None = None
+        self._cached_pixmap_path: Path | None = None
+
+        # Cached palette-derived badge colors; invalidated on PaletteChange.
+        self._cached_danger_color: QColor | None = None
+        self._cached_danger_fg_color: QColor | None = None
+        self._cached_info_color: QColor | None = None
+        self._cached_info_fg_color: QColor | None = None
+        self._cached_success_color: QColor | None = None
+        self._cached_success_fg_color: QColor | None = None
+
+        # Debounce timer for resize events to avoid re-scaling on every pixel.
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(60)  # ms
+        self._resize_timer.timeout.connect(self._on_resize_timer)
 
         self._cfg = _config.load()
 
@@ -920,12 +450,12 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
 
         self.list_widget = QListWidget(self)
-        self.list_widget.setIconSize(THUMB_SIZE)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_widget.currentRowChanged.connect(self.on_selection_changed)
+        self.list_widget.setItemDelegate(_ImageRowDelegate(self))
 
         self.filter_input = QLineEdit(self)
-        self.filter_input.setPlaceholderText("Filter (fixup, \"tag\", 'text', &, |, parentheses)")
+        self.filter_input.setPlaceholderText("Filter (fixup, vision, \"tag\", 'text', &, |, parentheses)")
         self.filter_input.textChanged.connect(self._apply_image_filter)
 
         self.filter_help_button = QPushButton("?", self)
@@ -966,6 +496,18 @@ class MainWindow(QMainWindow):
         self.jump_last_fixup_action.triggered.connect(self._jump_to_last_fixup)
         self.addAction(self.jump_last_fixup_action)
 
+        self.select_prev_image_action = QAction("Select Previous Image", self)
+        self.select_prev_image_action.setShortcut(platform_key_sequence("Alt+Up", "Alt+Up"))
+        self.select_prev_image_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.select_prev_image_action.triggered.connect(lambda: self._move_image_selection(-1))
+        self.addAction(self.select_prev_image_action)
+
+        self.select_next_image_action = QAction("Select Next Image", self)
+        self.select_next_image_action.setShortcut(platform_key_sequence("Alt+Down", "Alt+Down"))
+        self.select_next_image_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.select_next_image_action.triggered.connect(lambda: self._move_image_selection(1))
+        self.addAction(self.select_next_image_action)
+
         self.center_panel = QWidget(self)
         center_layout = QVBoxLayout(self.center_panel)
         center_layout.setContentsMargins(0, 0, 0, 0)
@@ -988,9 +530,12 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Top-right panel tabs: Tags + Vision
+        self.tag_tabs = QTabWidget(self)
+
         tags_panel = QWidget(self)
         tags_layout = QVBoxLayout(tags_panel)
-        tags_layout.setContentsMargins(0, 0, 0, 0)
+        tags_layout.setContentsMargins(6, 6, 6, 6)
         tags_layout.setSpacing(6)
 
         self.tag_input = QLineEdit(self)
@@ -1020,12 +565,43 @@ class MainWindow(QMainWindow):
         self.tag_list.tags_reordered.connect(self._on_tags_reordered)
 
         self.remove_tag_action = QAction("Remove Selected Tag", self)
-        self.remove_tag_action.setShortcut("Delete")
+        self.remove_tag_action.setShortcuts([QKeySequence("Delete"), QKeySequence("Backspace")])
+        self.remove_tag_action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         self.remove_tag_action.triggered.connect(self._remove_selected_tags)
         self.tag_list.addAction(self.remove_tag_action)
 
         tags_layout.addWidget(self.tag_input, stretch=0)
         tags_layout.addWidget(self.tag_list, stretch=1)
+        self.tag_tabs.addTab(tags_panel, "Tags")
+
+        vision_panel = QWidget(self)
+        vision_layout = QVBoxLayout(vision_panel)
+        vision_layout.setContentsMargins(6, 6, 6, 6)
+        vision_layout.setSpacing(6)
+
+        vision_layout.addWidget(QLabel("Description", self))
+        self.vision_description = QTextEdit(self)
+        self.vision_description.setAcceptRichText(False)
+        self.vision_description.textChanged.connect(self._update_vision_dirty_state)
+        vision_layout.addWidget(self.vision_description, stretch=1)
+
+        vision_layout.addWidget(QLabel("CoT", self))
+        self.vision_reasoning = QTextEdit(self)
+        self.vision_reasoning.setAcceptRichText(False)
+        self.vision_reasoning.textChanged.connect(self._update_vision_dirty_state)
+        vision_layout.addWidget(self.vision_reasoning, stretch=1)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        self.vision_save_button = QPushButton("Save", self)
+        self.vision_save_button.setEnabled(False)
+        self.vision_save_button.clicked.connect(self._save_vision_for_current_image)
+        save_row.addWidget(self.vision_save_button)
+        vision_layout.addLayout(save_row)
+
+        self.tag_tabs.addTab(vision_panel, "Vision")
+        # No image selected on startup; keep vision inputs disabled until a record is active.
+        self._clear_vision_fields()
 
         controls_panel = QWidget(self)
         controls_layout = QVBoxLayout(controls_panel)
@@ -1078,6 +654,12 @@ class MainWindow(QMainWindow):
         self.generate_description_checkbox = QCheckBox("Description", self)
         self.generate_description_checkbox.setChecked(True)
         self.generate_description_checkbox.checkStateChanged.connect(lambda _state: self._update_llm_controls())
+        self.generate_vision_checkbox = QCheckBox("Vision", self)
+        self.generate_vision_checkbox.setChecked(False)
+        self.generate_vision_checkbox.checkStateChanged.connect(lambda _state: self._update_llm_controls())
+        self.generate_refine_checkbox = QCheckBox("Refine", self)
+        self.generate_refine_checkbox.setChecked(False)
+        self.generate_refine_checkbox.checkStateChanged.connect(lambda _state: self._update_llm_controls())
 
         server_settings_frame = create_server_settings_frame(
             parent=self,
@@ -1087,6 +669,8 @@ class MainWindow(QMainWindow):
             use_button=self.llm_use_button,
             include_tags_checkbox=self.generate_tags_checkbox,
             include_description_checkbox=self.generate_description_checkbox,
+            include_vision_checkbox=self.generate_vision_checkbox,
+            include_refine_checkbox=self.generate_refine_checkbox,
             timeout_input=self.llm_timeout_input,
             retry_input=self.llm_retry_input,
             max_resolution_input=self.llm_max_resolution_input,
@@ -1115,19 +699,6 @@ class MainWindow(QMainWindow):
         ai_find_row.addWidget(self.ai_find_input, stretch=1)
         ai_find_row.addWidget(self.ai_find_button)
 
-        integrity_controls_row = QHBoxLayout()
-        integrity_controls_row.addStretch(1)
-        self.validate_integrity_button = QPushButton("Validate Integrity", self)
-        self.validate_integrity_button.clicked.connect(self.check_integrity_with_llm)
-        self.integrity_auto_fix_checkbox = QCheckBox("Auto fix", self)
-        self.integrity_auto_fix_checkbox.setChecked(bool(self._cfg.get("integrity_check_auto_fix", False)))
-        self.integrity_auto_fix_checkbox.stateChanged.connect(self._on_integrity_auto_fix_changed)
-        integrity_controls_enabled = bool(self._cfg.get("integrity_check_enabled", False))
-        self.validate_integrity_button.setVisible(integrity_controls_enabled)
-        self.integrity_auto_fix_checkbox.setVisible(integrity_controls_enabled)
-        integrity_controls_row.addWidget(self.validate_integrity_button)
-        integrity_controls_row.addWidget(self.integrity_auto_fix_checkbox)
-
         self.stop_loading_button = QPushButton("Stop loading", self)
         self.stop_loading_button.clicked.connect(self._request_stop_directory_loading)
         self.stop_loading_button.setVisible(False)
@@ -1136,20 +707,21 @@ class MainWindow(QMainWindow):
         autotag_layout.addLayout(gen_row)
         autotag_layout.addLayout(buttons_row)
         autotag_layout.addLayout(ai_find_row)
-        autotag_layout.addLayout(integrity_controls_row)
         autotag_layout.addWidget(self.stop_loading_button)
         autotag_layout.addStretch(1)
 
         self.controls_tabs.addTab(autotag_tab, "AutoTag")
         self._add_prompt_tab("description", "Description")
         self._add_prompt_tab("tagging", "Tagging")
+        self._add_prompt_tab("vision", "Vision")
+        self._add_prompt_tab("refine", "Refine")
         self._add_prompt_tab("validation", "Validation")
         self._add_prompt_tab("search", "AI Search")
         self._add_known_tags_tab()
         controls_layout.addWidget(self.controls_tabs)
 
         self.right_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        self.right_splitter.addWidget(tags_panel)
+        self.right_splitter.addWidget(self.tag_tabs)
         self.right_splitter.addWidget(controls_panel)
         self.right_splitter.setChildrenCollapsible(False)
         self.right_splitter.setStretchFactor(0, 2)
@@ -1185,6 +757,20 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
+        role_row = QHBoxLayout()
+        role_label = QLabel("Role:", self)
+        role_input = QLineEdit(self)
+        role_input.setPlaceholderText('e.g. "You are an ornithology expert."')
+        saved_role = self._cfg.get("agent_roles", {}).get(kind, "")
+        role_input.setText(saved_role)
+        self.prompt_role_inputs[kind] = role_input
+        set_role_button = QPushButton("Set", self)
+        set_role_button.setMaximumWidth(50)
+        set_role_button.clicked.connect(lambda _checked=False, prompt_kind=kind: self._set_agent_role(prompt_kind))
+        role_row.addWidget(role_label)
+        role_row.addWidget(role_input, stretch=1)
+        role_row.addWidget(set_role_button)
+
         editor = QTextEdit(self)
         editor.setAcceptRichText(False)
         editor.setPlainText(load_prompt_for_kind(kind))
@@ -1201,11 +787,15 @@ class MainWindow(QMainWindow):
         save_button.clicked.connect(lambda _checked=False, prompt_kind=kind: self._save_prompt_to_file(prompt_kind))
         reset_button = QPushButton("Reset", self)
         reset_button.clicked.connect(lambda _checked=False, prompt_kind=kind: self._reset_prompt_to_default(prompt_kind))
+        test_button = QPushButton("Test", self)
+        test_button.clicked.connect(lambda _checked=False, prompt_kind=kind: self._test_prompt(prompt_kind))
         buttons_row.addWidget(apply_button)
         buttons_row.addWidget(save_button)
         buttons_row.addWidget(reset_button)
+        buttons_row.addWidget(test_button)
         buttons_row.addStretch(1)
 
+        layout.addLayout(role_row)
         layout.addWidget(editor, stretch=1)
         layout.addWidget(status_label, stretch=0)
         layout.addLayout(buttons_row)
@@ -1219,9 +809,16 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        self.known_tags_list = QListWidget(self)
-        self.known_tags_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.known_tags_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.known_tags_filter = QLineEdit(self)
+        self.known_tags_filter.setPlaceholderText("Filter tags…")
+        self.known_tags_filter.setClearButtonEnabled(True)
+        self.known_tags_filter.textChanged.connect(self._refresh_known_tags_list)
+        layout.addWidget(self.known_tags_filter)
+
+        self.known_tags_list = GlobalTagListWidget(self)
+        self.known_tags_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.known_tags_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.known_tags_list.delete_requested.connect(self._delete_global_tag)
 
         layout.addWidget(self.known_tags_list, stretch=1)
 
@@ -1264,6 +861,10 @@ class MainWindow(QMainWindow):
             return "Description"
         if kind == "tagging":
             return "Tagging"
+        if kind == "vision":
+            return "Vision"
+        if kind == "refine":
+            return "Refine"
         if kind == "validation":
             return "Validation"
         if kind == "search":
@@ -1275,6 +876,116 @@ class MainWindow(QMainWindow):
         if editor is None:
             raise LlmProviderError(f"Prompt editor for {kind} is not available.")
         return editor.toPlainText().strip()
+
+    def _test_prompt(self, kind: str) -> None:
+        if self._llm_thread is not None:
+            QMessageBox.information(self, "LLM busy", "Wait for the current LLM task to finish before testing a prompt.")
+            return
+
+        session = self._active_provider_session()
+        if session is None:
+            QMessageBox.warning(self, "No model selected", f"Connect to {self._llm_provider.display_name} and choose a model first.")
+            return
+
+        if self.current_index < 0 or self.current_index >= len(self.records):
+            QMessageBox.information(self, "No image selected", "Select an image before testing the prompt.")
+            return
+
+        record = self.records[self.current_index]
+
+        try:
+            editor_text = self._prompt_editor_text(kind)
+        except LlmProviderError as exc:
+            QMessageBox.warning(self, "Prompt error", str(exc))
+            return
+
+        if kind == "vision":
+            tags_lines = self._parse_annotations_for_tag_list(record.text)
+            tags_text = "\n".join(tags_lines).strip()
+            prompt = editor_text.replace("{tags}", tags_text)
+        elif kind == "validation":
+            prompt = editor_text.replace("{tags}", format_annotations_for_validation(record.text))
+        elif kind == "search":
+            query = " ".join(self.ai_find_input.text().split())
+            if not query:
+                QMessageBox.information(self, "Missing search text", "Enter text in the AI Find box to test the search prompt.")
+                return
+            prompt = editor_text.replace("{query}", query)
+        elif kind == "refine":
+            vision_data = read_sidecar_data(record.image_path)
+            if vision_data.description:
+                parts.append(f'description: "{vision_data.description}"')
+            if vision_data.reasoning:
+                parts.append(f'reasoning: "{vision_data.reasoning}"')
+            vision_text = "\n".join(parts) if parts else "(no vision data available for this image)"
+            prompt = editor_text.replace("{vision_data}", vision_text)
+        else:
+            prompt = editor_text
+
+        try:
+            self._apply_query_downscale_setting()
+        except LlmProviderError:
+            return
+
+        timeout = self._llm_timeout_seconds()
+        image_path = record.image_path
+        title = self._prompt_title(kind)
+        cancel_token = LlmRequestCancellation()
+
+        def test_task(report_progress: Callable[[str], None]) -> str:
+            return session.generate(
+                image_path,
+                prompt,
+                timeout=timeout,
+                cancellation=cancel_token,
+            )
+
+        test_thread = QThread(self)
+        test_worker = RegenerateWorker(test_task)
+        test_worker.moveToThread(test_thread)
+        test_thread.started.connect(test_worker.run)
+        test_worker.finished.connect(test_thread.quit)
+        test_worker.failed.connect(test_thread.quit)
+        test_worker.cancelled.connect(test_thread.quit)
+
+        def _on_test_finished(result: object) -> None:
+            test_thread.deleteLater()
+            test_worker.deleteLater()
+            from imagetagger.ui.llm_test_result_dialog import LlmTestResultDialog
+            display_text = (
+                "=== PROMPT ===\n"
+                + prompt
+                + "\n\n=== RESPONSE ===\n"
+                + str(result)
+            )
+            dlg = LlmTestResultDialog(f"Test — {title}", display_text, self)
+            dlg.exec()
+
+        def _on_test_failed(error: str) -> None:
+            test_thread.deleteLater()
+            test_worker.deleteLater()
+            QMessageBox.warning(self, f"Test failed — {title}", error)
+
+        test_worker.finished.connect(_on_test_finished)
+        test_worker.failed.connect(_on_test_failed)
+        test_worker.cancelled.connect(_on_test_failed)
+
+        self.statusBar().showMessage(f"Testing {title} prompt with {self._llm_provider.display_name}…")
+        test_thread.start()
+
+    def _set_agent_role(self, kind: str) -> None:
+        role_input = self.prompt_role_inputs.get(kind)
+        role = role_input.text().strip() if role_input is not None else ""
+        if "agent_roles" not in self._cfg or not isinstance(self._cfg["agent_roles"], dict):
+            self._cfg["agent_roles"] = {}
+        if role:
+            self._cfg["agent_roles"][kind] = role
+        else:
+            self._cfg["agent_roles"].pop(kind, None)
+        _config.save(self._cfg)
+        self.statusBar().showMessage(
+            f"Role for {self._prompt_title(kind)} {'set' if role else 'cleared'}"
+        )
 
     def _apply_prompt_override(self, kind: str) -> None:
         try:
@@ -1614,7 +1325,12 @@ class MainWindow(QMainWindow):
         active = connected and self._llm_thread is None
         self.generate_button.setEnabled(
             active
-            and (self.generate_tags_checkbox.isChecked() or self.generate_description_checkbox.isChecked())
+            and (
+                self.generate_tags_checkbox.isChecked()
+                or self.generate_description_checkbox.isChecked()
+                or self.generate_vision_checkbox.isChecked()
+                or self.generate_refine_checkbox.isChecked()
+            )
         )
         self.validate_button.setEnabled(active)
         self.ai_find_input.setEnabled(active)
@@ -1625,6 +1341,84 @@ class MainWindow(QMainWindow):
         if 0 <= self.current_index < len(self.records):
             return self.records[self.current_index]
         return None
+
+    def _clear_vision_fields(self) -> None:
+        self._vision_updating = True
+        try:
+            if hasattr(self, "vision_description"):
+                self.vision_description.setPlainText("")
+            if hasattr(self, "vision_reasoning"):
+                self.vision_reasoning.setPlainText("")
+        finally:
+            self._vision_updating = False
+        self._vision_loaded_description = ""
+        self._vision_loaded_reasoning = ""
+        if hasattr(self, "vision_save_button"):
+            self.vision_save_button.setEnabled(False)
+        if hasattr(self, "vision_description"):
+            self.vision_description.setEnabled(False)
+        if hasattr(self, "vision_reasoning"):
+            self.vision_reasoning.setEnabled(False)
+        if hasattr(self, "image_label"):
+            self.image_label.setToolTip("")
+
+    def _load_vision_for_current_image(self) -> None:
+        record = self._current_record()
+        if record is None:
+            self._clear_vision_fields()
+            return
+
+        vision_data = read_sidecar_data(record.image_path)
+
+        self._vision_updating = True
+        try:
+            self.vision_description.setPlainText(vision_data.description)
+            self.vision_reasoning.setPlainText(vision_data.reasoning)
+        finally:
+            self._vision_updating = False
+
+        self._vision_loaded_description = vision_data.description
+        self._vision_loaded_reasoning = vision_data.reasoning
+        self.vision_description.setEnabled(True)
+        self.vision_reasoning.setEnabled(True)
+        self._update_vision_dirty_state()
+        self._update_image_label_tooltip(vision_data)
+
+    def _update_vision_dirty_state(self) -> None:
+        if self._vision_updating:
+            return
+        record = self._current_record()
+        if record is None:
+            self.vision_save_button.setEnabled(False)
+            return
+        current_description = self.vision_description.toPlainText()
+        current_reasoning = self.vision_reasoning.toPlainText()
+        dirty = (
+            current_description != self._vision_loaded_description
+            or current_reasoning != self._vision_loaded_reasoning
+        )
+        self.vision_save_button.setEnabled(dirty)
+
+    def _save_vision_for_current_image(self) -> None:
+        record = self._current_record()
+        if record is None:
+            return
+
+        vision_data = read_sidecar_data(record.image_path)
+        vision_data.description = self.vision_description.toPlainText()
+        vision_data.reasoning = self.vision_reasoning.toPlainText()
+        try:
+            write_sidecar_data(record.image_path, vision_data)
+        except Exception as exc:
+            path = get_sidecar_json_path(record.image_path)
+            QMessageBox.warning(self, "Save failed", f"Could not write {path.name}:\n\n{exc}")
+            return
+
+        self._vision_loaded_description = vision_data.description
+        self._vision_loaded_reasoning = vision_data.reasoning
+        self._update_vision_dirty_state()
+        path = get_sidecar_json_path(record.image_path)
+        self.statusBar().showMessage(f"Saved vision metadata: {path.name}")
 
     def _selected_record_indexes(self) -> list[int]:
         indexes = sorted(
@@ -1679,6 +1473,7 @@ class MainWindow(QMainWindow):
             "Filter rules:\n\n"
             "- fixup: show images with fixup files\n"
             "- untagged: show images with no annotation file\n"
+            "- vision: show images with a sidecar .json (vision data)\n"
             "- resolution <, >, <=, >=: compare resolution in megapixels\n"
             "- \"tag\": match an exact tag\n"
             "- 'text': match free text inside annotation content\n"
@@ -1699,18 +1494,22 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Filter rules", rules_text)
 
     def _get_image_resolution_mpx(self, record: ImageRecord) -> float | None:
-        """Compute image resolution in megapixels."""
+        """Return image resolution in megapixels, caching the result on the record."""
+        if record._resolution_mpx is not None:
+            return record._resolution_mpx
         try:
             with Image.open(record.image_path) as image:
                 width, height = image.size
-                return (width * height) / 1_000_000.0
+                record._resolution_mpx = (width * height) / 1_000_000.0
+                return record._resolution_mpx
         except Exception:
             return None
 
     def _build_filter_runtime(self, tag_cache: dict[Path, set[str]] | None = None) -> _FilterRuntime:
         named_filters: dict[str, Callable[[ImageRecord], bool]] = {
-            "fixup": lambda record: existing_fixup_path_for_image(record.image_path) is not None,
+            "fixup": lambda record: record.has_pending_fixup,
             "untagged": lambda record: not record.text_path.exists(),
+            "vision": lambda record: get_sidecar_json_path(record.image_path).exists(),
         }
         return _FilterRuntime(
             named_filters=named_filters,
@@ -1747,6 +1546,8 @@ class MainWindow(QMainWindow):
         return -1
 
     def _visible_record_count(self) -> int:
+        if not self.filter_input.text().strip():
+            return len(self.records)
         visible = 0
         for row in range(self.list_widget.count()):
             item = self.list_widget.item(row)
@@ -1757,6 +1558,8 @@ class MainWindow(QMainWindow):
     def _visible_position_for_row(self, row: int) -> int:
         if row < 0:
             return -1
+        if not self.filter_input.text().strip():
+            return row + 1
 
         position = 0
         for i in range(self.list_widget.count()):
@@ -1827,24 +1630,35 @@ class MainWindow(QMainWindow):
 
     def _on_fixup_state_changed(self, image_path: Path | None = None) -> None:
         if image_path is None:
-            self._refresh_all_list_item_previews()
+            for record in self.records:
+                record._sidecar_has_pending_fixup = None
+            # Defer the bulk visual refresh to the next event-loop iteration so
+            # _apply_image_filter and _update_fixup_button_state run first and
+            # the GUI stays responsive during large batch operations.
+            QTimer.singleShot(0, self._refresh_all_list_item_previews)
         else:
             for index, record in enumerate(self.records):
                 if record.image_path == image_path:
+                    record._sidecar_has_pending_fixup = None
                     self._update_list_item_preview(index)
                     break
         self._apply_image_filter()
         self._update_fixup_button_state()
+        # Refresh the image preview tooltip if the changed image is currently selected.
+        current = self._current_record()
+        if current is not None and (image_path is None or current.image_path == image_path):
+            self._update_image_label_tooltip()
 
     def _update_fixup_button_state(self) -> None:
         record = self._current_record()
-        enabled = record is not None and existing_fixup_path_for_image(record.image_path) is not None
+        enabled = record is not None and bool(self._list_item_badge_specs(record))
         if enabled:
             item = self.list_widget.item(self.current_index)
             if item is None or item.isHidden():
                 enabled = False
         if self._llm_thread is not None:
-            enabled = False
+            if self._llm_action_name != "Validate" or self.current_index in self._validate_pending_indices:
+                enabled = False
         self.fixup_button.setEnabled(enabled)
 
     def _find_adjacent_fixup_index(self, start_index: int, direction: int) -> int | None:
@@ -1858,25 +1672,31 @@ class MainWindow(QMainWindow):
                 index += direction
                 continue
 
+            if index in self._validate_pending_indices:
+                index += direction
+                continue
+
             record = self.records[index]
-            if existing_fixup_path_for_image(record.image_path) is not None:
+            if record.has_pending_fixup:
                 return index
 
             index += direction
 
         return None
 
-    def _find_fixup_index(self, reverse: bool = False) -> int | None:
+    def _find_fixup_index(self, reverse: bool) -> int | None:
         if not self.records:
             return None
 
         indices = range(len(self.records) - 1, -1, -1) if reverse else range(len(self.records))
         for index in indices:
+            if index in self._validate_pending_indices:
+                continue
             item = self.list_widget.item(index)
             if item is not None and item.isHidden():
                 continue
             record = self.records[index]
-            if existing_fixup_path_for_image(record.image_path) is not None:
+            if record.has_pending_fixup:
                 return index
         return None
 
@@ -1901,6 +1721,11 @@ class MainWindow(QMainWindow):
         if not self.records:
             return False
 
+        focus_tag_list = (
+            self.tag_list.hasFocus()
+            and len(self.tag_list.selectedItems()) > 0
+        )
+
         if 0 <= self.current_index < len(self.records):
             index = self.current_index + direction
         else:
@@ -1910,6 +1735,9 @@ class MainWindow(QMainWindow):
             item = self.list_widget.item(index)
             if item is not None and not item.isHidden():
                 self.list_widget.setCurrentRow(index)
+                if focus_tag_list and self.tag_list.count() > 0:
+                    self.tag_list.setCurrentRow(0)
+                    self.tag_list.setFocus()
                 return True
             index += direction
 
@@ -1970,7 +1798,7 @@ class MainWindow(QMainWindow):
     def _delete_image_and_related_files(self, image_path: Path, *, confirm: bool = True) -> tuple[bool, bool]:
         record_index = self._record_index_for_image_path(image_path)
         if record_index < 0:
-            return (False, any(existing_fixup_path_for_image(item.image_path) is not None for item in self.records))
+            return (False, any(item.has_pending_fixup for item in self.records))
 
         record = self.records[record_index]
         if confirm and self._confirm_on_delete_enabled():
@@ -1980,13 +1808,13 @@ class MainWindow(QMainWindow):
                 (
                     f"Delete this image and related files?\n\n"
                     f"Image: {record.image_path.name}\n"
-                    f"Also deletes: {record.text_path.name} and matching .fixup files"
+                    f"Also deletes: {record.text_path.name} and sidecar .json"
                 ),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
-                return (False, any(existing_fixup_path_for_image(item.image_path) is not None for item in self.records))
+                return (False, any(item.has_pending_fixup for item in self.records))
 
         errors: list[str] = []
         try:
@@ -1999,7 +1827,7 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             errors.append(f"{record.text_path.name}: {exc}")
 
-        clear_fixup_files_for_image(record.image_path)
+        delete_sidecar_for_image(record.image_path)
 
         if errors:
             QMessageBox.warning(
@@ -2007,7 +1835,7 @@ class MainWindow(QMainWindow):
                 "Delete failed",
                 "Could not delete one or more files:\n\n" + "\n".join(errors),
             )
-            return (False, any(existing_fixup_path_for_image(item.image_path) is not None for item in self.records))
+            return (False, any(item.has_pending_fixup for item in self.records))
 
         was_current = self.current_index == record_index
         self.records.pop(record_index)
@@ -2025,6 +1853,7 @@ class MainWindow(QMainWindow):
             self.image_label.setText("No image selected")
             self.tag_input.clear()
             self.tag_list.clear()
+            self._clear_vision_fields()
             self._update_fixup_button_state()
             self.statusBar().showMessage("Deleted file; no images remain")
             return (True, False)
@@ -2035,7 +1864,7 @@ class MainWindow(QMainWindow):
         elif self.current_index > record_index:
             self.current_index -= 1
 
-        has_fixups_remaining = any(existing_fixup_path_for_image(item.image_path) is not None for item in self.records)
+        has_fixups_remaining = any(item.has_pending_fixup for item in self.records)
         self.statusBar().showMessage(f"Deleted {record.image_path.name}")
         return (True, has_fixups_remaining)
 
@@ -2070,6 +1899,11 @@ class MainWindow(QMainWindow):
         pixmap = QPixmap(str(image_path))
         if pixmap.isNull():
             return
+
+        # Invalidate the pixmap cache so _show_image re-reads the updated file.
+        if self._cached_pixmap_path == image_path:
+            self._cached_pixmap = None
+            self._cached_pixmap_path = None
 
         self._show_image(image_path)
 
@@ -2238,7 +2072,7 @@ class MainWindow(QMainWindow):
 
         initial_fixup_record_indices = [
             i for i, item in enumerate(self.records)
-            if existing_fixup_path_for_image(item.image_path) is not None
+            if item.has_pending_fixup
         ]
         initial_fixup_total = len(initial_fixup_record_indices)
         if initial_fixup_total <= 0:
@@ -2389,7 +2223,7 @@ class MainWindow(QMainWindow):
                 # Deletion from merge dialog can change list indices while the dialog is open.
                 # Recompute target from current state instead of using stale pre-dialog indices.
                 current_record = self._current_record()
-                if current_record is not None and existing_fixup_path_for_image(current_record.image_path) is not None:
+                if current_record is not None and current_record.has_pending_fixup:
                     continue
 
                 target = self._find_adjacent_fixup_index(self.current_index, 1)
@@ -2525,8 +2359,8 @@ class MainWindow(QMainWindow):
         self._update_window_title(folder)
         self._clear_loaded_directory_data(reset_root=False)
 
-        # Tag completions depend on known tags, which we compute after load settles.
-        self._refresh_tag_completions()
+        # _clear_loaded_directory_data already calls _refresh_tag_completions() on
+        # the now-empty known_tags — no need to call it again here.
 
         self.statusBar().showMessage(f"Loading {total} images...")
         self._loader_worker.allow_processing()
@@ -2556,13 +2390,37 @@ class MainWindow(QMainWindow):
             f"Files:\n- {first}\n- {second}",
         )
 
-    def _add_list_item(self, record: ImageRecord, thumbnail: QImage | None = None) -> None:
-        title = self._build_list_item_title(record)
+    def _add_list_item(
+        self,
+        record: ImageRecord,
+        thumbnail: QImage | None = None,
+        active_badges: frozenset[str] | None = None,
+        is_visible: bool | None = None,
+    ) -> None:
+        if active_badges is None:
+            badge_specs = self._list_item_badge_specs(record)
+            active_badges = frozenset(s.text for s in badge_specs)
 
-        item = QListWidgetItem(title)
-        item.setToolTip(str(record.image_path))
-        item.setIcon(self._build_list_item_icon(record, thumbnail))
-        item.setHidden(not self._record_matches_filter(record))
+        # Pre-scale thumbnail once so the delegate draws it without per-paint work.
+        pixmap: QPixmap | None = None
+        if thumbnail is not None and not thumbnail.isNull():
+            raw = QPixmap.fromImage(thumbnail)
+            if not raw.isNull():
+                pixmap = raw.scaled(
+                    THUMB_SIZE,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+
+        item = QListWidgetItem()
+        item.setData(_ROLE_PIXMAP, pixmap)
+        item.setData(_ROLE_BADGES, active_badges)
+        item.setData(Qt.ItemDataRole.DisplayRole, self._build_list_item_title(record))
+        # Tooltip is built lazily on first hover by _ImageRowDelegate.helpEvent.
+        item.setSizeHint(QSize(0, THUMB_SIZE.height() + 10))
+        # Use pre-computed visibility when provided (avoids re-parsing the filter per item).
+        visible = is_visible if is_visible is not None else self._record_matches_filter(record)
+        item.setHidden(not visible)
         self.list_widget.addItem(item)
 
     def _set_loading_state(self, loading: bool) -> None:
@@ -2603,6 +2461,7 @@ class MainWindow(QMainWindow):
         self.image_label.setText("No image selected")
         self.tag_input.clear()
         self.tag_list.clear()
+        self._clear_vision_fields()
         self.current_index = -1
         self._set_watched_image(None)
         if reset_root:
@@ -2643,40 +2502,96 @@ class MainWindow(QMainWindow):
         if self._directory_load_cancel_requested:
             return
 
-        data = payload if isinstance(payload, dict) else {}
-        image_path_str = str(data.get("image_path", "")).strip()
-        text_path_str = str(data.get("text_path", "")).strip()
-        text = str(data.get("text", ""))
-        thumb_payload = data.get("thumbnail")
-        thumb_image: QImage | None = None
-        if isinstance(thumb_payload, dict):
-            try:
-                b = thumb_payload.get("bytes")
-                width = int(thumb_payload.get("width", 0))
-                height = int(thumb_payload.get("height", 0))
-                bytes_per_line = int(thumb_payload.get("bytes_per_line", width * 4))
-                if b is not None and width > 0 and height > 0 and bytes_per_line > 0:
-                    qimage = QImage(
-                        b,
-                        width,
-                        height,
-                        bytes_per_line,
-                        QImage.Format.Format_RGBA8888,
-                    )
-                    # Detach from the underlying bytes buffer to avoid lifetime issues.
-                    thumb_image = qimage.copy()
-            except Exception:
-                thumb_image = None
-
-        if not image_path_str or not text_path_str:
+        # payload is a list[dict] batch emitted per chunk from FolderLoadWorker.
+        items = payload if isinstance(payload, list) else []
+        if not items:
             return
 
-        image_path = Path(image_path_str)
-        text_path = Path(text_path_str)
+        # Parse the filter expression once per batch instead of once per item.
+        expression = self.filter_input.text().strip()
+        batch_parsed: _FilterNode | None = None
+        batch_runtime: _FilterRuntime | None = None
+        if expression:
+            try:
+                batch_parsed = _parse_filter_expression(expression)
+                if batch_parsed is not None:
+                    batch_runtime = self._build_filter_runtime()
+            except FilterSyntaxError:
+                pass
 
-        record = ImageRecord(image_path=image_path, text_path=text_path, text=text)
-        self.records.append(record)
-        self._add_list_item(record, thumb_image)
+        self.list_widget.setUpdatesEnabled(False)
+        try:
+            for data in items:
+                if self._directory_load_cancel_requested:
+                    break
+
+                if not isinstance(data, dict):
+                    continue
+                image_path_str = str(data.get("image_path", "")).strip()
+                text_path_str = str(data.get("text_path", "")).strip()
+                text = str(data.get("text", ""))
+                thumb_payload = data.get("thumbnail")
+                thumb_image: QImage | None = None
+                if isinstance(thumb_payload, dict):
+                    try:
+                        b = thumb_payload.get("bytes")
+                        width = int(thumb_payload.get("width", 0))
+                        height = int(thumb_payload.get("height", 0))
+                        bytes_per_line = int(thumb_payload.get("bytes_per_line", width * 4))
+                        has_alpha = bool(thumb_payload.get("has_alpha", True))
+                        if b is not None and width > 0 and height > 0 and bytes_per_line > 0:
+                            fmt = QImage.Format.Format_RGBA8888 if has_alpha else QImage.Format.Format_RGB888
+                            qimage = QImage(
+                                b,
+                                width,
+                                height,
+                                bytes_per_line,
+                                fmt,
+                            )
+                            # Detach from the underlying bytes buffer to avoid lifetime issues.
+                            thumb_image = qimage.copy()
+                    except Exception:
+                        thumb_image = None
+
+                if not image_path_str or not text_path_str:
+                    continue
+
+                image_path = Path(image_path_str)
+                text_path = Path(text_path_str)
+
+                # active_badges and has_pending_fixup were computed in the worker thread
+                # alongside the thumbnail; no main-thread sidecar I/O needed here.
+                active_badges_raw = data.get("active_badges")
+                active_badges: frozenset[str] | None = (
+                    active_badges_raw
+                    if isinstance(active_badges_raw, frozenset)
+                    else None
+                )
+                has_pending_fixup_raw = data.get("has_pending_fixup")
+
+                record = ImageRecord(image_path=image_path, text_path=text_path, text=text)
+                # Pre-populate the lazy sidecar cache on the record so the first
+                # access to record.has_pending_fixup never hits the filesystem.
+                if isinstance(has_pending_fixup_raw, bool):
+                    record._sidecar_has_pending_fixup = has_pending_fixup_raw
+                self.records.append(record)
+
+                # Compute visibility with the pre-parsed filter (avoids O(n) re-parses).
+                if batch_parsed is not None and batch_runtime is not None:
+                    is_visible: bool | None = batch_parsed.evaluate(record, batch_runtime)
+                elif expression:
+                    is_visible = True  # parse failed → show everything
+                else:
+                    is_visible = True
+                self._add_list_item(record, thumb_image, active_badges=active_badges, is_visible=is_visible)
+
+                # Accumulate tag counts incrementally so _on_load_finished can skip
+                # the full O(n) rebuild over all records.
+                parsed_tags = parse_tags_text(text)
+                self.tag_counts.update(parsed_tags)
+                self.known_tags.update(parsed_tags)
+        finally:
+            self.list_widget.setUpdatesEnabled(True)
 
     def _on_load_progress(self, processed: int, total: int, percent: int) -> None:
         if self._directory_load_cancel_requested:
@@ -2707,8 +2622,8 @@ class MainWindow(QMainWindow):
         self._cfg["last_open_directory"] = folder
         _config.save(self._cfg)
 
-        # Compute tag completions after the list has populated (tags settle after load).
-        self._rebuild_known_tags_from_records()
+        # Tag counts were built incrementally in _on_item_loaded; just refresh
+        # the sorted completion list and known-tags UI without re-iterating records.
         self._refresh_tag_completions()
         self._apply_tag_list_height()
         self._restore_selection_after_load()
@@ -2730,10 +2645,6 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("No supported images found in selected folder")
         self._icc_warning_paths = []
-
-    def _on_integrity_auto_fix_changed(self, _state: int) -> None:
-        self._cfg["integrity_check_auto_fix"] = self.integrity_auto_fix_checkbox.isChecked()
-        _config.save(self._cfg)
 
     def _on_load_failed(self, message: str) -> None:
         self._directory_loading_active = False
@@ -2799,45 +2710,154 @@ class MainWindow(QMainWindow):
         )
         return QIcon(thumb)
 
-    def _draw_fixup_badge(self, thumbnail: QPixmap) -> QPixmap:
-        if thumbnail.isNull():
-            return thumbnail
+    def _badge_specs_from_active_set(self, active_badges: frozenset[str]) -> list[_ListItemBadgeSpec]:
+        """Build badge specs from a pre-computed set of active symbols using cached palette colors."""
+        # Ensure palette-derived colors are cached.
+        if self._cached_danger_color is None:
+            palette = self.palette()
+            self._cached_danger_color = danger_accent_color(palette)
+            self._cached_danger_fg_color = danger_text_on_accent_color(palette)
+            self._cached_info_color = info_accent_color(palette)
+            self._cached_info_fg_color = info_text_on_accent_color(palette)
+            self._cached_success_color = success_accent_color(palette)
+            self._cached_success_fg_color = success_text_on_accent_color(palette)
+        danger_color: QColor = self._cached_danger_color  # type: ignore[assignment]
+        danger_fg: QColor = self._cached_danger_fg_color  # type: ignore[assignment]
+        info_color: QColor = self._cached_info_color  # type: ignore[assignment]
+        info_fg: QColor = self._cached_info_fg_color  # type: ignore[assignment]
+        success_color: QColor = self._cached_success_color  # type: ignore[assignment]
+        success_fg: QColor = self._cached_success_fg_color  # type: ignore[assignment]
 
-        badge_ready = QPixmap(thumbnail)
-        painter = QPainter(badge_ready)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        specs: list[_ListItemBadgeSpec] = []
+        for symbol in self._IMAGE_ROW_BADGE_SLOT_ORDER:
+            if symbol not in active_badges:
+                continue
+            if symbol == "⚖️":
+                specs.append(_ListItemBadgeSpec(text=symbol, background=danger_color, foreground=danger_fg))
+            elif symbol == "✅":
+                specs.append(_ListItemBadgeSpec(text=symbol, background=success_color, foreground=success_fg))
+            else:
+                specs.append(_ListItemBadgeSpec(text=symbol, background=info_color, foreground=info_fg))
+        return specs
 
-        diameter = max(14, min(26, min(badge_ready.width(), badge_ready.height()) // 2))
-        x = 2
-        y = 2
-        badge_rect = QRect(x, y, diameter, diameter)
+    def _list_item_badge_specs(self, record: ImageRecord) -> list[_ListItemBadgeSpec]:
+        sidecar = read_sidecar_data(record.image_path)
+        active: set[str] = set()
+        if sidecar.fixup_issues or sidecar.fixup_tags or sidecar.fixup_description:
+            active.add("⚖️")
+        if sidecar.vision_tags or (sidecar.vision_caption or "").strip():
+            active.add("✨")
+        if sidecar.ai_find_matches:
+            active.add("🔍")
+        if sidecar.validated is not None:
+            active.add("✅")
+        return self._badge_specs_from_active_set(frozenset(active))
 
-        palette = self.palette()
-        badge_color = danger_accent_color(palette)
-        badge_text_color = danger_text_on_accent_color(palette)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(badge_color)
-        painter.drawEllipse(badge_rect)
-
-        font = painter.font()
-        font.setBold(True)
-        painter.setFont(font)
-        painter.setPen(badge_text_color)
-        painter.drawText(badge_rect, int(Qt.AlignmentFlag.AlignCenter), "!")
-        painter.end()
-        return badge_ready
-
-    def _build_list_item_icon(self, record: ImageRecord, thumbnail: QImage | None = None) -> QIcon:
+    def _build_list_item_thumbnail(self, record: ImageRecord, thumbnail: QImage | None = None) -> QPixmap:
         if thumbnail is not None and not thumbnail.isNull():
-            base = QPixmap.fromImage(thumbnail)
-        else:
-            base_icon = self._build_thumbnail_icon(record.image_path)
-            base = base_icon.pixmap(THUMB_SIZE)
+            return QPixmap.fromImage(thumbnail)
+        base_icon = self._build_thumbnail_icon(record.image_path)
+        return base_icon.pixmap(THUMB_SIZE)
 
-        if existing_fixup_path_for_image(record.image_path) is not None:
-            base = self._draw_fixup_badge(base)
-        return QIcon(base)
+    @staticmethod
+    def _badge_label_for_symbol(symbol: str) -> str:
+        if symbol == "⚖️":
+            return "fixup"
+        if symbol == "✨":
+            return "vision"
+        if symbol == "🔍":
+            return "search"
+        if symbol == "✅":
+            return "validated"
+        return symbol
+
+    def _create_badge_chip_label(self, badge: _ListItemBadgeSpec, parent: QWidget) -> QLabel:
+        label = QLabel(badge.text, parent)
+        label.setObjectName("imageRowBadgeLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+
+        accent = badge.background.name(QColor.NameFormat.HexRgb)
+        label.setStyleSheet(
+            "QLabel#imageRowBadgeLabel {"
+            "background-color: transparent;"
+            f"color: {accent};"
+            "border-radius: 6px;"
+            "padding: 1px 8px;"
+            "font-weight: 600;"
+            "}"
+        )
+        return label
+
+    def _create_badge_placeholder_label(self, parent: QWidget) -> QLabel:
+        placeholder = QLabel(" ", parent)
+        placeholder.setObjectName("imageRowBadgePlaceholder")
+        placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        placeholder.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        placeholder.setStyleSheet(
+            "QLabel#imageRowBadgePlaceholder {"
+            "background-color: transparent;"
+            "border: 1px solid transparent;"
+            "border-radius: 6px;"
+            "padding: 1px 8px;"
+            "}"
+        )
+        return placeholder
+
+    def _set_image_list_row_widget(self, index: int, thumbnail: QImage | None = None) -> None:
+        item = self.list_widget.item(index)
+        if item is None or index < 0 or index >= len(self.records):
+            return
+        record = self.records[index]
+        badge_specs = self._list_item_badge_specs(record)
+        active_badges = frozenset(s.text for s in badge_specs)
+        item.setData(_ROLE_BADGES, active_badges)
+        item.setData(Qt.ItemDataRole.DisplayRole, self._build_list_item_title(record))
+        item.setToolTip(self._build_list_item_tooltip(record, badge_specs=badge_specs))
+        if thumbnail is not None and not thumbnail.isNull():
+            raw = QPixmap.fromImage(thumbnail)
+            if not raw.isNull():
+                item.setData(
+                    _ROLE_PIXMAP,
+                    raw.scaled(
+                        THUMB_SIZE,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    ),
+                )
+
+    def _build_list_item_tooltip(self, record: ImageRecord, badge_specs: list | None = None) -> str:
+        parts = [str(record.image_path)]
+        badges = badge_specs if badge_specs is not None else self._list_item_badge_specs(record)
+        if badges:
+            active_symbols = {badge.text for badge in badges}
+            legend = [f"{badge.text} {self._badge_label_for_symbol(badge.text)}" for badge in badges]
+            parts.append(f"Badges: {', '.join(legend)}")
+            if "✅" in active_symbols:
+                sidecar = read_sidecar_data(record.image_path)
+                if sidecar.validated is not None:
+                    date_str = sidecar.validated.split("T")[0] if "T" in sidecar.validated else sidecar.validated
+                    by = sidecar.validated_by or "unknown"
+                    parts.append(f"Validated by {by} on {date_str}")
+        return "\n".join(parts)
+
+    def _update_image_label_tooltip(self, sidecar: object | None = None) -> None:
+        """Set or clear the image preview tooltip based on the validated state of the current image."""
+        from imagetagger.utils.sidecar import SidecarData
+        if sidecar is None:
+            record = self._current_record()
+            if record is None:
+                self.image_label.setToolTip("")
+                return
+            sidecar = read_sidecar_data(record.image_path)
+        if not isinstance(sidecar, SidecarData) or sidecar.validated is None:
+            self.image_label.setToolTip("")
+            return
+        date_str = sidecar.validated.split("T")[0] if "T" in sidecar.validated else sidecar.validated
+        by = sidecar.validated_by or "unknown"
+        self.image_label.setToolTip(f"Validated by {by} on {date_str}")
 
     def _build_preview_text(self, text: str, max_chars: int = 42) -> str:
         cleaned = " ".join(text.strip().split())
@@ -2858,6 +2878,8 @@ class MainWindow(QMainWindow):
             self.current_index = -1
             self._set_watched_image(None)
             self._update_fixup_button_state()
+            if hasattr(self, "vision_description"):
+                self._clear_vision_fields()
             if self.records:
                 self.statusBar().showMessage(self._filtered_total_status_text())
             return
@@ -2871,15 +2893,25 @@ class MainWindow(QMainWindow):
         tags = self._parse_annotations_for_tag_list(record.text)
         self._populate_tag_list(tags)
         self.tag_input.clear()
+        self._load_vision_for_current_image()
         self._update_fixup_button_state()
         self.statusBar().showMessage(f"{self._filtered_total_status_text(selected_row=index)} {record.image_path}")
 
     def _show_image(self, image_path: Path) -> None:
-        pixmap = self._load_normalized_pixmap(image_path)
-        if pixmap.isNull():
-            self.image_label.setText(f"Unable to load image:\n{image_path.name}")
-            self.image_label.setPixmap(QPixmap())
-            return
+        # Re-use the cached pixmap when the same image is requested (e.g. during
+        # a window resize) to avoid a disk read on every resize event.
+        if self._cached_pixmap_path != image_path or self._cached_pixmap is None:
+            pixmap = self._load_normalized_pixmap(image_path)
+            if pixmap.isNull():
+                self.image_label.setText(f"Unable to load image:\n{image_path.name}")
+                self.image_label.setPixmap(QPixmap())
+                self._cached_pixmap = None
+                self._cached_pixmap_path = None
+                return
+            self._cached_pixmap = pixmap
+            self._cached_pixmap_path = image_path
+        else:
+            pixmap = self._cached_pixmap
 
         target_size = self.image_label.size()
         if target_size.width() < 50 or target_size.height() < 50:
@@ -2892,12 +2924,30 @@ class MainWindow(QMainWindow):
         )
         self.image_label.setPixmap(scaled)
 
+    def _on_resize_timer(self) -> None:
+        """Called after the resize debounce delay to re-scale the current image."""
+        if 0 <= self.current_index < len(self.records):
+            self._show_image(self.records[self.current_index].image_path)
+
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._apply_tag_list_height()
         self._update_tag_item_heights()
         if 0 <= self.current_index < len(self.records):
-            self._show_image(self.records[self.current_index].image_path)
+            # Debounce: reschedule the timer so a burst of resize events only
+            # triggers a single re-scale after the user stops dragging.
+            self._resize_timer.start()
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            # Invalidate cached badge colors so they are recomputed from the new palette.
+            self._cached_danger_color = None
+            self._cached_danger_fg_color = None
+            self._cached_info_color = None
+            self._cached_info_fg_color = None
+            self._cached_success_color = None
+            self._cached_success_fg_color = None
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._llm_cancel is not None:
@@ -3015,14 +3065,24 @@ class MainWindow(QMainWindow):
         tags = self._current_tags()
         record = self.records[self.current_index]
         new_text = self._serialize_tags(tags)
+        old_parsed = self._parse_tags(record.text)
+        new_parsed = self._parse_tags(new_text)
         # Ignore format-only churn so loading/selection does not trigger unsolicited saves.
-        if self._parse_tags(record.text) == self._parse_tags(new_text):
+        if old_parsed == new_parsed:
             return
 
         record.text = new_text
         self._update_list_item_preview(self.current_index)
         if rebuild_completions:
-            self._rebuild_known_tags_from_records()
+            # Incremental update: subtract old tags, add new tags — avoids O(n)
+            # full rebuild on every single-image tag edit.
+            self.tag_counts.subtract(old_parsed)
+            self.tag_counts.update(new_parsed)
+            # Remove zeroed/negative entries produced by subtract().
+            zero_keys = [k for k, v in self.tag_counts.items() if v <= 0]
+            for k in zero_keys:
+                del self.tag_counts[k]
+            self.known_tags = set(self.tag_counts)
             self._refresh_tag_completions()
         self._write_record_text(record, status_prefix=status_prefix)
 
@@ -3048,10 +3108,86 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "known_tags_list"):
             return
 
-        self.known_tags_list.clear()
-        for tag in self._sorted_tag_suggestions():
-            count = self.tag_counts.get(tag, 0)
-            self.known_tags_list.addItem(f"{tag} ({count})")
+        filter_text = ""
+        if hasattr(self, "known_tags_filter"):
+            filter_text = self.known_tags_filter.text().strip().casefold()
+
+        self.known_tags_list.setUpdatesEnabled(False)
+        try:
+            self.known_tags_list.clear()
+            for tag in self._sorted_tag_suggestions():
+                if filter_text and filter_text not in tag.casefold():
+                    continue
+                count = self.tag_counts.get(tag, 0)
+                item = QListWidgetItem(f"{tag} ({count})")
+                item.setData(Qt.ItemDataRole.UserRole, tag)
+                self.known_tags_list.addItem(item)
+        finally:
+            self.known_tags_list.setUpdatesEnabled(True)
+
+    def _delete_global_tag(self, tags_to_delete: list[str]) -> None:
+        tags_set = set(tags_to_delete)
+        affected = [r for r in self.records if tags_set & set(self._parse_tags(r.text))]
+        if not affected:
+            return
+        tag_count = len(tags_set)
+        tag_label = f'"{next(iter(tags_set))}"' if tag_count == 1 else f"{tag_count} tags"
+        reply = QMessageBox.question(
+            self,
+            "Remove tags from all images",
+            f'Remove {tag_label} from {len(affected)} image(s)?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Compute new text for every affected record on the main thread (fast, no I/O).
+        jobs: list[tuple] = []
+        for record in affected:
+            new_tags = [t for t in self._parse_tags(record.text) if t not in tags_set]
+            new_text = self._serialize_tags(new_tags)
+            record.text = new_text
+            jobs.append((record.text_path, new_text))
+
+        # Refresh UI immediately so the user sees the change right away.
+        self._rebuild_known_tags_from_records()
+        self._refresh_tag_completions()
+        if self.current_index >= 0 and self.current_index < len(self.records):
+            record = self.records[self.current_index]
+            if record in affected:
+                self._populate_tag_list(self._parse_tags(record.text))
+
+        total = len(jobs)
+        self.statusBar().showMessage(f'Removing {tag_label} — writing 0 / {total}…')
+
+        worker = TagPurgeWorker(jobs)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+
+        def on_progress(done: int, total: int) -> None:
+            self.statusBar().showMessage(f'Removing {tag_label} — writing {done} / {total}…')
+
+        def on_finished() -> None:
+            self.statusBar().showMessage(f'Removed {tag_label} from {total} file(s).')
+            thread.quit()
+
+        def on_failed(msg: str) -> None:
+            QMessageBox.critical(self, "Save failed", f"Could not write some files:\n{msg}")
+            thread.quit()
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.failed.connect(on_failed)
+        thread.started.connect(worker.run)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        # Keep references so Python doesn't GC the thread/worker before they finish.
+        self._purge_thread = thread
+        self._purge_worker = worker
+
+        thread.start()
 
     def _add_tag_from_input(self) -> None:
         if self.current_index < 0 or self.current_index >= len(self.records):
@@ -3107,6 +3243,8 @@ class MainWindow(QMainWindow):
         if not selected:
             return
 
+        first_row = min(self.tag_list.row(item) for item in selected)
+
         for item in selected:
             row = self.tag_list.row(item)
             removed = self.tag_list.takeItem(row)
@@ -3114,6 +3252,11 @@ class MainWindow(QMainWindow):
 
         self._update_tag_item_heights()
         self._sync_record_from_tag_list()
+
+        count = self.tag_list.count()
+        if count > 0:
+            next_row = min(first_row, count - 1)
+            self.tag_list.setCurrentRow(next_row)
 
     def _on_tags_reordered(self) -> None:
         self._update_tag_item_heights()
@@ -3137,8 +3280,8 @@ class MainWindow(QMainWindow):
             return
 
         record = self.records[index]
-        item.setText(self._build_list_item_title(record))
-        item.setIcon(self._build_list_item_icon(record))
+        item.setToolTip(self._build_list_item_tooltip(record))
+        self._set_image_list_row_widget(index)
 
     def _refresh_all_list_item_previews(self) -> None:
         for index in range(len(self.records)):
@@ -3351,8 +3494,10 @@ class MainWindow(QMainWindow):
             return
         include_tags = self.generate_tags_checkbox.isChecked()
         include_description = self.generate_description_checkbox.isChecked()
-        if not include_tags and not include_description:
-            QMessageBox.information(self, "Nothing selected", "Enable Tags or Description before generating.")
+        include_vision = self.generate_vision_checkbox.isChecked()
+        include_refine = self.generate_refine_checkbox.isChecked()
+        if not include_tags and not include_description and not include_vision and not include_refine:
+            QMessageBox.information(self, "Nothing selected", "Enable Tags, Description, Vision, or Refine before generating.")
             return
 
         cancel_token = LlmRequestCancellation()
@@ -3368,14 +3513,30 @@ class MainWindow(QMainWindow):
             timeout = self._llm_timeout_seconds()
             retry_count = self._llm_retry_count()
             total = len(selected_indexes)
-            description_query = prepare_description_query() if include_description else None
-            tags_query = prepare_tagging_query() if include_tags else None
+            vision_enabled = include_vision
+            refine_enabled = include_refine
+            agent_roles = self._cfg.get("agent_roles") or {}
+            description_role = agent_roles.get("description") or None
+            tagging_role = agent_roles.get("tagging") or None
 
             def process_one(position: int, record_index: int) -> dict:
                 record = self.records[record_index]
                 image_name = self._display_image_path(record.image_path)
+
+                # Existing short tags guide LLM generation when the user pre-seeds 1-2 tags.
+                existing_parts = self._split_record_annotations(record.text)
+                existing_tags_hint = [
+                    part for part in existing_parts
+                    if not self._is_description_like_annotation(part)
+                ] or None
+                description_query = prepare_description_query(existing_tags=existing_tags_hint, agent_role=description_role) if include_description else None
+                tags_query = prepare_tagging_query(existing_tags=existing_tags_hint, agent_role=tagging_role) if include_tags else None
                 generated_description = ""
                 generated_tags: list[str] = []
+                vision_reasoning = ""
+                vision_description = ""
+                refine_tags: list[str] = []
+                refine_caption = ""
                 image_retried = False
                 image_timed_out = False
                 image_started_at = time.monotonic()
@@ -3409,6 +3570,10 @@ class MainWindow(QMainWindow):
 
                     attempt_description = ""
                     attempt_tags: list[str] = []
+                    attempt_vision_reasoning = ""
+                    attempt_vision_description = ""
+                    attempt_refine_tags: list[str] = []
+                    attempt_refine_caption = ""
                     retry_needed = False
                     try:
                         if description_query is not None:
@@ -3438,7 +3603,53 @@ class MainWindow(QMainWindow):
                                 ]
                             )
 
-                        if not attempt_description and not attempt_tags:
+                        if vision_enabled:
+                            # Vision prompt consumes the outputs of description + tags.
+                            tags_input_lines: list[str] = []
+                            if attempt_description:
+                                tags_input_lines.append(attempt_description)
+                            if attempt_tags:
+                                tags_input_lines.extend(attempt_tags)
+                            if not tags_input_lines:
+                                # Vision-only generation should still treat existing annotations as ground truth.
+                                tags_input_lines = self._parse_annotations_for_tag_list(record.text)
+                            tags_input = "\n".join(tags_input_lines).strip()
+                            vision_query = prepare_vision_query(tags_text=tags_input, user_hint=None)
+                            vision_raw = session.generate(
+                                record.image_path,
+                                vision_query.prompt,
+                                timeout=remaining_timeout(),
+                                cancellation=cancel_token,
+                            )
+                            attempt_vision_reasoning, attempt_vision_description = parse_vision_response(vision_raw)
+
+                            if attempt_vision_reasoning or attempt_vision_description:
+                                # Persist immediately so multi-image batch can be applied without UI focus.
+                                try:
+                                    vision_data = read_sidecar_data(record.image_path)
+                                    vision_data.description = attempt_vision_description
+                                    vision_data.reasoning = attempt_vision_reasoning
+                                    write_sidecar_data(record.image_path, vision_data)
+                                except OSError as exc:
+                                    raise LlmProviderError(f"Could not write {record.image_path.with_suffix('.json').name}: {exc}") from exc
+
+                        if refine_enabled:
+                            # Refine reads the sidecar .json written by Vision (or a pre-existing one).
+                            sidecar = read_sidecar_data(record.image_path)
+                            if sidecar.description or sidecar.reasoning:
+                                refine_query = prepare_refine_query(
+                                    description=sidecar.description,
+                                    reasoning=sidecar.reasoning,
+                                )
+                                refine_raw = session.generate(
+                                    record.image_path,
+                                    refine_query.prompt,
+                                    timeout=remaining_timeout(),
+                                    cancellation=cancel_token,
+                                )
+                                attempt_refine_tags, attempt_refine_caption = parse_refine_response(refine_raw)
+
+                        if not attempt_description and not attempt_tags and not (attempt_vision_reasoning or attempt_vision_description) and not attempt_refine_tags and not attempt_refine_caption:
                             retry_needed = True
                     except LlmProviderCancelled:
                         raise
@@ -3451,6 +3662,10 @@ class MainWindow(QMainWindow):
                     if not retry_needed:
                         generated_description = attempt_description
                         generated_tags = attempt_tags
+                        vision_reasoning = attempt_vision_reasoning
+                        vision_description = attempt_vision_description
+                        refine_tags = attempt_refine_tags
+                        refine_caption = attempt_refine_caption
                         print(
                             f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_done image={image_name} elapsed_s={elapsed_seconds:.2f}",
                             flush=True,
@@ -3467,6 +3682,10 @@ class MainWindow(QMainWindow):
                     "index": record_index,
                     "description": generated_description,
                     "tags": generated_tags,
+                    "vision_description": vision_description,
+                    "vision_reasoning": vision_reasoning,
+                    "refine_tags": refine_tags,
+                    "refine_caption": refine_caption,
                     "retried": image_retried,
                     "timed_out": image_timed_out,
                     "elapsed_s": max(0.0, time.monotonic() - image_started_at),
@@ -3491,6 +3710,8 @@ class MainWindow(QMainWindow):
         self._generate_batch_total = len(selected_indexes)
         self._generate_batch_processed = 0
         self._generate_batch_updated = 0
+        self._generate_batch_vision_updated = 0
+        self._generate_batch_refine_updated = 0
         self._generate_batch_new_annotations = 0
         self._generate_batch_started_at = time.monotonic()
         self._generate_batch_retry_images = 0
@@ -3528,8 +3749,8 @@ class MainWindow(QMainWindow):
         for record_index in selected_indexes:
             if record_index < 0 or record_index >= len(self.records):
                 continue
-            annotations = self._serialize_tags(self._parse_tags(self.records[record_index].text))
-            if not annotations:
+            annotations = self.records[record_index].text
+            if not annotations.strip():
                 skipped_without_annotations += 1
                 continue
             annotated_records.append((record_index, annotations))
@@ -3597,13 +3818,8 @@ class MainWindow(QMainWindow):
 
                         # Detect format hallucination and trigger retry
                         if validation_result.strip().upper() != "OK":
-                            from imagetagger.ui.merge_dialog import parse_fixup_data
-                            parsed_check = parse_fixup_data(
-                                validation_result,
-                                self._parse_tags,
-                                self._sanitize_annotation_text
-                            )
-                            if not parsed_check.has_headers:
+                            from imagetagger.utils.fixup_parser import has_fixup_section_headers
+                            if not has_fixup_section_headers(validation_result):
                                 raise LlmProviderError("Model hallucinated output format (missing headers).")
                     except LlmProviderCancelled:
                         raise
@@ -3665,6 +3881,7 @@ class MainWindow(QMainWindow):
         self._validate_batch_started_at = time.monotonic()
         self._validate_batch_retry_images = 0
         self._validate_batch_llm_disobeyed = 0
+        self._validate_pending_indices = {idx for idx, _ in annotated_records}
 
         self._start_llm_task(
             task=validate_task,
@@ -3823,165 +4040,6 @@ class MainWindow(QMainWindow):
             empty_message="No matching images were found.",
             cancel_token=cancel_token,
         )
-
-    def check_integrity_with_llm(self) -> None:
-        """Scan selected images for data integrity issues using detection patterns."""
-        if self._integrity_check_thread is not None:
-            # Already running, do nothing
-            return
-
-        selected_indexes = self._selected_record_indexes()
-        if not selected_indexes:
-            QMessageBox.information(self, "No image selected", "Select one or more images to check.")
-            return
-
-        # Set up UI state
-        self.statusBar().showMessage("Scanning for integrity issues...")
-        self.validate_integrity_button.setEnabled(False)
-        self.integrity_auto_fix_checkbox.setEnabled(False)
-
-        self._integrity_check_batch_total = len(selected_indexes)
-        self._integrity_check_batch_processed = 0
-        self._integrity_check_batch_issues = 0
-        self._integrity_check_batch_fixed = 0
-        self._integrity_check_batch_started_at = time.monotonic()
-        auto_fix_enabled = self.integrity_auto_fix_checkbox.isVisible() and self.integrity_auto_fix_checkbox.isChecked()
-
-        # Create and start worker thread
-        self._integrity_check_thread = QThread(self)
-        self._integrity_check_worker = IntegrityCheckWorker(self.records, selected_indexes, auto_fix=auto_fix_enabled)
-        self._integrity_check_worker.moveToThread(self._integrity_check_thread)
-
-        # Connect signals
-        self._integrity_check_thread.started.connect(self._integrity_check_worker.run)
-        self._integrity_check_worker.progress.connect(self._on_integrity_check_progress)
-        self._integrity_check_worker.finished.connect(self._on_integrity_check_finished)
-        self._integrity_check_worker.failed.connect(self._on_integrity_check_failed)
-        self._integrity_check_worker.finished.connect(self._integrity_check_thread.quit)
-        self._integrity_check_worker.failed.connect(self._integrity_check_thread.quit)
-        self._integrity_check_thread.finished.connect(self._cleanup_integrity_check_task)
-
-        # Start the worker
-        self._integrity_check_thread.start()
-
-    def _on_integrity_check_progress(self, message: str) -> None:
-        """Handle progress updates from integrity check worker."""
-        self.statusBar().showMessage(message)
-
-    def _apply_integrity_auto_fix(self, fixes_to_apply: object) -> int:
-        if not isinstance(fixes_to_apply, list):
-            return 0
-
-        fixed_count = 0
-        updated_indices: list[int] = []
-        for entry in fixes_to_apply:
-            if not isinstance(entry, tuple) or len(entry) != 2:
-                continue
-
-            record_index_raw, issue = entry
-            if not isinstance(record_index_raw, int):
-                continue
-            if record_index_raw < 0 or record_index_raw >= len(self.records):
-                continue
-
-            description = str(getattr(issue, "description", "")).strip()
-            issue_tags_raw = getattr(issue, "tags", [])
-            issue_tags = issue_tags_raw if isinstance(issue_tags_raw, list) else []
-
-            corrected_annotations: list[str] = []
-            seen: set[str] = set()
-
-            if description:
-                corrected_annotations.append(description)
-                seen.add(self._sanitize_annotation_text(description).casefold())
-
-            for raw_tag in issue_tags:
-                tag = str(raw_tag).strip()
-                if not tag:
-                    continue
-                key = self._sanitize_annotation_text(tag).casefold()
-                if key in seen:
-                    continue
-                seen.add(key)
-                corrected_annotations.append(tag)
-
-            if not corrected_annotations:
-                continue
-
-            record = self.records[record_index_raw]
-            new_text = self._serialize_tags(corrected_annotations)
-            if not new_text or new_text == record.text:
-                clear_fixup_files_for_image(record.image_path)
-                fixed_count += 1
-                continue
-
-            record.text = new_text
-            try:
-                atomic_write_text(record.text_path, record.text, encoding="utf-8")
-            except OSError:
-                # Skip files that fail to write; keep processing others.
-                continue
-
-            clear_fixup_files_for_image(record.image_path)
-            updated_indices.append(record_index_raw)
-            fixed_count += 1
-
-            if fixed_count % 50 == 0:
-                self.statusBar().showMessage(
-                    f"Integrity auto-fix: applying {fixed_count}/{len(fixes_to_apply)}"
-                )
-
-        if updated_indices:
-            for index in updated_indices:
-                self._update_list_item_preview(index)
-
-            if 0 <= self.current_index < len(self.records) and self.current_index in updated_indices:
-                self._populate_tag_list(self._parse_annotations_for_tag_list(self.records[self.current_index].text))
-
-            # Rebuild completions once after all updates to avoid O(N^2) stalls.
-            self._rebuild_known_tags_from_records()
-            self._refresh_tag_completions()
-
-        return fixed_count
-
-    def _on_integrity_check_finished(self, records_checked: int, issues_found: int, fixes_to_apply: object) -> None:
-        """Handle completion of integrity check."""
-        auto_fix_enabled = self.integrity_auto_fix_checkbox.isVisible() and self.integrity_auto_fix_checkbox.isChecked()
-        fixed_count = self._apply_integrity_auto_fix(fixes_to_apply) if auto_fix_enabled else 0
-        self._integrity_check_batch_fixed = fixed_count
-
-        elapsed_seconds = (
-            time.monotonic() - self._integrity_check_batch_started_at
-            if self._integrity_check_batch_started_at
-            else 0
-        )
-        if auto_fix_enabled:
-            message = (
-                f"Integrity check complete: {records_checked} scanned, {issues_found} issues found, "
-                f"{fixed_count} auto-fixed ({elapsed_seconds:.1f}s)"
-            )
-        else:
-            message = (
-                f"Integrity check complete: {records_checked} scanned, {issues_found} issues found "
-                f"({elapsed_seconds:.1f}s)"
-            )
-        self.statusBar().showMessage(message)
-        # Refresh fixup badges, button state, and list filter so newly written or
-        # auto-resolved .fixup files are immediately visible without a manual reload.
-        if issues_found > 0 or fixed_count > 0:
-            self._on_fixup_state_changed()
-
-    def _on_integrity_check_failed(self, error: str) -> None:
-        """Handle failure of integrity check."""
-        self.statusBar().showMessage("Integrity check failed")
-        QMessageBox.warning(self, "Integrity Check Error", error)
-
-    def _cleanup_integrity_check_task(self) -> None:
-        """Clean up after integrity check task completes."""
-        self._integrity_check_thread = None
-        self._integrity_check_worker = None
-        self.validate_integrity_button.setEnabled(True)
-        self.integrity_auto_fix_checkbox.setEnabled(True)
 
     def _start_llm_task(
         self,
@@ -4289,6 +4347,8 @@ class MainWindow(QMainWindow):
             raw_index = payload.get("index")
             raw_description = payload.get("description")
             raw_tags = payload.get("tags")
+            raw_vision_description = payload.get("vision_description")
+            raw_vision_reasoning = payload.get("vision_reasoning")
             raw_retried = payload.get("retried")
             raw_position = payload.get("position")
             raw_total = payload.get("total")
@@ -4321,6 +4381,29 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     f"Generate: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name}{details}{self._llm_threads_status_suffix()}"
                 )
+            vision_desc = str(raw_vision_description).strip() if isinstance(raw_vision_description, str) else ""
+            vision_reason = str(raw_vision_reasoning).strip() if isinstance(raw_vision_reasoning, str) else ""
+            if vision_desc or vision_reason:
+                self._generate_batch_vision_updated += 1
+                if self.current_index == raw_index:
+                    self._load_vision_for_current_image()
+
+            raw_refine_tags = payload.get("refine_tags")
+            raw_refine_caption = payload.get("refine_caption")
+            refine_tags = [str(t).strip() for t in raw_refine_tags if str(t).strip()] if isinstance(raw_refine_tags, list) else []
+            refine_caption = str(raw_refine_caption).strip() if isinstance(raw_refine_caption, str) else ""
+            if refine_tags or refine_caption:
+                try:
+                    record_refine_result_for_image(
+                        self.records[raw_index].image_path,
+                        refine_tags,
+                        refine_caption,
+                    )
+                except OSError:
+                    pass
+                else:
+                    self._generate_batch_refine_updated += 1
+                    self._on_fixup_state_changed(self.records[raw_index].image_path)
             return
 
         if kind == "ai_find_item":
@@ -4385,6 +4468,7 @@ class MainWindow(QMainWindow):
             return
 
         outcome, llm_violated_no_commas = self._apply_validation_result_to_record(raw_index, str(raw_result or ""))
+        self._validate_pending_indices.discard(raw_index)
         self._validate_batch_processed += 1
         if isinstance(raw_retried, bool) and raw_retried:
             self._validate_batch_retry_images += 1
@@ -4470,16 +4554,31 @@ class MainWindow(QMainWindow):
             return
 
         if isinstance(result, dict) and result.get("batch") is True and result.get("streamed") is True:
-            if self._generate_batch_updated == 0:
+            # Check if any output was generated (tags/description or vision)
+            has_annotations = self._generate_batch_updated > 0
+            has_vision = self._generate_batch_vision_updated > 0
+            has_refine = self._generate_batch_refine_updated > 0
+
+            if not has_annotations and not has_vision and not has_refine:
                 QMessageBox.information(self, f"{action_name} finished", empty_message)
                 self.statusBar().showMessage(f"{action_name} finished")
             else:
+                parts = []
+                if has_annotations:
+                    parts.append(f"{self._generate_batch_updated} image{'s' if self._generate_batch_updated != 1 else ''}, {self._generate_batch_new_annotations} new annotation{'s' if self._generate_batch_new_annotations != 1 else ''}")
+                if has_vision:
+                    parts.append(f"{self._generate_batch_vision_updated} vision update{'s' if self._generate_batch_vision_updated != 1 else ''}")
+                if has_refine:
+                    parts.append(f"{self._generate_batch_refine_updated} refine fixup{'s' if self._generate_batch_refine_updated != 1 else ''}")
+                summary = ", ".join(parts)
                 self.statusBar().showMessage(
-                    f"{action_name} complete via {self._llm_provider.display_name} ({self._generate_batch_updated} image{'s' if self._generate_batch_updated != 1 else ''}, {self._generate_batch_new_annotations} new annotation{'s' if self._generate_batch_new_annotations != 1 else ''})"
+                    f"{action_name} complete via {self._llm_provider.display_name} ({summary})"
                 )
             self._generate_batch_total = 0
             self._generate_batch_processed = 0
             self._generate_batch_updated = 0
+            self._generate_batch_vision_updated = 0
+            self._generate_batch_refine_updated = 0
             self._generate_batch_new_annotations = 0
             return
 
@@ -4552,7 +4651,11 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("Validate complete: no issues found")
                 record = self._current_record()
                 if record is not None:
-                    clear_fixup_files_for_image(record.image_path)
+                    clear_validation_fields_sidecar(
+                        record.image_path,
+                        model=self.llm_model_name,
+                        date=datetime.now().astimezone().isoformat(timespec="seconds"),
+                    )
                     self._on_fixup_state_changed()
                 return
 
@@ -4563,13 +4666,22 @@ class MainWindow(QMainWindow):
 
             record = self.records[self.current_index]
             try:
-                fixup_path = write_fixup_for_image(record.image_path, cleaned)
+                from imagetagger.utils.fixup_parser import parse_fixup_data
+                parsed_fixup = parse_fixup_data(cleaned, self._parse_tags, self._sanitize_annotation_text)
+                write_fixup_sidecar(
+                    record.image_path,
+                    parsed_fixup.issues or None,
+                    parsed_fixup.corrected_tags or None,
+                    parsed_fixup.corrected_description_raw or None,
+                    model=self.llm_model_name,
+                    date=datetime.now().astimezone().isoformat(timespec="seconds"),
+                )
             except OSError as exc:
-                QMessageBox.warning(self, "Fixup write failed", f"Could not write fixup file:\n{exc}")
-                self.statusBar().showMessage("Validate failed: could not write .fixup")
+                QMessageBox.warning(self, "Fixup write failed", f"Could not write sidecar:\n{exc}")
+                self.statusBar().showMessage("Validate failed: could not write sidecar")
                 return
 
-            self.statusBar().showMessage(f"Validate found issues: wrote {fixup_path.name}")
+            self.statusBar().showMessage("Validate found issues: saved to sidecar")
             self._on_fixup_state_changed()
             return
 
@@ -4626,15 +4738,18 @@ class MainWindow(QMainWindow):
             return ("empty", False)
 
         record = self.records[record_index]
+        validation_model = self.llm_model_name
+        validation_date = datetime.now().astimezone().isoformat(timespec="seconds")
         if cleaned.casefold() == "ok":
-            clear_fixup_files_for_image(record.image_path)
+            clear_validation_fields_sidecar(record.image_path, model=validation_model, date=validation_date)
             self._on_fixup_state_changed(record.image_path)
             return ("clean", False)
 
         # Check if LLM violated the "no commas" rule in the description
         llm_violated_no_commas = False
+        parsed = None
         try:
-            from imagetagger.ui.merge_dialog import parse_fixup_data
+            from imagetagger.utils.fixup_parser import parse_fixup_data
             parsed = parse_fixup_data(cleaned, self._parse_tags, self._sanitize_annotation_text)
             if parsed.corrected_description and "," in parsed.corrected_description_raw:
                 llm_violated_no_commas = True
@@ -4642,7 +4757,17 @@ class MainWindow(QMainWindow):
             pass  # Silently ignore parsing errors, just track nothing
 
         try:
-            write_fixup_for_image(record.image_path, cleaned)
+            if parsed is not None:
+                write_fixup_sidecar(
+                    record.image_path,
+                    parsed.issues or None,
+                    parsed.corrected_tags or None,
+                    parsed.corrected_description_raw or None,
+                    model=validation_model,
+                    date=validation_date,
+                )
+            else:
+                write_fixup_sidecar(record.image_path, cleaned, None, None, model=validation_model, date=validation_date)
         except OSError:
             return ("error", llm_violated_no_commas)
 
@@ -4659,6 +4784,7 @@ class MainWindow(QMainWindow):
         self._generate_batch_total = 0
         self._generate_batch_processed = 0
         self._generate_batch_updated = 0
+        self._generate_batch_vision_updated = 0
         self._generate_batch_new_annotations = 0
         self._generate_batch_started_at = None
         self._generate_batch_retry_images = 0
@@ -4669,6 +4795,7 @@ class MainWindow(QMainWindow):
         self._validate_batch_skipped = 0
         self._validate_batch_started_at = None
         self._validate_batch_retry_images = 0
+        self._validate_pending_indices = set()
         self._ai_find_batch_total = 0
         self._ai_find_batch_processed = 0
         self._ai_find_batch_matched = 0

@@ -16,10 +16,13 @@ class ItemActionWidget(QWidget):
         button_callback: Callable[[], None] | None = None,
         diff_ranges: list[tuple[int, int]] | None = None,
         button_on_left: bool = False,
+        clean_value: str | None = None,
+        badge: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.text = text
+        self.clean_value = clean_value
         self.button_callback = button_callback
         self.diff_ranges = diff_ranges or []
         
@@ -40,8 +43,8 @@ class ItemActionWidget(QWidget):
         button: QPushButton | None = None
         if button_text and button_callback:
             button = QPushButton(button_text)
-            button.setMaximumWidth(32)
-            button.setMaximumHeight(20)
+            fm = self.fontMetrics()
+            button.setMaximumWidth(max(32, fm.horizontalAdvance(button_text) + 16))
             button.clicked.connect(button_callback)
             if button_text == "✕":
                 button.setStyleSheet(_danger_button_stylesheet(button.palette()))
@@ -53,6 +56,11 @@ class ItemActionWidget(QWidget):
             layout.addWidget(text_label, stretch=1)
             if button is not None:
                 layout.addWidget(button, stretch=0)
+
+        if badge:
+            badge_label = QLabel(badge)
+            badge_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            layout.addWidget(badge_label, stretch=0)
         
         self.setLayout(layout)
     

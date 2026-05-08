@@ -22,6 +22,7 @@ from imagetagger.utils.theme_colors import danger_accent_color
 DIFF_RANGES_ROLE = int(Qt.ItemDataRole.UserRole) + 1
 ITEM_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 2
 IS_SEARCH_MATCH_ROLE = int(Qt.ItemDataRole.UserRole) + 3
+ITEM_BADGE_ROLE = int(Qt.ItemDataRole.UserRole) + 4
 
 
 def _blend_colors(base: QColor, overlay: QColor, alpha: float) -> QColor:
@@ -54,28 +55,13 @@ def _danger_button_stylesheet(palette: QPalette) -> str:
     return f"QPushButton {{ color: {color}; font-weight: bold; padding: 2px; }}"
 
 
-def strip_tag_list_prefix(tag: str) -> str:
-    """Remove one or more leading markdown list markers from a tag value."""
-    cleaned = tag.strip()
-    while cleaned.startswith("- "):
-        cleaned = cleaned[2:].lstrip()
-    return cleaned
-
-
-def _normalize_fixup_section_entry(value: str) -> str:
-    """Normalize entry by stripping whitespace and leading dash."""
-    text = value.strip()
-    if text.startswith("- "):
-        text = text[2:].strip()
-    return text
-
-
-def _normalize_search_match_entry(value: str, sanitize_annotation: Callable[[str], str]) -> str:
-    normalized = sanitize_annotation(_normalize_fixup_section_entry(value)).strip()
-    return normalized.lower()
-
-
 class DiffHighlightDelegate(QStyledItemDelegate):
+    _DOC_CACHE_MAX = 256
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._doc_cache: dict[tuple, QTextDocument] = {}
+
     def _normalized_ranges(self, text: str, raw_ranges: object) -> list[tuple[int, int]]:
         if not isinstance(raw_ranges, list):
             return []
@@ -111,6 +97,22 @@ class DiffHighlightDelegate(QStyledItemDelegate):
 
         return document
 
+    def _cached_document(
+        self,
+        text: str,
+        ranges: list[tuple[int, int]],
+        option: QStyleOptionViewItem,
+    ) -> QTextDocument:
+        highlight_bg, _ = _diff_highlight_colors(option.palette)
+        key = (text, tuple(ranges), option.font.key(), highlight_bg.name())
+        doc = self._doc_cache.get(key)
+        if doc is None:
+            doc = self._build_document(text, ranges, option)
+            if len(self._doc_cache) >= self._DOC_CACHE_MAX:
+                self._doc_cache.pop(next(iter(self._doc_cache)))
+            self._doc_cache[key] = doc
+        return doc
+
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:  # type: ignore[override]
         style = option.widget.style() if option.widget is not None else None
         if style is None:
@@ -145,7 +147,7 @@ class DiffHighlightDelegate(QStyledItemDelegate):
 
         # When selected, keep text plain for readability on highlight background.
         ranges = [] if (option.state & QStyle.StateFlag.State_Selected) else self._normalized_ranges(text, index.data(DIFF_RANGES_ROLE))
-        document = self._build_document(text, ranges, option)
+        document = self._cached_document(text, ranges, option)
         document.setTextWidth(float(max(10, text_rect.width())))
 
         painter.save()
@@ -166,7 +168,7 @@ class DiffHighlightDelegate(QStyledItemDelegate):
         width = max(40, width - 8)
 
         ranges = self._normalized_ranges(text, index.data(DIFF_RANGES_ROLE))
-        document = self._build_document(text, ranges, option)
+        document = self._cached_document(text, ranges, option)
         document.setTextWidth(float(width))
         size = document.size().toSize()
         size.setHeight(max(size.height() + 6, 24))

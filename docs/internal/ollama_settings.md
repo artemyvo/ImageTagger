@@ -1,6 +1,6 @@
 # Ollama Settings Reference
 
-Navigation: [Project README](../README.md) | [Docs Index](README.md) | [Usage Guide](usage.md)
+Navigation: [Project README](../../README.md) | [Docs Index](../README.md) | [Usage Guide](../usage.md)
 
 This page explains ImageTagger Ollama settings with a focus on auto thread mode.
 

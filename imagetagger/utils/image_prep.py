@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from io import BytesIO
 import math
@@ -14,6 +15,15 @@ DEFAULT_MAX_IMAGE_PIXELS = 1_000_000
 _max_image_pixels = DEFAULT_MAX_IMAGE_PIXELS
 _resize_warning_lock = threading.Lock()
 _resize_warning_pending = False
+
+# ---------------------------------------------------------------------------
+# PreparedImage cache: keyed on (path, mtime, size, force_webp_to_png).
+# Bounded LRU so repeated LLM requests for the same image skip re-encoding.
+# ---------------------------------------------------------------------------
+_PreparedImageCacheKey = tuple  # (Path, float, int, bool)
+_prepared_image_cache: OrderedDict[_PreparedImageCacheKey, PreparedImage] = OrderedDict()
+_prepared_image_cache_lock = threading.Lock()
+_PREPARED_IMAGE_CACHE_MAX = 128
 
 _MEDIA_TYPES_BY_FORMAT = {
     "BMP": "image/bmp",
@@ -80,16 +90,39 @@ def prepare_image_for_query(
     *,
     force_webp_to_png: bool = False,
 ) -> PreparedImage:
+    cache_key: _PreparedImageCacheKey | None = None
+    try:
+        stat = image_path.stat()
+        cache_key = (image_path, stat.st_mtime, stat.st_size, force_webp_to_png)
+    except OSError:
+        pass
+
+    if cache_key is not None:
+        with _prepared_image_cache_lock:
+            cached = _prepared_image_cache.get(cache_key)
+            if cached is not None:
+                _prepared_image_cache.move_to_end(cache_key)
+                return cached
+
     try:
         image_bytes = image_path.read_bytes()
     except OSError as exc:
         raise LlmQueryError(f"Could not read image file: {exc}") from exc
 
-    return _prepare_image_bytes(
+    result = _prepare_image_bytes(
         image_bytes,
         suffix=image_path.suffix,
         force_webp_to_png=force_webp_to_png,
     )
+
+    if cache_key is not None:
+        with _prepared_image_cache_lock:
+            _prepared_image_cache[cache_key] = result
+            _prepared_image_cache.move_to_end(cache_key)
+            while len(_prepared_image_cache) > _PREPARED_IMAGE_CACHE_MAX:
+                _prepared_image_cache.popitem(last=False)
+
+    return result
 
 
 def _prepare_image_bytes(

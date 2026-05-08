@@ -12,6 +12,8 @@ def create_server_settings_frame(
     use_button: QPushButton,
     include_tags_checkbox: QCheckBox,
     include_description_checkbox: QCheckBox,
+    include_vision_checkbox: QCheckBox | None = None,
+    include_refine_checkbox: QCheckBox | None = None,
     timeout_input: QLineEdit,
     retry_input: QLineEdit,
     max_resolution_input: QLineEdit,
@@ -41,6 +43,10 @@ def create_server_settings_frame(
     options_row.setContentsMargins(0, 0, 0, 0)
     options_row.addWidget(include_tags_checkbox)
     options_row.addWidget(include_description_checkbox)
+    if include_vision_checkbox is not None:
+        options_row.addWidget(include_vision_checkbox)
+    if include_refine_checkbox is not None:
+        options_row.addWidget(include_refine_checkbox)
     options_row.addSpacing(12)
     options_row.addWidget(QLabel("Timeout", parent))
     options_row.addWidget(timeout_input)

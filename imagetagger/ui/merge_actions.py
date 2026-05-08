@@ -1,204 +1,105 @@
 from __future__ import annotations
 
 from pathlib import Path
-import re
 from typing import Callable, Literal
 
 from PyQt6.QtWidgets import QDialog, QMessageBox, QStyle, QWidget
 
-from imagetagger.utils.annotations import sanitize_annotation_text, sanitize_tag_text, sanitize_description_text
-from imagetagger.utils.io_utils import atomic_write_text
+from imagetagger.utils.annotations import sanitize_description_text, sanitize_tag_text
+from imagetagger.utils.fixup_parser import FixupData
+from imagetagger.utils.sidecar import (
+    SidecarData,
+    get_sidecar_json_path,
+    read_sidecar_data,
+    write_sidecar_data,
+)
 from imagetagger.providers.llm_provider import VisionLlmProvider, VisionLlmSession
-from imagetagger.ui.merge_dialog import FixupDialog, parse_fixup_data
+from imagetagger.ui.merge_dialog import FixupDialog
 
 
-_AI_FIND_SECTION_HEADER = "AI_FIND_MATCHES:"
-_KNOWN_FIXUP_HEADERS = {
-    "ISSUES:",
-    "TAGS:",
-    "DESCRIPTION:",
-    _AI_FIND_SECTION_HEADER,
-}
-
-
-def fixup_path_for_image(image_path: Path) -> Path:
-    return image_path.parent / f"{image_path.name}.fixup"
-
-
-def legacy_fixup_path_for_image(image_path: Path) -> Path:
-    return image_path.with_suffix(".fixup")
-
-
-def existing_fixup_path_for_image(image_path: Path) -> Path | None:
-    preferred = fixup_path_for_image(image_path)
-    if preferred.exists():
-        return preferred
-
-    legacy = legacy_fixup_path_for_image(image_path)
-    if legacy.exists():
-        return legacy
-
-    return None
-
-
-def _dedupe_fixup_tags_content(content: str) -> str:
-    """Normalize and deduplicate entries within each TAGS section."""
-    lines = content.splitlines()
-    if not lines:
-        return ""
-
-    output_lines: list[str] = []
-    index = 0
-
-    while index < len(lines):
-        line = lines[index]
-        stripped = line.strip()
-        upper = stripped.upper()
-
-        if upper.startswith("TAGS:"):
-            raw_tags: list[str] = []
-            inline_content = stripped[5:].strip()
-            if inline_content:
-                raw_tags.append(inline_content)
-
-            index += 1
-            while index < len(lines):
-                next_line = lines[index]
-                next_stripped = next_line.strip()
-                next_upper = next_stripped.upper()
-                if (
-                    next_upper.startswith("ISSUES:")
-                    or next_upper.startswith("TAGS:")
-                    or next_upper.startswith("DESCRIPTION:")
-                    or next_upper.startswith(_AI_FIND_SECTION_HEADER)
-                ):
-                    break
-                if next_stripped:
-                    raw_tags.append(next_stripped)
-                index += 1
-
-            unique_tags: list[str] = []
-            seen_keys: set[str] = set()
-            for value in raw_tags:
-                normalized = sanitize_tag_text(_normalize_fixup_section_entry(value))
-                if not normalized:
-                    continue
-                key = normalized.casefold()
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                unique_tags.append(normalized)
-
-            output_lines.append("TAGS:")
-            output_lines.extend(f"- {tag}" for tag in unique_tags)
-            continue
-
-        output_lines.append(line)
-        index += 1
-
-    return "\n".join(output_lines).strip() + "\n"
-
-
-def write_fixup_for_image(image_path: Path, content: str) -> Path:
-    fixup_path = fixup_path_for_image(image_path)
-    cleaned_content = _dedupe_fixup_tags_content(content)
-    atomic_write_text(fixup_path, cleaned_content, encoding="utf-8")
-    return fixup_path
-
-
-def _normalize_fixup_section_entry(value: str) -> str:
-    text = value.strip()
-    if text.startswith("- "):
-        text = text[2:].strip()
-    return text
-
-
-def _normalize_ai_find_match_query(
-    query: str,
-    normalize_annotation: Callable[[str], str] | None = None,
-) -> str:
-    cleaned_query = _normalize_fixup_section_entry(query)
-    if normalize_annotation is not None:
-        cleaned_query = normalize_annotation(cleaned_query)
-    return cleaned_query.strip().lower()
+def write_fixup_sidecar(
+    image_path: Path,
+    issues: str | None,
+    tags: list[str] | None,
+    description: str | None,
+    model: str | None = None,
+    date: str | None = None,
+) -> None:
+    data = read_sidecar_data(image_path)
+    data.fixup_issues = issues or None
+    data.fixup_tags = tags or None
+    data.fixup_description = description or None
+    data.fixup_model = model or None
+    data.fixup_date = date or None
+    write_sidecar_data(image_path, data)
 
 
 def record_ai_find_match_for_image(
     image_path: Path,
     query: str,
     normalize_annotation: Callable[[str], str] | None = None,
-) -> Path:
-    normalized_query = _normalize_ai_find_match_query(query, normalize_annotation)
-    if not normalized_query:
+) -> None:
+    normalized = query.strip()
+    if normalize_annotation is not None:
+        normalized = normalize_annotation(normalized)
+    normalized = normalized.strip().lower()
+    if not normalized:
         raise OSError("AI Find query cannot be empty.")
-
-    existing_path = existing_fixup_path_for_image(image_path)
-    if existing_path is None:
-        lines: list[str] = []
-    else:
-        try:
-            lines = existing_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError as exc:
-            raise OSError(f"Could not read fixup file: {exc}") from exc
-
-    # Header regex compatible with the improved parser
-    ai_find_header_re = re.compile(r"^[#*_\s>\-]*AI_FIND_MATCHES\b\s*[:\s]*", re.IGNORECASE)
-    any_header_re = re.compile(r"^[#*_\s>\-]*(ISSUES|TAGS|DESCRIPTION|AI_FIND_MATCHES)\b\s*[:\s]*", re.IGNORECASE)
-
-    header_index: int | None = None
-    for index, line in enumerate(lines):
-        if ai_find_header_re.match(line):
-            header_index = index
-            break
-
-    section_start = -1
-    section_end = -1
-    section_entries: list[str] = []
-    if header_index is not None:
-        section_start = header_index + 1
-        section_end = len(lines)
-        for index in range(section_start, len(lines)):
-            if any_header_re.match(lines[index]):
-                section_end = index
-                break
-
-        for line in lines[section_start:section_end]:
-            entry = _normalize_fixup_section_entry(line)
-            if entry:
-                section_entries.append(entry)
-
-    existing_keys = {entry.casefold() for entry in section_entries}
-    if normalized_query.casefold() not in existing_keys:
-        section_entries.append(normalized_query)
-
-    new_section_lines = [_AI_FIND_SECTION_HEADER]
-    new_section_lines.extend(f"- {entry}" for entry in section_entries)
-
-    if header_index is None:
-        output_lines = list(lines)
-        while output_lines and not output_lines[-1].strip():
-            output_lines.pop()
-        if output_lines:
-            output_lines.append("")
-        output_lines.extend(new_section_lines)
-    else:
-        output_lines = lines[:header_index] + new_section_lines + lines[section_end:]
-
-    fixup_path = fixup_path_for_image(image_path)
-    atomic_write_text(fixup_path, "\n".join(output_lines).strip() + "\n", encoding="utf-8")
-    return fixup_path
+    data = read_sidecar_data(image_path)
+    matches = list(data.ai_find_matches or [])
+    if normalized not in matches:
+        matches.append(normalized)
+        data.ai_find_matches = matches
+        write_sidecar_data(image_path, data)
 
 
-def clear_fixup_files_for_image(image_path: Path) -> None:
-    seen_paths: set[Path] = set()
-    for path in (fixup_path_for_image(image_path), legacy_fixup_path_for_image(image_path)):
-        if path in seen_paths:
-            continue
-        seen_paths.add(path)
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+def record_refine_result_for_image(
+    image_path: Path,
+    tags: list[str],
+    caption: str,
+) -> None:
+    normalized_tags = [sanitize_tag_text(t) for t in tags if sanitize_tag_text(t)]
+    normalized_caption = sanitize_description_text(caption)
+    data = read_sidecar_data(image_path)
+    data.vision_tags = normalized_tags or None
+    data.vision_caption = normalized_caption or None
+    write_sidecar_data(image_path, data)
+
+
+def clear_fixup_sidecar(image_path: Path) -> None:
+    from datetime import datetime, timezone
+    data = read_sidecar_data(image_path)
+    data.fixup_issues = None
+    data.fixup_tags = None
+    data.fixup_description = None
+    data.ai_find_matches = None
+    data.vision_tags = None
+    data.vision_caption = None
+    data.validated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data.validated_by = "user"
+    write_sidecar_data(image_path, data)
+
+
+def clear_validation_fields_sidecar(image_path: Path, model: str | None = None, date: str | None = None) -> None:
+    """Clear only the validation fixup fields, preserving ai_find_matches and vision data."""
+    from datetime import datetime, timezone
+    data = read_sidecar_data(image_path)
+    data.fixup_issues = None
+    data.fixup_tags = None
+    data.fixup_description = None
+    data.fixup_model = model or None
+    data.fixup_date = date or None
+    data.validated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data.validated_by = model or None
+    write_sidecar_data(image_path, data)
+
+
+def delete_sidecar_for_image(image_path: Path) -> None:
+    path = get_sidecar_json_path(image_path)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def open_fixup_dialog_for_image(
@@ -236,50 +137,68 @@ def open_fixup_dialog_for_image(
     confirm_delete: bool = True,
     save_regenerate_settings: Callable[[dict[str, int | float | bool | str]], None] | None = None,
 ) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
-    fixup_path = existing_fixup_path_for_image(image_path)
-    if fixup_path is None:
+    try:
+        sidecar = read_sidecar_data(image_path)
+    except OSError as exc:
+        QMessageBox.warning(parent, "Sidecar read failed", f"Could not read sidecar file:\n{exc}")
+        return "error"
+
+    if not sidecar.has_pending_fixup:
         refresh_fixup_state(image_path)
         return "missing"
 
-    try:
-        content = fixup_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        QMessageBox.warning(parent, "Fixup read failed", f"Could not read fixup file:\n{exc}")
-        return "error"
+    original_sidecar = SidecarData(
+        description=sidecar.description,
+        reasoning=sidecar.reasoning,
+        fixup_issues=sidecar.fixup_issues,
+        fixup_tags=list(sidecar.fixup_tags) if sidecar.fixup_tags is not None else None,
+        fixup_description=sidecar.fixup_description,
+        ai_find_matches=list(sidecar.ai_find_matches) if sidecar.ai_find_matches is not None else None,
+        vision_tags=list(sidecar.vision_tags) if sidecar.vision_tags is not None else None,
+        vision_caption=sidecar.vision_caption,
+    )
+
+    fixup_data = FixupData(
+        issues=sidecar.fixup_issues or "",
+        corrected_description=sanitize_description_text(sidecar.fixup_description or ""),
+        corrected_description_raw=sidecar.fixup_description or "",
+        corrected_tags=list(sidecar.fixup_tags or []),
+        search_matches=list(sidecar.ai_find_matches or []),
+        vision_tags=list(sidecar.vision_tags or []),
+        vision_caption=sidecar.vision_caption or "",
+        has_headers=True,
+    )
 
     def clear_fixup() -> bool:
         try:
-            fixup_path.unlink(missing_ok=True)
+            clear_fixup_sidecar(image_path)
         except OSError as exc:
-            QMessageBox.warning(parent, "Fixup cleanup failed", f"Could not remove fixup file:\n{exc}")
-            show_status("Fixup resolution failed: could not remove .fixup")
+            QMessageBox.warning(parent, "Fixup cleanup failed", f"Could not clear sidecar fixup:\n{exc}")
+            show_status("Fixup resolution failed")
             refresh_fixup_state(image_path)
             return False
-
-        show_status("Fixup resolved and .fixup removed")
+        show_status("Fixup resolved")
         refresh_fixup_state(image_path)
         return True
 
-    def restore_fixup(original_content: str) -> bool:
+    def restore_fixup() -> bool:
         try:
-            atomic_write_text(fixup_path, original_content, encoding="utf-8")
+            write_sidecar_data(image_path, original_sidecar)
         except OSError as exc:
-            QMessageBox.warning(parent, "Fixup restore failed", f"Could not restore fixup file:\n{exc}")
-            show_status("Undo failed: could not restore .fixup")
+            QMessageBox.warning(parent, "Fixup restore failed", f"Could not restore sidecar:\n{exc}")
+            show_status("Undo failed: could not restore sidecar")
             refresh_fixup_state(image_path)
             return False
-
         show_status("Fixup restored")
         refresh_fixup_state(image_path)
         return True
 
     dialog = FixupDialog(
         current_annotations,
-        parse_fixup_data(content, parse_tags, sanitize_annotation),
+        fixup_data,
         image_path,
         title_text,
         apply_annotations,
-        content,
         clear_fixup,
         restore_fixup,
         can_navigate_prev,
@@ -305,6 +224,12 @@ def open_fixup_dialog_for_image(
         merge_table_horizontal_scroll_row_target_mode=merge_table_horizontal_scroll_row_target_mode,
         delete_image=delete_image,
         confirm_delete=confirm_delete,
+        allow_left_delete=bool(sidecar.fixup_tags or sidecar.fixup_description),
+        fixup_tag_keys={
+            sanitize_tag_text(t).casefold()
+            for t in sidecar.fixup_tags
+            if sanitize_tag_text(t)
+        } if sidecar.fixup_tags is not None else None,
         parent=parent,
     )
 
@@ -336,9 +261,10 @@ def open_fixup_dialog_for_image(
     result = dialog.exec()
 
     if save_regenerate_settings is not None:
-        timeout_raw = dialog.regenerate_timeout_input.text().strip()
-        retry_raw = dialog.regenerate_retry_input.text().strip()
-        max_resolution_raw = dialog.regenerate_max_resolution_input.text().strip()
+        rp = dialog._regen_panel
+        timeout_raw = rp.regenerate_timeout_input.text().strip()
+        retry_raw = rp.regenerate_retry_input.text().strip()
+        max_resolution_raw = rp.regenerate_max_resolution_input.text().strip()
         try:
             timeout_value = int(timeout_raw) if timeout_raw else max(1, int(regenerate_timeout_seconds))
         except ValueError:
@@ -361,14 +287,14 @@ def open_fixup_dialog_for_image(
 
         save_regenerate_settings(
             {
-                "tags_enabled": dialog.regenerate_tags_checkbox.isChecked(),
-                "description_enabled": dialog.regenerate_description_checkbox.isChecked(),
+                "tags_enabled": rp.regenerate_tags_checkbox.isChecked(),
+                "description_enabled": rp.regenerate_description_checkbox.isChecked(),
                 "timeout_seconds": max(1, timeout_value),
                 "retry_count": max(0, retry_value),
                 "max_resolution_mpx": max_resolution_value,
-                "model_name": dialog._llm_model_name,
-                "model_endpoint": dialog._llm_endpoint,
-                "user_hint": dialog._regenerate_user_hint_text(),
+                "model_name": rp.current_model_name,
+                "model_endpoint": rp.current_endpoint,
+                "user_hint": rp.current_user_hint,
             }
         )
 
@@ -391,3 +317,4 @@ def open_fixup_dialog_for_image(
         outcome = "cancelled"
 
     return outcome
+

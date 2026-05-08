@@ -42,9 +42,8 @@ _DEFAULTS: dict = {
     "confirm_on_delete": True,
     "last_selected_image": "",
     "debug_regenerate_prompt_console": False,
-    "integrity_check_enabled": False,
-    "integrity_check_auto_fix": False,
     "merge_table_mouse_actions": dict(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS),
+    "agent_roles": {},
 }
 
 
@@ -206,15 +205,17 @@ def _normalize_loaded_config(data: Any) -> dict:
         data.get("debug_regenerate_prompt_console"),
         _DEFAULTS["debug_regenerate_prompt_console"],
     )
-    normalized["integrity_check_enabled"] = _normalize_bool(
-        data.get("integrity_check_enabled"),
-        _DEFAULTS["integrity_check_enabled"],
-    )
-    normalized["integrity_check_auto_fix"] = _normalize_bool(
-        data.get("integrity_check_auto_fix"),
-        _DEFAULTS["integrity_check_auto_fix"],
-    )
     normalized["merge_table_mouse_actions"] = _normalize_merge_table_mouse_actions(data)
+
+    raw_roles = data.get("agent_roles")
+    if isinstance(raw_roles, dict):
+        normalized["agent_roles"] = {
+            k: v for k, v in raw_roles.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
+    else:
+        normalized["agent_roles"] = {}
+
     return normalized
 
 
