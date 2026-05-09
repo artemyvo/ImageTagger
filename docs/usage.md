@@ -243,6 +243,7 @@ Supported terms:
 
 - `fixup`: images with pending fixup data in their sidecar.
 - `untagged`: images that have no annotation (.txt) file at all.
+- `validated`: images that have passed validation (carry the ✅ badge).
 - `resolution <, >, <=, >=`: images matching a resolution threshold in megapixels.
 - `"tag"`: exact tag match.
 - `'text'`: case-insensitive text match against annotation content.
@@ -259,6 +260,8 @@ Precedence (highest to lowest): NOT, AND, OR — same as C. So `a | b & c` is `a
 Examples:
 
 - `!fixup` — images without pending fixup data
+- `!validated` — images that have not yet been validated
+- `validated & !fixup` — images fully signed off, no pending changes
 - `resolution < 1.0` — images with resolution lower than 1 MPx
 - `resolution >= 5` — images with resolution 5 MPx or higher
 - `(resolution > 5) & 'landscape'` — high-res landscape images

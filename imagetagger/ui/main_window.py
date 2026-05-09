@@ -95,6 +95,9 @@ from imagetagger.utils.llm_queries import (
     prepare_validation_query,
     prepare_vision_query,
     prompt_source_for_kind,
+    render_prompt_with_agent_role,
+    render_prompt_with_existing_tags,
+    render_prompt_with_user_hint,
     reset_prompt_to_default,
     save_prompt_for_kind,
     set_prompt_override,
@@ -455,7 +458,7 @@ class MainWindow(QMainWindow):
         self.list_widget.setItemDelegate(_ImageRowDelegate(self))
 
         self.filter_input = QLineEdit(self)
-        self.filter_input.setPlaceholderText("Filter (fixup, vision, \"tag\", 'text', &, |, parentheses)")
+        self.filter_input.setPlaceholderText("Filter (fixup, vision, validated, \"tag\", 'text', &, |, parentheses)")
         self.filter_input.textChanged.connect(self._apply_image_filter)
 
         self.filter_help_button = QPushButton("?", self)
@@ -507,6 +510,12 @@ class MainWindow(QMainWindow):
         self.select_next_image_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.select_next_image_action.triggered.connect(lambda: self._move_image_selection(1))
         self.addAction(self.select_next_image_action)
+
+        self.focus_tag_input_action = QAction("Focus Tag Input", self)
+        self.focus_tag_input_action.setShortcut(platform_key_sequence("Alt+T", "Alt+T"))
+        self.focus_tag_input_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.focus_tag_input_action.triggered.connect(self._focus_tag_input_when_autotag)
+        self.addAction(self.focus_tag_input_action)
 
         self.center_panel = QWidget(self)
         center_layout = QVBoxLayout(self.center_panel)
@@ -678,14 +687,14 @@ class MainWindow(QMainWindow):
         )
 
         gen_row = QHBoxLayout()
-        self.generate_button = QPushButton("Generate", self)
+        self.generate_button = QPushButton("&Generate", self)
         self.generate_button.clicked.connect(self.generate_with_llm)
         gen_row.addWidget(self.generate_button)
 
         buttons_row = QHBoxLayout()
-        self.validate_button = QPushButton("Validate", self)
+        self.validate_button = QPushButton("&Validate", self)
         self.validate_button.clicked.connect(self.validate_tags_with_llm)
-        self.fixup_button = QPushButton("Fixup", self)
+        self.fixup_button = QPushButton("Fi&xup", self)
         self.fixup_button.clicked.connect(self.open_fixup_dialog)
         buttons_row.addWidget(self.validate_button)
         buttons_row.addWidget(self.fixup_button)
@@ -813,6 +822,7 @@ class MainWindow(QMainWindow):
         self.known_tags_filter.setPlaceholderText("Filter tags…")
         self.known_tags_filter.setClearButtonEnabled(True)
         self.known_tags_filter.textChanged.connect(self._refresh_known_tags_list)
+        self.known_tags_filter.installEventFilter(self)
         layout.addWidget(self.known_tags_filter)
 
         self.known_tags_list = GlobalTagListWidget(self)
@@ -899,18 +909,26 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Prompt error", str(exc))
             return
 
+        agent_role = self._cfg.get("agent_roles", {}).get(kind) or None
+
         if kind == "vision":
             tags_lines = self._parse_annotations_for_tag_list(record.text)
             tags_text = "\n".join(tags_lines).strip()
             prompt = editor_text.replace("{tags}", tags_text)
+            prompt = render_prompt_with_agent_role(prompt, agent_role)
+            prompt = render_prompt_with_user_hint(prompt)
         elif kind == "validation":
             prompt = editor_text.replace("{tags}", format_annotations_for_validation(record.text))
+            prompt = render_prompt_with_agent_role(prompt, agent_role)
+            prompt = render_prompt_with_user_hint(prompt)
         elif kind == "search":
             query = " ".join(self.ai_find_input.text().split())
             if not query:
                 QMessageBox.information(self, "Missing search text", "Enter text in the AI Find box to test the search prompt.")
                 return
             prompt = editor_text.replace("{query}", query)
+            prompt = render_prompt_with_agent_role(prompt, agent_role)
+            prompt = render_prompt_with_user_hint(prompt)
         elif kind == "refine":
             vision_data = read_sidecar_data(record.image_path)
             if vision_data.description:
@@ -919,8 +937,13 @@ class MainWindow(QMainWindow):
                 parts.append(f'reasoning: "{vision_data.reasoning}"')
             vision_text = "\n".join(parts) if parts else "(no vision data available for this image)"
             prompt = editor_text.replace("{vision_data}", vision_text)
+            prompt = render_prompt_with_agent_role(prompt, agent_role)
+            prompt = render_prompt_with_user_hint(prompt)
         else:
-            prompt = editor_text
+            existing_tags = self._parse_annotations_for_tag_list(record.text)
+            prompt = render_prompt_with_agent_role(editor_text, agent_role)
+            prompt = render_prompt_with_existing_tags(prompt, existing_tags)
+            prompt = render_prompt_with_user_hint(prompt)
 
         try:
             self._apply_query_downscale_setting()
@@ -1289,9 +1312,9 @@ class MainWindow(QMainWindow):
         if self.status_connection_label is not None:
             self.status_connection_label.setText(text)
         if self._llm_thread is not None and self._llm_action_name == "Generate":
-            self.generate_button.setText("Stop generation")
+            self.generate_button.setText("&Stop generation")
             self.generate_button.setEnabled(True)
-            self.validate_button.setText("Validate")
+            self.validate_button.setText("&Validate")
             self.validate_button.setEnabled(False)
             self.ai_find_button.setText("AI Find")
             self.ai_find_button.setEnabled(False)
@@ -1299,9 +1322,9 @@ class MainWindow(QMainWindow):
             self._update_fixup_button_state()
             return
         if self._llm_thread is not None and self._llm_action_name == "Validate":
-            self.generate_button.setText("Generate")
+            self.generate_button.setText("&Generate")
             self.generate_button.setEnabled(False)
-            self.validate_button.setText("Stop validation")
+            self.validate_button.setText("&Stop validation")
             self.validate_button.setEnabled(True)
             self.ai_find_button.setText("AI Find")
             self.ai_find_button.setEnabled(False)
@@ -1309,9 +1332,9 @@ class MainWindow(QMainWindow):
             self._update_fixup_button_state()
             return
         if self._llm_thread is not None and self._llm_action_name == "AI Find":
-            self.generate_button.setText("Generate")
+            self.generate_button.setText("&Generate")
             self.generate_button.setEnabled(False)
-            self.validate_button.setText("Validate")
+            self.validate_button.setText("&Validate")
             self.validate_button.setEnabled(False)
             self.ai_find_button.setText("Stop AI Find")
             self.ai_find_button.setEnabled(True)
@@ -1319,8 +1342,8 @@ class MainWindow(QMainWindow):
             self._update_fixup_button_state()
             return
 
-        self.generate_button.setText("Generate")
-        self.validate_button.setText("Validate")
+        self.generate_button.setText("&Generate")
+        self.validate_button.setText("&Validate")
         self.ai_find_button.setText("AI Find")
         active = connected and self._llm_thread is None
         self.generate_button.setEnabled(
@@ -1474,6 +1497,7 @@ class MainWindow(QMainWindow):
             "- fixup: show images with fixup files\n"
             "- untagged: show images with no annotation file\n"
             "- vision: show images with a sidecar .json (vision data)\n"
+            "- validated: show images that have passed validation (✅ badge)\n"
             "- resolution <, >, <=, >=: compare resolution in megapixels\n"
             "- \"tag\": match an exact tag\n"
             "- 'text': match free text inside annotation content\n"
@@ -1484,6 +1508,7 @@ class MainWindow(QMainWindow):
             "Precedence (highest to lowest): NOT, AND, OR\n\n"
             "Examples:\n"
             "- !fixup\n"
+            "- !validated\n"
             "- resolution < 1.0\n"
             "- (resolution > 5) & 'landscape'\n"
             "- untagged | fixup\n"
@@ -1510,6 +1535,7 @@ class MainWindow(QMainWindow):
             "fixup": lambda record: record.has_pending_fixup,
             "untagged": lambda record: not record.text_path.exists(),
             "vision": lambda record: get_sidecar_json_path(record.image_path).exists(),
+            "validated": lambda record: read_sidecar_data(record.image_path).validated is not None,
         }
         return _FilterRuntime(
             named_filters=named_filters,
@@ -1714,6 +1740,10 @@ class MainWindow(QMainWindow):
             return
         self.list_widget.setCurrentRow(index)
 
+    def _focus_tag_input_when_autotag(self) -> None:
+        if self.controls_tabs.currentIndex() == 0:
+            self.tag_input.setFocus()
+
     def _move_image_selection(self, direction: int) -> bool:
         if direction not in (-1, 1):
             return False
@@ -1753,6 +1783,12 @@ class MainWindow(QMainWindow):
                 if key == Qt.Key.Key_Down:
                     self._move_image_selection(1)
                     return True
+        if hasattr(self, "known_tags_filter") and watched is self.known_tags_filter and event.type() == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Down:
+                self.known_tags_list.setFocus()
+                if self.known_tags_list.currentItem() is None and self.known_tags_list.count() > 0:
+                    self.known_tags_list.setCurrentRow(0)
+                return True
         return super().eventFilter(watched, event)
 
     def _show_image_context_menu(self, position) -> None:
@@ -3132,14 +3168,14 @@ class MainWindow(QMainWindow):
             return
         tag_count = len(tags_set)
         tag_label = f'"{next(iter(tags_set))}"' if tag_count == 1 else f"{tag_count} tags"
-        reply = QMessageBox.question(
-            self,
-            "Remove tags from all images",
-            f'Remove {tag_label} from {len(affected)} image(s)?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("Remove tags from all images")
+        confirm.setText(f'Remove {tag_label} from {len(affected)} image(s)?')
+        confirm.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        confirm.setDefaultButton(QMessageBox.StandardButton.No)
+        confirm.raise_()
+        confirm.activateWindow()
+        if confirm.exec() != QMessageBox.StandardButton.Yes:
             return
 
         # Compute new text for every affected record on the main thread (fast, no I/O).
@@ -4668,6 +4704,15 @@ class MainWindow(QMainWindow):
             try:
                 from imagetagger.utils.fixup_parser import parse_fixup_data
                 parsed_fixup = parse_fixup_data(cleaned, self._parse_tags, self._sanitize_annotation_text)
+                if not parsed_fixup.issues and not parsed_fixup.corrected_tags and not parsed_fixup.corrected_description_raw:
+                    clear_validation_fields_sidecar(
+                        record.image_path,
+                        model=self.llm_model_name,
+                        date=datetime.now().astimezone().isoformat(timespec="seconds"),
+                    )
+                    self.statusBar().showMessage("Validate complete: no issues found")
+                    self._on_fixup_state_changed()
+                    return
                 write_fixup_sidecar(
                     record.image_path,
                     parsed_fixup.issues or None,
@@ -4758,6 +4803,10 @@ class MainWindow(QMainWindow):
 
         try:
             if parsed is not None:
+                if not parsed.issues and not parsed.corrected_tags and not parsed.corrected_description_raw:
+                    clear_validation_fields_sidecar(record.image_path, model=validation_model, date=validation_date)
+                    self._on_fixup_state_changed(record.image_path)
+                    return ("clean", llm_violated_no_commas)
                 write_fixup_sidecar(
                     record.image_path,
                     parsed.issues or None,

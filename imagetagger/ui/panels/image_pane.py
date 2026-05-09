@@ -204,18 +204,18 @@ class ImagePane(QWidget):
             return
 
         if self._confirm_delete:
-            answer = QMessageBox.question(
-                self,
-                "Delete file",
-                (
-                    f"Delete this image and related files?\n\n"
-                    f"Image: {self._current_image_path.name}\n"
-                    "Also deletes matching .txt and .fixup files"
-                ),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+            confirm = QMessageBox(self)
+            confirm.setWindowTitle("Delete file")
+            confirm.setText(
+                f"Delete this image and related files?\n\n"
+                f"Image: {self._current_image_path.name}\n"
+                "Also deletes matching .txt and .fixup files"
             )
-            if answer != QMessageBox.StandardButton.Yes:
+            confirm.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            confirm.setDefaultButton(QMessageBox.StandardButton.No)
+            confirm.raise_()
+            confirm.activateWindow()
+            if confirm.exec() != QMessageBox.StandardButton.Yes:
                 return
 
         deleted, has_fixups_remaining = self._delete_image()

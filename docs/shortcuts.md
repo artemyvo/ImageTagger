@@ -26,6 +26,11 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Exit app | Ctrl+Q | Command+Q | File menu |
 | Increase font | Ctrl++ / Ctrl+= | Command++ / Command+= | Edit menu |
 | Decrease font | Ctrl+- | Command+- | Edit menu |
+| Generate | Alt+G | Option+G | AutoTag tab active |
+| Stop batch (generation or validation) | Alt+S | Option+S | AutoTag tab active, while generation or validation is in progress |
+| Validate | Alt+V | Option+V | AutoTag tab active |
+| Open Fixup dialog | Alt+X | Option+X | AutoTag tab active |
+| Focus tag input | Alt+T | Option+T | AutoTag tab active |
 
 ## Merge Dialog
 
