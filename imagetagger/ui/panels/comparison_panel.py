@@ -1285,8 +1285,11 @@ class ComparisonPanel(QWidget):
             item = self.left_list.item(i)
             item_text = left_texts[i] if i < len(left_texts) else item.text().strip()
             existing_widget = self.left_list.itemWidget(item)
+            right_index = left_matches.get(i)
+            is_fuzzy_match = right_index is not None and right_match_kind.get(right_index) == "fuzzy"
             should_show_x = self._allow_left_delete and (
-                i not in left_matches or self._is_fixup_deletion_candidate(left_texts[i])
+                right_index is None
+                or (not is_fuzzy_match and self._is_fixup_deletion_candidate(left_texts[i]))
             )
 
             if should_show_x:
@@ -1680,13 +1683,13 @@ class ComparisonPanel(QWidget):
                         right_text = right_texts[right_index]
                         callback = lambda idx=right_index, text=right_text: self._add_search_match_to_tags(text)
                     elif left_index is not None:
-                        if self._is_fixup_deletion_candidate(left_texts[left_index]):
+                        if right_match_kind.get(right_index) != "exact":
+                            action_text = "←"
+                            callback = lambda table_row=row, idx=right_index: self._merge_proposed_row_from_table(table_row, idx)
+                        elif self._is_fixup_deletion_candidate(left_texts[left_index]):
                             left_text = left_texts[left_index]
                             action_text = "✕"
                             callback = lambda table_row=row, value=left_text: self._remove_left_item_from_table(table_row, value)
-                        elif right_match_kind.get(right_index) != "exact":
-                            action_text = "←"
-                            callback = lambda table_row=row, idx=right_index: self._merge_proposed_row_from_table(table_row, idx)
                     else:
                         action_text = "←"
                         callback = lambda table_row=row, idx=right_index: self._merge_proposed_row_from_table(table_row, idx)

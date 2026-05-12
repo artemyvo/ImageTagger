@@ -12,6 +12,16 @@ from imagetagger.utils.llm_queries import LlmQueryError
 
 DEFAULT_MAX_IMAGE_PIXELS = 1_000_000
 
+
+def is_pillow_image_resize_available() -> bool:
+    """Return True if Pillow is installed so images can be downscaled before LLM upload."""
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 _max_image_pixels = DEFAULT_MAX_IMAGE_PIXELS
 _resize_warning_lock = threading.Lock()
 _resize_warning_pending = False
@@ -20,7 +30,7 @@ _resize_warning_pending = False
 # PreparedImage cache: keyed on (path, mtime, size, force_webp_to_png).
 # Bounded LRU so repeated LLM requests for the same image skip re-encoding.
 # ---------------------------------------------------------------------------
-_PreparedImageCacheKey = tuple  # (Path, float, int, bool)
+_PreparedImageCacheKey = tuple  # (Path, float, int, bool, int)
 _prepared_image_cache: OrderedDict[_PreparedImageCacheKey, PreparedImage] = OrderedDict()
 _prepared_image_cache_lock = threading.Lock()
 _PREPARED_IMAGE_CACHE_MAX = 128
@@ -93,7 +103,7 @@ def prepare_image_for_query(
     cache_key: _PreparedImageCacheKey | None = None
     try:
         stat = image_path.stat()
-        cache_key = (image_path, stat.st_mtime, stat.st_size, force_webp_to_png)
+        cache_key = (image_path, stat.st_mtime, stat.st_size, force_webp_to_png, _max_image_pixels)
     except OSError:
         pass
 

@@ -379,6 +379,8 @@ class MainWindow(QMainWindow):
         self._validate_batch_started_at: float | None = None
         self._validate_batch_retry_images = 0
         self._validate_batch_llm_disobeyed = 0
+        self._validate_batch_errors = 0
+        self._validate_batch_context_exhausted = 0
         self._validate_pending_indices: set[int] = set()
         self._ai_find_batch_total = 0
         self._ai_find_batch_processed = 0
@@ -3439,6 +3441,7 @@ class MainWindow(QMainWindow):
                 completed += 1
 
                 retried = bool(payload.get("retried")) if isinstance(payload, dict) else False
+                perf_retry = bool(payload.get("perf_retry", retried)) if isinstance(payload, dict) else retried
                 image_name = ""
                 if isinstance(payload, dict):
                     image_name = str(payload.get("image_name", "")).strip()
@@ -3459,7 +3462,7 @@ class MainWindow(QMainWindow):
                                 f"timeout_backoff completed={completed}/{total} epoch={backoff_epoch}",
                                 image_name=image_name,
                             )
-                    elif retried:
+                    elif perf_retry:
                         if finished_backoff_epoch == backoff_epoch:
                             previous_parallelism = target_parallelism
                             target_parallelism = max(1, target_parallelism - 1)
@@ -3574,6 +3577,7 @@ class MainWindow(QMainWindow):
                 refine_tags: list[str] = []
                 refine_caption = ""
                 image_retried = False
+                image_perf_retry = False
                 image_timed_out = False
                 image_started_at = time.monotonic()
 
@@ -3692,6 +3696,8 @@ class MainWindow(QMainWindow):
                     except LlmProviderError as exc:
                         if "Timed out" in str(exc):
                             image_timed_out = True
+                        if not getattr(exc, "no_backoff", False):
+                            image_perf_retry = True
                         retry_needed = True
 
                     elapsed_seconds = time.monotonic() - attempt_start
@@ -3723,6 +3729,7 @@ class MainWindow(QMainWindow):
                     "refine_tags": refine_tags,
                     "refine_caption": refine_caption,
                     "retried": image_retried,
+                    "perf_retry": image_perf_retry,
                     "timed_out": image_timed_out,
                     "elapsed_s": max(0.0, time.monotonic() - image_started_at),
                     "position": position,
@@ -3813,6 +3820,7 @@ class MainWindow(QMainWindow):
                 record = self.records[record_index]
                 image_name = self._display_image_path(record.image_path)
                 image_retried = False
+                image_perf_retry = False
                 validation_result = ""
                 image_timed_out = False
                 image_started_at = time.monotonic()
@@ -3862,13 +3870,26 @@ class MainWindow(QMainWindow):
                     except LlmProviderError as exc:
                         if "Timed out" in str(exc):
                             image_timed_out = True
+                        if not getattr(exc, "no_backoff", False):
+                            image_perf_retry = True
                         elapsed_seconds = time.monotonic() - attempt_start
                         print(
                             f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
                             flush=True,
                         )
                         if attempt >= retry_count:
-                            raise
+                            # Return a per-image error instead of raising so one
+                            # failing image does not abort the entire batch.
+                            return {
+                                "kind": "validate_item_error",
+                                "index": record_index,
+                                "error": str(exc),
+                                "timed_out": image_timed_out,
+                                "context_exhausted": getattr(exc, "context_exhausted", False),
+                                "position": position,
+                                "total": total,
+                                "image_name": image_name,
+                            }
                         continue
 
                     elapsed_seconds = time.monotonic() - attempt_start
@@ -3883,6 +3904,7 @@ class MainWindow(QMainWindow):
                     "index": record_index,
                     "result": validation_result,
                     "retried": image_retried,
+                    "perf_retry": image_perf_retry,
                     "timed_out": image_timed_out,
                     "elapsed_s": max(0.0, time.monotonic() - image_started_at),
                     "position": position,
@@ -3917,6 +3939,8 @@ class MainWindow(QMainWindow):
         self._validate_batch_started_at = time.monotonic()
         self._validate_batch_retry_images = 0
         self._validate_batch_llm_disobeyed = 0
+        self._validate_batch_errors = 0
+        self._validate_batch_context_exhausted = 0
         self._validate_pending_indices = {idx for idx, _ in annotated_records}
 
         self._start_llm_task(
@@ -3971,6 +3995,7 @@ class MainWindow(QMainWindow):
                 record = self.records[record_index]
                 image_name = record.image_path.name
                 image_retried = False
+                image_perf_retry = False
                 matched = False
                 image_timed_out = False
                 image_started_at = time.monotonic()
@@ -4016,6 +4041,8 @@ class MainWindow(QMainWindow):
                     except LlmProviderError as exc:
                         if "Timed out" in str(exc):
                             image_timed_out = True
+                        if not getattr(exc, "no_backoff", False):
+                            image_perf_retry = True
                         elapsed_seconds = time.monotonic() - attempt_start
                         print(
                             f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
@@ -4037,6 +4064,7 @@ class MainWindow(QMainWindow):
                     "index": record_index,
                     "matched": matched,
                     "retried": image_retried,
+                    "perf_retry": image_perf_retry,
                     "timed_out": image_timed_out,
                     "elapsed_s": max(0.0, time.monotonic() - image_started_at),
                     "position": position,
@@ -4220,8 +4248,9 @@ class MainWindow(QMainWindow):
                 self._validate_batch_retry_images,
             )
             issues_text = f" | invalid: {self._validate_batch_issues}"
+            errors_text = f" | errors: {self._validate_batch_errors}" if self._validate_batch_errors > 0 else ""
             disobeyed_text = f" | LLM disobeyed: {self._validate_batch_llm_disobeyed}" if self._validate_batch_llm_disobeyed > 0 else ""
-            self.statusBar().showMessage(f"{message}{details}{issues_text}{disobeyed_text}{self._llm_threads_status_suffix()}")
+            self.statusBar().showMessage(f"{message}{details}{issues_text}{errors_text}{disobeyed_text}{self._llm_threads_status_suffix()}")
             return
 
         if self._llm_action_name == "AI Find" and (
@@ -4489,6 +4518,28 @@ class MainWindow(QMainWindow):
                 )
             return
 
+        if kind == "validate_item_error":
+            raw_index = payload.get("index")
+            raw_error = str(payload.get("error") or "")
+            raw_image_name = str(payload.get("image_name") or "").strip()
+            raw_timed_out = bool(payload.get("timed_out"))
+            raw_context_exhausted = bool(payload.get("context_exhausted"))
+
+            if isinstance(raw_index, int) and 0 <= raw_index < len(self.records):
+                self._validate_pending_indices.discard(raw_index)
+            self._validate_batch_processed += 1
+            self._validate_batch_errors += 1
+            if raw_timed_out:
+                self._validate_batch_retry_images += 1
+            if raw_context_exhausted:
+                self._validate_batch_context_exhausted += 1
+
+            print(
+                f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_error image={raw_image_name} error={raw_error!r}",
+                flush=True,
+            )
+            return
+
         if kind != "validate_item":
             return
 
@@ -4543,8 +4594,9 @@ class MainWindow(QMainWindow):
         ):
             skipped = self._validate_batch_skipped
             total_checked = self._validate_batch_clean + self._validate_batch_issues
+            errors = self._validate_batch_errors
 
-            if total_checked == 0:
+            if total_checked == 0 and errors == 0:
                 QMessageBox.information(self, f"{action_name} finished", empty_message)
                 self.statusBar().showMessage(f"{action_name} finished")
             else:
@@ -4553,6 +4605,8 @@ class MainWindow(QMainWindow):
                     f"{self._validate_batch_clean} clean",
                     f"{self._validate_batch_issues} fixup file{'s' if self._validate_batch_issues != 1 else ''}",
                 ]
+                if errors:
+                    parts.append(f"{errors} error{'s' if errors != 1 else ''}")
                 if skipped:
                     parts.append(f"{skipped} skipped")
                 self.statusBar().showMessage(
@@ -4564,6 +4618,21 @@ class MainWindow(QMainWindow):
             self._validate_batch_clean = 0
             self._validate_batch_issues = 0
             self._validate_batch_skipped = 0
+            self._validate_batch_errors = 0
+            ctx_exhausted = self._validate_batch_context_exhausted
+            self._validate_batch_context_exhausted = 0
+            if ctx_exhausted > 0:
+                n = ctx_exhausted
+                QMessageBox.warning(
+                    self,
+                    "Context window exhausted",
+                    f"{n} image{'s' if n != 1 else ''} failed because the model exhausted its "
+                    f"context window — thinking (CoT) tokens consumed all available space, leaving "
+                    f"no room for a response.\n\n"
+                    f"To fix this, increase num_ctx on your Ollama server. For example, pull the "
+                    f"model with a higher context size or set num_ctx in the model options "
+                    f"(e.g. 32768 or higher).",
+                )
             return
 
         if (
@@ -4844,6 +4913,8 @@ class MainWindow(QMainWindow):
         self._validate_batch_skipped = 0
         self._validate_batch_started_at = None
         self._validate_batch_retry_images = 0
+        self._validate_batch_errors = 0
+        self._validate_batch_context_exhausted = 0
         self._validate_pending_indices = set()
         self._ai_find_batch_total = 0
         self._ai_find_batch_processed = 0

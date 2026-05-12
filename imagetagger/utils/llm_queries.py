@@ -21,8 +21,22 @@ _USER_HINT_PLACEHOLDER = "{user_hint}"
 _EXISTING_TAGS_PLACEHOLDER = "{existing_tags}"
 _AGENT_ROLE_PLACEHOLDER = "{agent_role}"
 
+# Matches any remaining {word} placeholder token (ASCII identifier characters).
+_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
+
 
 _prompt_file_cache: dict[str, str] = {}
+
+
+def _strip_unresolved_placeholders(prompt: str) -> str:
+    """Remove any {placeholder} tokens that were not substituted.
+
+    This is a final safety pass applied after all known substitutions.
+    It prevents literal placeholder text (e.g. ``{agent_role}``) from
+    being forwarded to the LLM when a custom prompt file uses a token
+    that the current code path does not fill.
+    """
+    return _PLACEHOLDER_RE.sub("", prompt)
 
 
 def _load_prompt(filename: str, default: str) -> str:
@@ -307,9 +321,10 @@ def format_annotations_for_validation(annotations: str) -> str:
 def prepare_tagging_query(*, existing_tags: list[str] | None = None, agent_role: str | None = None) -> PreparedVisionQuery:
     prompt = render_prompt_with_agent_role(_active_prompt("tagging"), agent_role)
     prompt = render_prompt_with_existing_tags(prompt, existing_tags)
+    prompt = render_prompt_with_user_hint(prompt)
     return PreparedVisionQuery(
         kind="tagging",
-        prompt=render_prompt_with_user_hint(prompt),
+        prompt=_strip_unresolved_placeholders(prompt),
         metadata={"task": "tags"},
     )
 
@@ -317,26 +332,41 @@ def prepare_tagging_query(*, existing_tags: list[str] | None = None, agent_role:
 def prepare_description_query(*, existing_tags: list[str] | None = None, agent_role: str | None = None) -> PreparedVisionQuery:
     prompt = render_prompt_with_agent_role(_active_prompt("description"), agent_role)
     prompt = render_prompt_with_existing_tags(prompt, existing_tags)
+    prompt = render_prompt_with_user_hint(prompt)
     return PreparedVisionQuery(
         kind="description",
-        prompt=render_prompt_with_user_hint(prompt),
+        prompt=_strip_unresolved_placeholders(prompt),
         metadata={"task": "description"},
     )
 
 
 def prepare_vision_query(*, tags_text: str, user_hint: str | None = None) -> PreparedVisionQuery:
-    prompt = _active_prompt("vision").replace("{tags}", tags_text.strip())
+    prompt = _active_prompt("vision")
+    prompt = render_prompt_with_agent_role(prompt, None)
+    prompt = render_prompt_with_existing_tags(prompt, None)
+    prompt = prompt.replace("{tags}", tags_text.strip())
+    prompt = render_prompt_with_user_hint(prompt, user_hint)
     return PreparedVisionQuery(
         kind="vision",
-        prompt=render_prompt_with_user_hint(prompt, user_hint),
+        prompt=_strip_unresolved_placeholders(prompt),
         metadata={"task": "vision"},
     )
 
 
 def prepare_validation_query(annotations: str) -> PreparedVisionQuery:
+    prompt = _active_prompt("validation")
+    # Apply the standard render pipeline so that any placeholder a custom
+    # validation_prompt.txt may use is either filled or stripped before the
+    # prompt reaches the LLM.
+    prompt = render_prompt_with_agent_role(prompt, None)
+    prompt = render_prompt_with_existing_tags(prompt, None)
+    prompt = render_prompt_with_user_hint(prompt, None)
+    prompt = prompt.replace("{tags}", format_annotations_for_validation(annotations))
+    # Strip any remaining {token} that no substitution path covers.
+    prompt = _strip_unresolved_placeholders(prompt)
     return PreparedVisionQuery(
         kind="validation",
-        prompt=_active_prompt("validation").replace("{tags}", format_annotations_for_validation(annotations)),
+        prompt=prompt,
         metadata={"task": "validation"},
     )
 
@@ -346,9 +376,10 @@ def prepare_search_query(query: str) -> PreparedVisionQuery:
     if not cleaned_query:
         raise LlmQueryError("Enter text to search for.")
 
+    prompt = _active_prompt("search").replace("{query}", cleaned_query)
     return PreparedVisionQuery(
         kind="search",
-        prompt=_active_prompt("search").replace("{query}", cleaned_query),
+        prompt=_strip_unresolved_placeholders(prompt),
         metadata={"task": "search", "query": cleaned_query},
     )
 
@@ -360,10 +391,14 @@ def prepare_refine_query(*, description: str, reasoning: str) -> PreparedVisionQ
     if reasoning:
         parts.append(f'reasoning: "{reasoning}"')
     vision_text = "\n".join(parts) if parts else "(no vision data available for this image)"
-    prompt = _active_prompt("refine").replace("{vision_data}", vision_text)
+    prompt = _active_prompt("refine")
+    prompt = render_prompt_with_agent_role(prompt, None)
+    prompt = render_prompt_with_existing_tags(prompt, None)
+    prompt = render_prompt_with_user_hint(prompt, None)
+    prompt = prompt.replace("{vision_data}", vision_text)
     return PreparedVisionQuery(
         kind="refine",
-        prompt=prompt,
+        prompt=_strip_unresolved_placeholders(prompt),
         metadata={"task": "refine"},
     )
 

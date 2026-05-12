@@ -61,6 +61,18 @@ def _discard_pooled_connection(netloc: str, scheme: str) -> None:
             pass
 
 
+def discard_pooled_connection_for_server(server: str, default_server: str) -> None:
+    """Discard the thread-local pooled connection for the given server URL.
+
+    Call this when a technically-successful HTTP response contains invalid
+    content (e.g. an empty body from Ollama) so the next request starts with
+    a guaranteed-fresh socket instead of potentially reusing a stale one.
+    """
+    server_url = normalize_server_url(server, default_server)
+    parsed = urlparse(server_url)
+    _discard_pooled_connection(parsed.netloc, parsed.scheme)
+
+
 def _store_pooled_connection(
     netloc: str,
     scheme: str,

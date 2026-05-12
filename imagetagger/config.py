@@ -42,6 +42,7 @@ _DEFAULTS: dict = {
     "confirm_on_delete": True,
     "last_selected_image": "",
     "debug_regenerate_prompt_console": False,
+    "debug_prompts": False,
     "merge_table_mouse_actions": dict(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS),
     "agent_roles": {},
 }
@@ -204,6 +205,10 @@ def _normalize_loaded_config(data: Any) -> dict:
     normalized["debug_regenerate_prompt_console"] = _normalize_bool(
         data.get("debug_regenerate_prompt_console"),
         _DEFAULTS["debug_regenerate_prompt_console"],
+    )
+    normalized["debug_prompts"] = _normalize_bool(
+        data.get("debug_prompts"),
+        _DEFAULTS["debug_prompts"],
     )
     normalized["merge_table_mouse_actions"] = _normalize_merge_table_mouse_actions(data)
 

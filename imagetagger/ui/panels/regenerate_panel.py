@@ -22,7 +22,11 @@ from PyQt6.QtWidgets import (
 
 from imagetagger import config as _config
 from imagetagger.utils.annotations import sanitize_description_text
-from imagetagger.utils.image_prep import configure_image_preparation, consume_image_preparation_warning
+from imagetagger.utils.image_prep import (
+    configure_image_preparation,
+    consume_image_preparation_warning,
+    is_pillow_image_resize_available,
+)
 from imagetagger.utils.input_validators import InputValidator
 from imagetagger.utils.validators import (
     create_max_resolution_validator,
@@ -354,7 +358,10 @@ class RegeneratePanel(QWidget):
 
     def _active_regenerate_session(self, *, show_errors: bool) -> VisionLlmSession | None:
         if self._llm_provider is not None and self._llm_model_name.strip():
-            endpoint = self._llm_endpoint.strip() or self.llm_endpoint_input.text().strip()
+            # Prefer the text field (what the user sees and can edit) over the
+            # stored _llm_endpoint so that typing a different server without
+            # clicking "Use" is still honoured for regeneration.
+            endpoint = self.llm_endpoint_input.text().strip() or self._llm_endpoint.strip()
             if not endpoint:
                 if show_errors:
                     QMessageBox.warning(
@@ -435,7 +442,13 @@ class RegeneratePanel(QWidget):
         self._llm_endpoint = normalized_server
         self._llm_model_name = model_name
         self.llm_endpoint_input.setText(normalized_server)
-        self.regenerate_status_label.setText(f"Model selected: {self._llm_model_name}")
+        status_parts = [f"Model selected: {self._llm_model_name}"]
+        if not is_pillow_image_resize_available():
+            status_parts.append(
+                "Warning: Pillow is not installed — query downscaling is disabled and "
+                "full-resolution images are sent to the model. Install Pillow to enable downscaling."
+            )
+        self.regenerate_status_label.setText("\n\n".join(status_parts))
         self.model_selection_changed.emit(self._llm_endpoint, self._llm_model_name)
         self._update_regenerate_controls()
 

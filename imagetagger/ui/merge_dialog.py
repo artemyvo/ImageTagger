@@ -402,6 +402,21 @@ class FixupDialog(QDialog):
             if isinstance(watched, QWidget) and not self.isAncestorOf(watched):
                 return super().eventFilter(watched, event)
             if comparison_table.state() == QAbstractItemView.State.EditingState:
+                _edit_focused = self.focusWidget()
+                if _edit_focused is comparison_table or _edit_focused is comparison_table.viewport():
+                    # Platform timing window: the table has entered EditingState (editItem was
+                    # called from a deferred QTimer) but keyboard focus has not yet transferred
+                    # to the in-cell editor — this is common on macOS where focus transfer is
+                    # handled asynchronously by the window server.  If we just return False here
+                    # the event reaches the table's own keyPressEvent, which is a no-op for Left
+                    # in column 0 and never forwards to the editor, so the cursor never moves.
+                    # Instead: locate the visible editor widget, redirect focus to it, then
+                    # re-deliver the original event via sendEvent so the very first press works.
+                    _editor = comparison_table.viewport().findChild(QTextEdit)
+                    if _editor is not None and _editor.isVisible():
+                        _editor.setFocus(Qt.FocusReason.OtherFocusReason)
+                        QApplication.sendEvent(_editor, event)
+                    return True
                 return False
             focused = self.focusWidget()
             # When an in-cell editor is being activated, Qt may not yet report EditingState on the

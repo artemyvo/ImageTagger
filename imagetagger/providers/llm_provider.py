@@ -13,7 +13,9 @@ DEFAULT_LLM_TIMEOUT = 300.0
 
 
 class LlmProviderError(LlmQueryError):
-    pass
+    # When True, auto-threading should not treat this error as a performance
+    # signal (i.e. no backoff / thread-count reduction on retry).
+    no_backoff: bool = False
 
 
 class LlmProviderCancelled(LlmProviderError):

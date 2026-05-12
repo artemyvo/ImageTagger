@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,5 +122,58 @@ def generate_with_image(
 
     content = _extract_text_content(message.get("content"))
     if not content:
+        try:
+            from imagetagger import config as _config
+            if _config.load().get("debug_prompts"):
+                def _sanitize_messages(messages: object) -> object:
+                    if not isinstance(messages, list):
+                        return messages
+                    result = []
+                    for msg in messages:
+                        if not isinstance(msg, dict):
+                            result.append(msg)
+                            continue
+                        sanitized = dict(msg)
+                        content_parts = msg.get("content")
+                        if isinstance(content_parts, list):
+                            sanitized_parts = []
+                            for part in content_parts:
+                                if (
+                                    isinstance(part, dict)
+                                    and part.get("type") == "image_url"
+                                    and isinstance(part.get("image_url"), dict)
+                                ):
+                                    url = part["image_url"].get("url", "")
+                                    prefix, _, data = url.partition(",")
+                                    sanitized_parts.append({
+                                        "type": "image_url",
+                                        "image_url": {"url": f"{prefix},[{len(data)} chars base64]"},
+                                    })
+                                elif (
+                                    isinstance(part, dict)
+                                    and part.get("type") == "text"
+                                    and isinstance(part.get("text"), str)
+                                ):
+                                    sanitized_parts.append({
+                                        "type": "text",
+                                        "text": f"[{len(part['text'])} chars]",
+                                    })
+                                else:
+                                    sanitized_parts.append(part)
+                            sanitized["content"] = sanitized_parts
+                        elif isinstance(content_parts, str):
+                            sanitized["content"] = f"[{len(content_parts)} chars]"
+                        result.append(sanitized)
+                    return result
+
+                debug_payload = dict(payload)
+                debug_payload["messages"] = _sanitize_messages(payload.get("messages"))
+                print(f"[debug_prompts] empty response for file: {image_path}", flush=True)
+                print("[debug_prompts] request sent to vLLM/OpenAI-compat:", flush=True)
+                print(json.dumps(debug_payload, indent=2, ensure_ascii=False), flush=True)
+                print("[debug_prompts] raw response from LLM:", flush=True)
+                print(json.dumps(response_payload, indent=2, ensure_ascii=False), flush=True)
+        except Exception:
+            pass
         raise OpenAiCompatError("Server returned an empty response.")
     return content
