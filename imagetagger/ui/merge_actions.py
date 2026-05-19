@@ -12,6 +12,7 @@ from imagetagger.utils.sidecar import (
     get_sidecar_json_path,
     read_sidecar_data,
     write_sidecar_data,
+    write_sidecar_data_async,
 )
 from imagetagger.providers.llm_provider import VisionLlmProvider, VisionLlmSession
 from imagetagger.ui.merge_dialog import FixupDialog
@@ -77,7 +78,7 @@ def clear_fixup_sidecar(image_path: Path) -> None:
     data.vision_caption = None
     data.validated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     data.validated_by = "user"
-    write_sidecar_data(image_path, data)
+    write_sidecar_data_async(image_path, data)
 
 
 def clear_validation_fields_sidecar(image_path: Path, model: str | None = None, date: str | None = None) -> None:
@@ -136,16 +137,13 @@ def open_fixup_dialog_for_image(
     delete_image: Callable[[], tuple[bool, bool]] | None = None,
     confirm_delete: bool = True,
     save_regenerate_settings: Callable[[dict[str, int | float | bool | str]], None] | None = None,
+    reasoning_lines: int = 5,
 ) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
     try:
         sidecar = read_sidecar_data(image_path)
     except OSError as exc:
         QMessageBox.warning(parent, "Sidecar read failed", f"Could not read sidecar file:\n{exc}")
         return "error"
-
-    if not sidecar.has_pending_fixup:
-        refresh_fixup_state(image_path)
-        return "missing"
 
     original_sidecar = SidecarData(
         description=sidecar.description,
@@ -158,16 +156,39 @@ def open_fixup_dialog_for_image(
         vision_caption=sidecar.vision_caption,
     )
 
-    fixup_data = FixupData(
-        issues=sidecar.fixup_issues or "",
-        corrected_description=sanitize_description_text(sidecar.fixup_description or ""),
-        corrected_description_raw=sidecar.fixup_description or "",
-        corrected_tags=list(sidecar.fixup_tags or []),
-        search_matches=list(sidecar.ai_find_matches or []),
-        vision_tags=list(sidecar.vision_tags or []),
-        vision_caption=sidecar.vision_caption or "",
-        has_headers=True,
-    )
+    if not sidecar.has_pending_fixup:
+        # No pending fixup — open in clean mode: proposed mirrors current so the
+        # table shows no differences.  The user can then use Regenerate to bring
+        # in new proposed content.
+        # Separate description from tags using the same heuristic as the comparison panel.
+        clean_description = ""
+        clean_tags = list(current_annotations)
+        if clean_tags:
+            first = clean_tags[0]
+            if len(first.split()) >= 5 or len(first) >= 40:
+                clean_description = first
+                clean_tags = clean_tags[1:]
+        fixup_data = FixupData(
+            issues="",
+            corrected_description=clean_description,
+            corrected_description_raw=clean_description,
+            corrected_tags=clean_tags,
+            search_matches=[],
+            vision_tags=[],
+            vision_caption="",
+            has_headers=False,
+        )
+    else:
+        fixup_data = FixupData(
+            issues=sidecar.fixup_issues or "",
+            corrected_description=sanitize_description_text(sidecar.fixup_description or ""),
+            corrected_description_raw=sidecar.fixup_description or "",
+            corrected_tags=list(sidecar.fixup_tags or []),
+            search_matches=list(sidecar.ai_find_matches or []),
+            vision_tags=list(sidecar.vision_tags or []),
+            vision_caption=sidecar.vision_caption or "",
+            has_headers=True,
+        )
 
     def clear_fixup() -> bool:
         try:
@@ -230,6 +251,7 @@ def open_fixup_dialog_for_image(
             for t in sidecar.fixup_tags
             if sanitize_tag_text(t)
         } if sidecar.fixup_tags is not None else None,
+        reasoning_lines=reasoning_lines,
         parent=parent,
     )
 
@@ -315,6 +337,10 @@ def open_fixup_dialog_for_image(
         outcome = "next"
     else:
         outcome = "cancelled"
+
+    # Release the dialog's C++ object immediately rather than waiting for
+    # the parent window to be destroyed.  All data has been extracted above.
+    dialog.deleteLater()
 
     return outcome
 

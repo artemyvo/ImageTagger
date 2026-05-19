@@ -42,11 +42,12 @@ class ImageReloadHelper:
             on_reload: Callback invoked when image reload should occur
         """
         self._on_reload = on_reload
+        self._parent_qobject = parent
         self._watched_image_path: Path | None = None
         self._watched_image_mtime_ns: int | None = None
         self._image_reload_pending = False
 
-        self._image_file_watcher = QFileSystemWatcher(parent)
+        self._image_file_watcher: QFileSystemWatcher | None = QFileSystemWatcher(parent)
         self._image_file_watcher.fileChanged.connect(self._on_watched_image_file_changed)
 
         self._image_reload_debounce_timer = QTimer(parent)
@@ -69,16 +70,34 @@ class ImageReloadHelper:
         self._image_reload_pending = False
         self._image_reload_debounce_timer.stop()
 
-        existing_watch_paths = self._image_file_watcher.files()
-        if existing_watch_paths:
-            self._image_file_watcher.removePaths(existing_watch_paths)
+        if self._image_file_watcher is not None:
+            existing_watch_paths = self._image_file_watcher.files()
+            if existing_watch_paths:
+                self._image_file_watcher.removePaths(existing_watch_paths)
 
         self._watched_image_path = image_path
         self._watched_image_mtime_ns = None
 
         if image_path is None:
             self._image_reload_poll_timer.stop()
+            # Release the inotify fd immediately rather than waiting for the
+            # parent widget to be destroyed.  Qt's DeferredDelete (deleteLater)
+            # is not dispatched while a nested modal exec() loop is running at
+            # one level deeper than where deleteLater was called, so dialogs
+            # shown in the fixup navigation loop accumulate stale
+            # QFileSystemWatcher objects — each holding an open inotify fd —
+            # until the entire loop exits.  Removing the Qt parent and dropping
+            # the Python reference transfers ownership to Python and causes sip
+            # to delete the C++ object (and close its fd) synchronously.
+            if self._image_file_watcher is not None:
+                self._image_file_watcher.setParent(None)
+                self._image_file_watcher = None
             return
+
+        # Recreate the watcher if it was previously released.
+        if self._image_file_watcher is None:
+            self._image_file_watcher = QFileSystemWatcher(self._parent_qobject)
+            self._image_file_watcher.fileChanged.connect(self._on_watched_image_file_changed)
 
         self._watched_image_mtime_ns = self._image_mtime_ns(image_path)
         try:
@@ -96,7 +115,7 @@ class ImageReloadHelper:
         External editors may do atomic-replace saves; re-subscribe after reload.
         """
         image_path = self._watched_image_path
-        if image_path is None:
+        if image_path is None or self._image_file_watcher is None:
             return
         current_watches = {
             os.path.normcase(path)
@@ -119,7 +138,7 @@ class ImageReloadHelper:
     def _on_watched_image_file_changed(self, changed_path: str) -> None:
         """Handle QFileSystemWatcher file change event."""
         image_path = self._watched_image_path
-        if image_path is None:
+        if image_path is None or self._image_file_watcher is None:
             return
 
         normalized_changed = os.path.normcase(changed_path)

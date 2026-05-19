@@ -155,6 +155,8 @@ class RegeneratePanel(QWidget):
         self.llm_model_combo.setEditable(False)
 
         self.llm_use_button = QPushButton("Use", self)
+        self.llm_use_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.llm_use_button.setAutoDefault(False)
         self.llm_use_button.clicked.connect(self._use_selected_provider_model)
 
         _clear_hint_shortcut = platform_key_sequence("Alt+H", "Alt+H")
@@ -192,6 +194,8 @@ class RegeneratePanel(QWidget):
         self.regenerate_user_hint_overlay_label.setStyleSheet("color: palette(mid);")
 
         self.regenerate_user_hint_clear_button = QPushButton("Clear", self)
+        self.regenerate_user_hint_clear_button.setAutoDefault(False)
+        self.regenerate_user_hint_clear_button.setDefault(False)
         self.regenerate_user_hint_clear_button.setToolTip("Clear the current user hint.")
         self.regenerate_user_hint_clear_button.clicked.connect(self._clear_regenerate_user_hint)
 

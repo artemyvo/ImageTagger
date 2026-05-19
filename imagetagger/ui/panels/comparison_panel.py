@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -147,6 +148,9 @@ class ComparisonPanel(QWidget):
         self._action_button_width: int = 24
         self._action_button_height: int = 22
         self._table_row_map: list[tuple[int | None, int | None]] = []
+        self._table_row_action_callbacks: dict[int, Callable[[], None]] = {}
+        self._table_row_action_symbols: dict[int, str] = {}
+        self._active_comparison_editor: QTextEdit | None = None
 
         # ── Widgets ───────────────────────────────────────────────────────
         self.left_list = QListWidget(self)
@@ -175,7 +179,10 @@ class ComparisonPanel(QWidget):
             QAbstractItemView.EditTrigger.DoubleClicked
             | QAbstractItemView.EditTrigger.EditKeyPressed
         )
-        self.comparison_table.setItemDelegateForColumn(0, EditableDiffDelegate(self.comparison_table))
+        self._comparison_delegate = EditableDiffDelegate(self.comparison_table)
+        self._comparison_delegate.editor_created.connect(self._on_comparison_editor_created)
+        self._comparison_delegate.closeEditor.connect(self._on_comparison_editor_closed)
+        self.comparison_table.setItemDelegateForColumn(0, self._comparison_delegate)
         self.comparison_table.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.comparison_table.setMouseTracking(False)
         self.comparison_table.viewport().setMouseTracking(False)
@@ -224,6 +231,7 @@ class ComparisonPanel(QWidget):
             on_apply_row=self._apply_proposed_value_for_table_row,
             on_begin_editing=self.begin_editing_comparison_row,
             on_trigger_row_action=self._trigger_action_for_table_row,
+            on_move_row=self._move_table_row,
             parent=self,
         )
 
@@ -445,17 +453,18 @@ class ComparisonPanel(QWidget):
             return
         self._initial_table_focus_applied = True
 
-        self.comparison_table.setFocus()
         row_count = self.comparison_table.rowCount()
-        if row_count <= 0:
-            return
+        if row_count > 0:
+            for row in range(row_count):
+                if self._row_needs_addressing(row):
+                    self.comparison_table.setCurrentCell(row, 0)
+                    self.comparison_table.selectRow(row)
+                    break
+            else:
+                self.comparison_table.setCurrentCell(0, 0)
+                self.comparison_table.selectRow(0)
 
-        for row in range(row_count):
-            if self._row_needs_addressing(row):
-                self.select_comparison_row(row, Qt.FocusReason.ActiveWindowFocusReason)
-                return
-
-        self.select_comparison_row(0, Qt.FocusReason.ActiveWindowFocusReason)
+        self.comparison_table.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
 
     # Navigation — called by dialog's QActions and eventFilter
 
@@ -533,6 +542,18 @@ class ComparisonPanel(QWidget):
 
         QTimer.singleShot(0, _open_editor)
         return True
+
+    def active_comparison_editor(self) -> QTextEdit | None:
+        editor = self._active_comparison_editor
+        if editor is None or not editor.isVisible():
+            return None
+        return editor
+
+    def comparison_editor_owns(self, widget: QWidget | None) -> bool:
+        editor = self.active_comparison_editor()
+        if editor is None or widget is None:
+            return False
+        return widget is editor or editor.isAncestorOf(widget)
 
     def trigger_action_for_current_row(self) -> bool:
         row = self.comparison_table.currentRow()
@@ -640,7 +661,7 @@ class ComparisonPanel(QWidget):
         new_row_count = self.comparison_table.rowCount()
         if new_row_count > 0:
             target_row = min(min_selected_row, new_row_count - 1)
-            self.comparison_table.setCurrentCell(target_row, 0)
+            self.select_comparison_row(target_row, Qt.FocusReason.OtherFocusReason)
 
     def enter_no_fixups_state(self) -> None:
         """Disable the panel for the 'no fixups remaining' state after a delete."""
@@ -1104,11 +1125,12 @@ class ComparisonPanel(QWidget):
         return True
 
     def _trigger_action_for_table_row(self, row: int) -> bool:
-        button = self._action_button_for_row(row)
-        if button is None:
+        callback = self._table_row_action_callbacks.get(row)
+        action_symbol = self._table_row_action_symbols.get(row, "")
+        if callback is None:
             return False
-        removes_row = button.text() == "✕"
-        button.click()
+        removes_row = action_symbol == "✕"
+        callback()
         advance_from = row if removes_row else row + 1
         self._advance_to_next_actionable_from(advance_from)
         return True
@@ -1547,6 +1569,13 @@ class ComparisonPanel(QWidget):
         action_text: str,
         callback: Callable[[], None] | None,
     ) -> None:
+        if action_text and callback is not None:
+            self._table_row_action_callbacks[row] = callback
+            self._table_row_action_symbols[row] = action_text
+        else:
+            self._table_row_action_callbacks.pop(row, None)
+            self._table_row_action_symbols.pop(row, None)
+
         action_host = QWidget(self.comparison_table)
         action_host.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         action_layout = QHBoxLayout(action_host)
@@ -1561,6 +1590,7 @@ class ComparisonPanel(QWidget):
             button = QPushButton(action_text, action_host)
             button.setFixedWidth(self._action_button_width)
             button.setFixedHeight(self._action_button_height)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             button.setEnabled(not self._is_regenerating())
             if action_text == "✕":
                 button.setStyleSheet(_danger_button_stylesheet(button.palette()))
@@ -1598,6 +1628,8 @@ class ComparisonPanel(QWidget):
         try:
             self.comparison_table.setRowCount(0)
             self._table_row_map = []
+            self._table_row_action_callbacks.clear()
+            self._table_row_action_symbols.clear()
 
             consumed_left_indexes: set[int] = set()
             consumed_right_indexes: set[int] = set()
@@ -1727,6 +1759,18 @@ class ComparisonPanel(QWidget):
 
         QTimer.singleShot(0, _run_refresh)
 
+    def _on_comparison_editor_created(self, editor: QTextEdit) -> None:
+        self._active_comparison_editor = editor
+        editor.destroyed.connect(lambda _obj=None: self._clear_active_comparison_editor(editor))
+
+    def _on_comparison_editor_closed(self, editor, _hint) -> None:
+        if isinstance(editor, QTextEdit):
+            self._clear_active_comparison_editor(editor)
+
+    def _clear_active_comparison_editor(self, editor: QTextEdit) -> None:
+        if self._active_comparison_editor is editor:
+            self._active_comparison_editor = None
+
     def _on_comparison_item_changed(self, item: QTableWidgetItem) -> None:
         if self._updating_comparison_table:
             return
@@ -1783,3 +1827,64 @@ class ComparisonPanel(QWidget):
                 break
         self._update_difference_highlights()
         self.state_changed.emit()
+
+    def _move_table_row(self, from_row: int, to_row: int) -> bool:
+        """Reorder the left list so that the item at *from_row* moves to *to_row*.
+
+        Only rows that own a left-list item can be reordered.  Returns True if
+        the left list was actually modified.
+        """
+        if from_row == to_row:
+            return False
+        row_count = len(self._table_row_map)
+        if from_row < 0 or from_row >= row_count or to_row < 0 or to_row >= row_count:
+            return False
+
+        from_left_idx, _ = self._table_row_map[from_row]
+        if from_left_idx is None:
+            return False  # Right-only rows cannot be reordered
+
+        # Build the new table-row order after moving from_row to to_row.
+        new_row_order = list(range(row_count))
+        new_row_order.pop(from_row)
+        new_row_order.insert(to_row, from_row)
+
+        # Derive the new left-list item order from the new table-row order.
+        left_count = self.left_list.count()
+        new_left_order: list[int] = []
+        seen: set[int] = set()
+        for table_row in new_row_order:
+            left_idx, _ = self._table_row_map[table_row]
+            if left_idx is not None and left_idx not in seen:
+                seen.add(left_idx)
+                new_left_order.append(left_idx)
+        # Include any left items not represented in the table (safety net).
+        for i in range(left_count):
+            if i not in seen:
+                new_left_order.append(i)
+
+        if new_left_order == list(range(left_count)):
+            return False  # No effective change
+
+        # Collect left-list text values before clearing.
+        left_texts: list[str] = []
+        for i in range(left_count):
+            item = self.left_list.item(i)
+            widget = self.left_list.itemWidget(item)
+            if widget and hasattr(widget, "text"):
+                left_texts.append(widget.text)
+            else:
+                text = item.text().strip()
+                if not text:
+                    stored = item.data(ITEM_TEXT_ROLE)
+                    if isinstance(stored, str):
+                        text = stored.strip()
+                left_texts.append(text)
+
+        self.left_list.clear()
+        for idx in new_left_order:
+            self._add_left_item(left_texts[idx])
+
+        self._update_difference_highlights()
+        self.state_changed.emit()
+        return True

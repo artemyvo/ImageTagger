@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
 from imagetagger.providers.llm_provider import LlmProviderCancelled, LlmProviderError
 import os
 import threading
@@ -14,6 +14,24 @@ from PyQt6.QtCore import QSize
 
 from imagetagger.ui.models import ImageRecord
 from imagetagger.utils.sidecar import read_sidecar_data
+
+
+class _SimpleRunnable(QObject, QRunnable):
+    """Minimal QRunnable that can emit a *finished* signal.
+
+    ``QRunnable`` alone cannot emit signals; the ``QObject`` mixin enables it.
+    """
+
+    finished = pyqtSignal()
+
+    def __init__(self, fn: Callable[[], None]) -> None:
+        QObject.__init__(self)
+        QRunnable.__init__(self)
+        self._fn = fn
+
+    def run(self) -> None:
+        self._fn()
+        self.finished.emit()
 
 
 class RegenerateWorker(QObject):
@@ -294,9 +312,11 @@ class FolderLoadWorker(QObject):
                     _active.add("✅")
                 active_badges = frozenset(_active)
                 has_pending_fixup: bool = sidecar.has_pending_fixup
+                validated: str | None = sidecar.validated
             except Exception:
                 active_badges = frozenset()
                 has_pending_fixup = False
+                validated = None
 
             thumb_payload, icc_invalid = self._thumbnail_rgba_bytes(image_path)
             return {
@@ -307,6 +327,7 @@ class FolderLoadWorker(QObject):
                 "icc_invalid": icc_invalid,
                 "active_badges": active_badges,
                 "has_pending_fixup": has_pending_fixup,
+                "validated": validated,
             }
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -335,6 +356,7 @@ class FolderLoadWorker(QObject):
                                 "thumbnail": result["thumbnail"],
                                 "active_badges": result["active_badges"],
                                 "has_pending_fixup": result["has_pending_fixup"],
+                                "validated": result["validated"],
                             }
                         )
 

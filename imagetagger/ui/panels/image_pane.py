@@ -10,8 +10,8 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal
+from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QFileDialog,
     QLabel,
@@ -30,6 +30,30 @@ from imagetagger.utils.external_editors import (
     launch_image_in_editor,
     launch_image_in_system_default,
 )
+
+
+class _ImageLoadSignaller(QObject):
+    """Carries image-load result signals back to the main thread."""
+
+    loaded = pyqtSignal(object, object)  # (Path, QImage)
+    failed = pyqtSignal(object)          # Path
+
+
+class _ImageLoadRunnable(QRunnable):
+    """Loads a QImage on a thread-pool thread and signals completion."""
+
+    def __init__(self, image_path: Path, signaller: _ImageLoadSignaller) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._image_path = image_path
+        self._signaller = signaller
+
+    def run(self) -> None:
+        image = QImage(str(self._image_path))
+        if image.isNull():
+            self._signaller.failed.emit(self._image_path)
+        else:
+            self._signaller.loaded.emit(self._image_path, image)
 
 
 class ImagePane(QWidget):
@@ -63,6 +87,8 @@ class ImagePane(QWidget):
         self._confirm_delete = confirm_delete
         self._delete_image = delete_image
         self._detected_external_editors: list[ExternalEditor] | None = None
+        self._async_load_signaller: _ImageLoadSignaller | None = None
+        self._pending_reload_status: Path | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -99,26 +125,35 @@ class ImagePane(QWidget):
     # ------------------------------------------------------------------
 
     def load_image(self, image_path: Path | None) -> bool:
-        """Load and display *image_path*.  Returns ``True`` on success."""
+        """Load and display *image_path* asynchronously.
+
+        Returns ``False`` immediately if the path is absent or invalid;
+        returns ``True`` once background loading has been dispatched.
+        The image label shows a placeholder until the load completes.
+        """
         if image_path is None:
+            self._current_image_path = None
             self._set_header_text(None, None)
             self.image_label.clear_original_image("No image path provided")
             return False
 
         if not image_path.exists() or not image_path.is_file():
+            self._current_image_path = image_path
             self._set_header_text(None, None)
             self.image_label.clear_original_image(f"File not found:\n{image_path.name}")
             return False
 
-        pixmap = self._load_normalized_pixmap(image_path)
-        if pixmap.isNull():
-            self._set_header_text(None, None)
-            self.image_label.clear_original_image(f"Unsupported format:\n{image_path.name}")
-            return False
+        # Update current path so context-menu actions work immediately,
+        # then show a placeholder and start the background load.
+        self._current_image_path = image_path
+        self._set_header_text(None, None)
+        self.image_label.clear_original_image("Loading\u2026")
 
-        self._set_header_text(pixmap.width(), pixmap.height())
-        self.image_label.setText("")
-        self.image_label.set_original_image(pixmap)
+        signaller = _ImageLoadSignaller()
+        signaller.loaded.connect(self._on_async_image_loaded)
+        signaller.failed.connect(self._on_async_image_failed)
+        self._async_load_signaller = signaller  # keep reference alive until signal fires
+        QThreadPool.globalInstance().start(_ImageLoadRunnable(image_path, signaller))
         return True
 
     def set_watched_image(self, image_path: Path | None) -> None:
@@ -137,9 +172,39 @@ class ImagePane(QWidget):
     # ------------------------------------------------------------------
 
     def _on_image_reload(self, image_path: Path) -> None:
+        self._pending_reload_status = image_path
         if not self.load_image(image_path):
-            return
-        self.status_message.emit(f"Reloaded image: {image_path.name}")
+            self._pending_reload_status = None
+        # Status message is emitted by _on_async_image_loaded once load completes.
+
+    def _on_async_image_loaded(self, image_path: object, image: object) -> None:
+        """Called on the main thread when the background QImage load succeeds."""
+        path: Path = image_path  # type: ignore[assignment]
+        if path != self._current_image_path:
+            return  # stale result — a newer load was requested
+
+        pixmap = QPixmap.fromImage(image)  # type: ignore[arg-type]
+        pixmap.setDevicePixelRatio(1.0)
+        if pixmap.isNull():
+            self._set_header_text(None, None)
+            self.image_label.clear_original_image(f"Unsupported format:\n{path.name}")
+        else:
+            self._set_header_text(pixmap.width(), pixmap.height())
+            self.image_label.set_original_image(pixmap)
+
+        if self._pending_reload_status == path:
+            self._pending_reload_status = None
+            self.status_message.emit(f"Reloaded image: {path.name}")
+
+    def _on_async_image_failed(self, image_path: object) -> None:
+        """Called on the main thread when the background QImage load fails."""
+        path: Path = image_path  # type: ignore[assignment]
+        if path != self._current_image_path:
+            return  # stale result
+        self._set_header_text(None, None)
+        self.image_label.clear_original_image(f"Unsupported format:\n{path.name}")
+        if self._pending_reload_status == path:
+            self._pending_reload_status = None
 
     @staticmethod
     def _load_normalized_pixmap(image_path: Path) -> QPixmap:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable
-from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QPainter,
@@ -177,6 +177,7 @@ class DiffHighlightDelegate(QStyledItemDelegate):
 
 class EditableDiffDelegate(DiffHighlightDelegate):
     _CLOSED_BY_DELEGATE_PROP = "_closed_by_editable_diff_delegate"
+    editor_created = pyqtSignal(QTextEdit)
 
     def _resize_editor(self, editor: QTextEdit) -> None:
         margins = editor.contentsMargins()
@@ -196,6 +197,7 @@ class EditableDiffDelegate(DiffHighlightDelegate):
         editor.setFrameStyle(0)
         editor.installEventFilter(self)
         editor.textChanged.connect(lambda: self._resize_editor(editor))
+        self.editor_created.emit(editor)
         return editor
 
     def setEditorData(self, editor, index) -> None:  # type: ignore[override]

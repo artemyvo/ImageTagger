@@ -45,6 +45,7 @@ _DEFAULTS: dict = {
     "debug_prompts": False,
     "merge_table_mouse_actions": dict(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS),
     "agent_roles": {},
+    "merge_dialog_reasoning_lines": 5,
 }
 
 
@@ -211,6 +212,11 @@ def _normalize_loaded_config(data: Any) -> dict:
         _DEFAULTS["debug_prompts"],
     )
     normalized["merge_table_mouse_actions"] = _normalize_merge_table_mouse_actions(data)
+    normalized["merge_dialog_reasoning_lines"] = _normalize_int(
+        data.get("merge_dialog_reasoning_lines"),
+        _DEFAULTS["merge_dialog_reasoning_lines"],
+        minimum=1,
+    )
 
     raw_roles = data.get("agent_roles")
     if isinstance(raw_roles, dict):

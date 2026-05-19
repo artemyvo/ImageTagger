@@ -17,7 +17,6 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QPushButton,
     QSplitter,
@@ -75,6 +74,7 @@ class FixupDialog(QDialog):
         confirm_delete: bool = True,
         allow_left_delete: bool = True,
         fixup_tag_keys: set[str] | None = None,
+        reasoning_lines: int = 5,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -212,10 +212,15 @@ class FixupDialog(QDialog):
         self._image_pane.delete_result.connect(self._on_image_pane_delete_result)
 
         # ── Auxiliary widgets ─────────────────────────────────────────────
-        self.issues_label = QLabel(fixup_data.issues or "No issue details provided.", self)
-        self.issues_label.setWordWrap(True)
-        self.issues_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.issues_label = QTextEdit(self)
+        self.issues_label.setReadOnly(True)
+        self.issues_label.setAcceptRichText(False)
+        self.issues_label.setPlainText(fixup_data.issues or "No issue details provided.")
         self.issues_label.setStyleSheet("border: 1px solid palette(mid); padding: 6px;")
+        _fm = self.issues_label.fontMetrics()
+        # Border (1px * 2) + padding (6px * 2) + default document margin (4px * 2)
+        _issues_height = _fm.lineSpacing() * max(1, reasoning_lines) + 22
+        self.issues_label.setFixedHeight(_issues_height)
 
         # ── Buttons ───────────────────────────────────────────────────────
         self.accept_button = QPushButton("&Accept", self)
@@ -401,6 +406,13 @@ class FixupDialog(QDialog):
             # originating from within this dialog's widget tree.
             if isinstance(watched, QWidget) and not self.isAncestorOf(watched):
                 return super().eventFilter(watched, event)
+            if isinstance(watched, QWidget) and self._comparison_panel.comparison_editor_owns(watched):
+                return False
+            active_editor = self._comparison_panel.active_comparison_editor()
+            if active_editor is not None:
+                focused = self.focusWidget()
+                if self._comparison_panel.comparison_editor_owns(focused):
+                    return False
             if comparison_table.state() == QAbstractItemView.State.EditingState:
                 _edit_focused = self.focusWidget()
                 if _edit_focused is comparison_table or _edit_focused is comparison_table.viewport():
@@ -412,11 +424,11 @@ class FixupDialog(QDialog):
                     # in column 0 and never forwards to the editor, so the cursor never moves.
                     # Instead: locate the visible editor widget, redirect focus to it, then
                     # re-deliver the original event via sendEvent so the very first press works.
-                    _editor = comparison_table.viewport().findChild(QTextEdit)
-                    if _editor is not None and _editor.isVisible():
-                        _editor.setFocus(Qt.FocusReason.OtherFocusReason)
-                        QApplication.sendEvent(_editor, event)
-                    return True
+                    if active_editor is not None:
+                        active_editor.setFocus(Qt.FocusReason.OtherFocusReason)
+                        QApplication.sendEvent(active_editor, event)
+                        return True
+                    return False
                 return False
             focused = self.focusWidget()
             # When an in-cell editor is being activated, Qt may not yet report EditingState on the
@@ -534,7 +546,7 @@ class FixupDialog(QDialog):
         self._image_path = None
         self._comparison_panel.enter_no_fixups_state()
         self._image_pane.clear_for_deleted()
-        self.issues_label.setText("No fixup files remaining.")
+        self.issues_label.setPlainText("No fixup files remaining.")
         self._regen_panel.set_status("Current file was deleted. Press Esc to close.")
         self._regen_panel.set_all_controls_enabled(False)
 
@@ -581,6 +593,21 @@ class FixupDialog(QDialog):
             self._comparison_panel.update_difference_highlights()
             self._comparison_panel.resize_rows_to_contents()
             self._comparison_panel.refresh_widget_item_sizes()
+
+    def done(self, result: int) -> None:  # type: ignore[override]
+        # Release resources immediately on any close path: navigation codes,
+        # accept/reject, or programmatic close.  closeEvent only fires for the
+        # X-button / close() code path, so we handle cleanup here and let
+        # closeEvent call super() which will re-invoke done() — idempotent because
+        # the flag guards the filter removal and the other calls are no-ops.
+        if self._global_key_filter_installed:
+            app = QApplication.instance()
+            if app is not None:
+                app.removeEventFilter(self)
+            self._global_key_filter_installed = False
+        self._regen_panel.cancel_regeneration(discard_result=True)
+        self._image_pane.set_watched_image(None)
+        super().done(result)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if self._global_key_filter_installed:

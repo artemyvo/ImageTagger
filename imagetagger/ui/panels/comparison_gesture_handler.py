@@ -11,13 +11,17 @@ import time
 from typing import Callable
 
 from PyQt6.QtCore import QEvent, QObject, Qt
-from PyQt6.QtWidgets import QApplication, QTableWidget
+from PyQt6.QtGui import QCursor
+from PyQt6.QtWidgets import QApplication, QTableWidget, QWidget
 
 
 # ── Row-target modes (mirrored from imagetagger.config) ────────────────────
 HSCROLL_TARGET_POINTER_ROW = 1
 HSCROLL_TARGET_SELECTED_ROW = 2
 HSCROLL_TARGET_POINTER_ON_SELECTED = 3
+
+# ── Row-drag constants ──────────────────────────────────────────────────────
+_ROW_DRAG_MIN_VERTICAL_PX = 6
 
 
 class ComparisonGestureHandler(QObject):
@@ -53,6 +57,7 @@ class ComparisonGestureHandler(QObject):
         on_apply_row: Callable[[int], bool],
         on_begin_editing: Callable[[int], bool],
         on_trigger_row_action: Callable[[int], bool],
+        on_move_row: Callable[[int, int], bool] | None = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -79,11 +84,27 @@ class ComparisonGestureHandler(QObject):
         self._on_apply_row = on_apply_row
         self._on_begin_editing = on_begin_editing
         self._on_trigger_row_action = on_trigger_row_action
+        self._on_move_row = on_move_row
 
         # Swipe tracking state
         self._swipe_drag_active = False
         self._swipe_start_pos: tuple[float, float] | None = None
         self._swipe_row = -1
+
+        # Row-drag tracking state
+        self._row_drag_active: bool = False
+        self._row_drag_start_pos: tuple[float, float] | None = None
+        self._row_drag_start_row: int = -1
+        self._row_drag_insert_before: int = -1
+        self._row_drag_committed: bool = False
+
+        # Drop indicator (a thin horizontal line drawn over the viewport)
+        self._drop_indicator = QWidget(table.viewport())
+        self._drop_indicator.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._drop_indicator.setFixedHeight(2)
+        self._drop_indicator.setStyleSheet("background-color: palette(highlight);")
+        self._drop_indicator.hide()
+        self._drop_indicator.raise_()
 
         # Horizontal-scroll tracking state
         self._hscroll_accumulator_x = 0.0
@@ -105,6 +126,54 @@ class ComparisonGestureHandler(QObject):
         except RuntimeError:
             return super().eventFilter(watched, event)
 
+        # ── Row drag ───────────────────────────────────────────────────
+        if self._on_move_row is not None:
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
+                row = table.rowAt(int(event.position().y()))  # type: ignore[attr-defined]
+                if row >= 0:
+                    pos = event.position()  # type: ignore[attr-defined]
+                    self._row_drag_start_pos = (float(pos.x()), float(pos.y()))
+                    self._row_drag_start_row = row
+                    self._row_drag_committed = False
+                else:
+                    self._reset_row_drag()
+
+            elif event.type() == QEvent.Type.MouseMove:
+                if self._row_drag_start_pos is not None and self._row_drag_start_row >= 0:
+                    pos = event.position()  # type: ignore[attr-defined]
+                    start_x, start_y = self._row_drag_start_pos
+                    dx = float(pos.x()) - start_x
+                    dy = float(pos.y()) - start_y
+                    min_drag = max(_ROW_DRAG_MIN_VERTICAL_PX, QApplication.startDragDistance())
+                    if not self._row_drag_committed:
+                        if abs(dy) >= min_drag and abs(dy) >= abs(dx) * 0.8:
+                            self._row_drag_committed = True
+                            self._row_drag_active = True
+                            QApplication.setOverrideCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
+                    if self._row_drag_active:
+                        insert_before = self._compute_insert_before(float(pos.y()))  # type: ignore[attr-defined]
+                        self._row_drag_insert_before = insert_before
+                        self._update_drop_indicator()
+                        return True
+
+            elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
+                if self._row_drag_committed:
+                    from_row = self._row_drag_start_row
+                    insert_before = self._row_drag_insert_before
+                    self._reset_row_drag()
+                    row_count = table.rowCount()
+                    if from_row >= 0 and 0 <= insert_before <= row_count:
+                        to_row = (insert_before - 1) if from_row < insert_before else insert_before
+                        if to_row != from_row and 0 <= to_row < row_count:
+                            self._on_select_row(to_row, Qt.FocusReason.MouseFocusReason)
+                            self._on_move_row(from_row, to_row)
+                    return True
+                else:
+                    self._reset_row_drag()
+
+            elif event.type() == QEvent.Type.Leave:
+                self._reset_row_drag()
+
         # ── Swipe ──────────────────────────────────────────────────────
         if self._swipe_enabled:
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
@@ -120,7 +189,8 @@ class ComparisonGestureHandler(QObject):
             elif event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]
                 handled_swipe = False
                 if (
-                    self._swipe_drag_active
+                    not self._row_drag_committed
+                    and self._swipe_drag_active
                     and self._swipe_start_pos is not None
                     and self._swipe_row >= 0
                 ):
@@ -181,6 +251,61 @@ class ComparisonGestureHandler(QObject):
     # ------------------------------------------------------------------
     # Swipe internals
     # ------------------------------------------------------------------
+
+    def _reset_row_drag(self) -> None:
+        if self._row_drag_committed:
+            QApplication.restoreOverrideCursor()
+        self._row_drag_active = False
+        self._row_drag_start_pos = None
+        self._row_drag_start_row = -1
+        self._row_drag_insert_before = -1
+        self._row_drag_committed = False
+        self._drop_indicator.hide()
+
+    def _compute_insert_before(self, y: float) -> int:
+        """Return the row index before which the dragged row should be inserted.
+
+        Returns a value in [0, row_count]: 0 means before the first row,
+        row_count means after the last row.
+        """
+        table = self._table
+        row_count = table.rowCount()
+        if row_count == 0:
+            return 0
+        for row in range(row_count):
+            rect = table.visualRect(table.model().index(row, 0))
+            mid_y = rect.top() + rect.height() / 2.0
+            if y < mid_y:
+                return row
+        return row_count
+
+    def _update_drop_indicator(self) -> None:
+        table = self._table
+        viewport = table.viewport()
+        row_count = table.rowCount()
+        insert_before = self._row_drag_insert_before
+        from_row = self._row_drag_start_row
+
+        if row_count == 0 or insert_before < 0:
+            self._drop_indicator.hide()
+            return
+
+        # Don't show indicator when the result would be no change.
+        effective_to = (insert_before - 1) if from_row < insert_before else insert_before
+        if effective_to == from_row:
+            self._drop_indicator.hide()
+            return
+
+        if insert_before >= row_count:
+            rect = table.visualRect(table.model().index(row_count - 1, 0))
+            y = rect.bottom()
+        else:
+            rect = table.visualRect(table.model().index(insert_before, 0))
+            y = rect.top()
+
+        self._drop_indicator.setGeometry(0, max(0, y - 1), viewport.width(), 2)
+        self._drop_indicator.show()
+        self._drop_indicator.raise_()
 
     def _reset_swipe(self) -> None:
         self._swipe_drag_active = False

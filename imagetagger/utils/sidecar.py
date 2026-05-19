@@ -22,6 +22,12 @@ def get_sidecar_json_path(image_path: Path) -> Path:
 _sidecar_cache: dict[Path, tuple[float, SidecarData]] = {}
 _sidecar_cache_lock = threading.Lock()
 
+# Pending async sidecar writes: image_path -> SidecarData that has been
+# enqueued for disk write but not yet flushed.  read_sidecar_data checks
+# this first so callers always see the latest in-flight state.
+_pending_sidecar: dict[Path, "SidecarData"] = {}
+_pending_sidecar_lock = threading.Lock()
+
 
 @dataclass
 class SidecarData:
@@ -57,6 +63,12 @@ class SidecarData:
 
 
 def read_sidecar_data(image_path: Path) -> SidecarData:
+    # Pending async write takes priority — return it directly without hitting disk.
+    with _pending_sidecar_lock:
+        pending = _pending_sidecar.get(image_path)
+    if pending is not None:
+        return pending
+
     path = get_sidecar_json_path(image_path)
 
     # Fast-path: return cached negative result without a stat().
@@ -126,8 +138,8 @@ def _parse_sidecar_file(path: Path) -> SidecarData:
         return SidecarData()
 
 
-def write_sidecar_data(image_path: Path, data: SidecarData) -> None:
-    path = get_sidecar_json_path(image_path)
+def _build_sidecar_content(data: SidecarData) -> str:
+    """Serialize *data* to the JSON string written to disk."""
     payload: dict[str, Any] = {
         "description": data.description,
         "reasoning": data.reasoning,
@@ -152,7 +164,46 @@ def write_sidecar_data(image_path: Path, data: SidecarData) -> None:
         payload["validated"] = data.validated
     if data.validated_by is not None:
         payload["validated_by"] = data.validated_by
-    content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def write_sidecar_data(image_path: Path, data: SidecarData) -> None:
+    path = get_sidecar_json_path(image_path)
+    content = _build_sidecar_content(data)
     atomic_write_text(path, content, encoding="utf-8")
     with _sidecar_cache_lock:
         _sidecar_cache.pop(image_path, None)
+
+
+def write_sidecar_data_async(image_path: Path, data: SidecarData) -> None:
+    """Like ``write_sidecar_data`` but the disk write happens on a background thread.
+
+    The new data is immediately visible to ``read_sidecar_data`` via the
+    pending-write cache so callers always see the latest in-memory state
+    regardless of whether the background write has completed.
+    """
+    from imagetagger.utils.io_utils import bg_write_text
+
+    path = get_sidecar_json_path(image_path)
+    content = _build_sidecar_content(data)
+
+    # Make the new data available to reads immediately.
+    with _pending_sidecar_lock:
+        _pending_sidecar[image_path] = data
+    # Invalidate the disk-mtime cache so the pending entry is authoritative.
+    with _sidecar_cache_lock:
+        _sidecar_cache.pop(image_path, None)
+
+    def _on_write_complete() -> None:
+        # Replace pending entry with a real mtime-keyed cache entry.
+        with _pending_sidecar_lock:
+            if _pending_sidecar.get(image_path) is data:
+                _pending_sidecar.pop(image_path, None)
+        try:
+            mtime = path.stat().st_mtime
+            with _sidecar_cache_lock:
+                _sidecar_cache[image_path] = (mtime, data)
+        except OSError:
+            pass
+
+    bg_write_text(path, content, on_complete=_on_write_complete)

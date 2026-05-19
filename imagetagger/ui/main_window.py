@@ -54,7 +54,7 @@ from imagetagger.utils.validators import (
     create_threads_validator,
     create_timeout_validator,
 )
-from imagetagger.utils.io_utils import atomic_write_text
+from imagetagger.utils.io_utils import atomic_write_text, bg_write_text
 from imagetagger.utils.sidecar import SidecarData, get_sidecar_json_path, read_sidecar_data, write_sidecar_data
 from imagetagger.providers.llm_provider import (
     DEFAULT_LLM_TIMEOUT,
@@ -114,6 +114,11 @@ from imagetagger.ui.workers import (
 )
 from imagetagger.ui.shortcuts import platform_key_sequence
 from imagetagger.ui.server_settings_frame import create_server_settings_frame
+from imagetagger.ui.tag_controller import TagController
+from imagetagger.ui.llm_controller import LlmController
+from imagetagger.ui.directory_controller import DirectoryController
+from imagetagger.ui.fixup_controller import FixupController
+from imagetagger.ui.image_view_controller import ImageViewController
 from imagetagger.utils.theme_colors import danger_accent_color, danger_text_on_accent_color, info_accent_color, info_text_on_accent_color, success_accent_color, success_text_on_accent_color
 
 
@@ -126,7 +131,7 @@ from imagetagger.utils.filter_parser import (
     _FilterRuntime,
     _parse_filter_expression,
 )
-from imagetagger.ui.models import ImageRecord
+from imagetagger.ui.models import ImageRecord, _UNKNOWN
 
 
 
@@ -354,44 +359,12 @@ class MainWindow(QMainWindow):
         self.resize(1400, 860)
 
         self.records: List[ImageRecord] = []
+        self._record_index_by_path: dict[Path, int] = {}
         self.current_index: int = -1
-        self._loader_thread: QThread | None = None
-        self._loader_worker: FolderLoadWorker | None = None
         self._llm_provider = DEFAULT_VISION_PROVIDER
-        self._llm_thread: QThread | None = None
-        self._llm_worker: LlmTaskWorker | None = None
         self.known_tags: set[str] = set()
         self.tag_counts: Counter[str] = Counter()
-        self._updating_tag_list = False
         self._ignore_selection_sync = False
-        self._generate_batch_total = 0
-        self._generate_batch_processed = 0
-        self._generate_batch_updated = 0
-        self._generate_batch_vision_updated = 0
-        self._generate_batch_new_annotations = 0
-        self._generate_batch_started_at: float | None = None
-        self._generate_batch_retry_images = 0
-        self._validate_batch_total = 0
-        self._validate_batch_processed = 0
-        self._validate_batch_clean = 0
-        self._validate_batch_issues = 0
-        self._validate_batch_skipped = 0
-        self._validate_batch_started_at: float | None = None
-        self._validate_batch_retry_images = 0
-        self._validate_batch_llm_disobeyed = 0
-        self._validate_batch_errors = 0
-        self._validate_batch_context_exhausted = 0
-        self._validate_pending_indices: set[int] = set()
-        self._ai_find_batch_total = 0
-        self._ai_find_batch_processed = 0
-        self._ai_find_batch_matched = 0
-        self._ai_find_batch_started_at: float | None = None
-        self._ai_find_batch_retry_images = 0
-        self._llm_action_name: str | None = None
-        self._llm_cancel: LlmRequestCancellation | None = None
-        self._llm_threads_auto_mode = False
-        self._llm_threads_current = 0
-        self._icc_warning_paths: list[str] = []
         self._right_splitter_initialized = False
         self.prompt_editors: dict[str, QTextEdit] = {}
         self.prompt_status_labels: dict[str, QLabel] = {}
@@ -408,21 +381,11 @@ class MainWindow(QMainWindow):
         self.llm_endpoint = self._llm_provider.default_endpoint
         self.llm_model_name = ""
         self.status_connection_label: QLabel | None = None
-        self._pending_selection_path: Path | None = None
-        self._root_directory: Path | None = None
         self._detected_external_editors: list[ExternalEditor] | None = None
-        self._directory_loading_active = False
-        self._directory_load_cancel_requested = False
-        self._directory_load_cancelled_by_user = False
 
         # Image reload detection for external editor changes
         self._image_reload_helper = ImageReloadHelper(self, self._on_image_reload)
         self._prev_selected_rows: set[int] = set()
-
-        # Cached full-resolution pixmap for the currently displayed image.
-        # Avoids re-reading from disk on resize events and rapid re-selections.
-        self._cached_pixmap: QPixmap | None = None
-        self._cached_pixmap_path: Path | None = None
 
         # Cached palette-derived badge colors; invalidated on PaletteChange.
         self._cached_danger_color: QColor | None = None
@@ -440,11 +403,85 @@ class MainWindow(QMainWindow):
 
         self._cfg = _config.load()
 
+        self.directory_controller = DirectoryController(self)
+        self.llm_controller = LlmController(self)
         self._build_ui()
+        self.tag_controller = TagController(
+            self,
+            self.tag_input,
+            self.tag_list,
+            self.tag_suggestions_model,
+            self.known_tags_list,
+            self.known_tags_filter,
+        )
+        self.fixup_controller = FixupController(self)
+        self.image_view_controller = ImageViewController(self, self.image_label)
         self._build_menu()
         self._apply_tag_list_height()
         self._apply_config()
         self._update_llm_controls()
+
+    # ------------------------------------------------------------------
+    # Properties delegating LLM state to LlmController (used throughout
+    # MainWindow for backwards-compatible access)
+    # ------------------------------------------------------------------
+
+    @property
+    def _cached_pixmap(self) -> "QPixmap | None":
+        return self.image_view_controller._cached_pixmap
+
+    @_cached_pixmap.setter
+    def _cached_pixmap(self, value: "QPixmap | None") -> None:
+        self.image_view_controller._cached_pixmap = value
+
+    @property
+    def _cached_pixmap_path(self) -> "Path | None":
+        return self.image_view_controller._cached_pixmap_path
+
+    @_cached_pixmap_path.setter
+    def _cached_pixmap_path(self, value: "Path | None") -> None:
+        self.image_view_controller._cached_pixmap_path = value
+
+    @property
+    def _fixup_navigating(self) -> bool:
+        return self.fixup_controller._fixup_navigating
+
+    @_fixup_navigating.setter
+    def _fixup_navigating(self, value: bool) -> None:
+        self.fixup_controller._fixup_navigating = value
+
+    @property
+    def _llm_thread(self):
+        return self.llm_controller._llm_thread
+
+    @property
+    def _llm_action_name(self):
+        return self.llm_controller._llm_action_name
+
+    @property
+    def _llm_cancel(self):
+        return self.llm_controller._llm_cancel
+
+    @property
+    def _validate_pending_indices(self) -> set:
+        return self.llm_controller._validate_pending_indices
+
+    # ------------------------------------------------------------------
+    # Properties delegating directory state to DirectoryController
+    # (used in closeEvent, _display_image_path, and other retained methods)
+    # ------------------------------------------------------------------
+
+    @property
+    def _root_directory(self) -> Path | None:
+        return self.directory_controller._root_directory
+
+    @property
+    def _loader_thread(self):
+        return self.directory_controller._loader_thread
+
+    @property
+    def _loader_worker(self):
+        return self.directory_controller._loader_worker
 
     def _build_ui(self) -> None:
         root = QWidget(self)
@@ -458,6 +495,7 @@ class MainWindow(QMainWindow):
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_widget.currentRowChanged.connect(self.on_selection_changed)
         self.list_widget.setItemDelegate(_ImageRowDelegate(self))
+        self.list_widget.installEventFilter(self)
 
         self.filter_input = QLineEdit(self)
         self.filter_input.setPlaceholderText("Filter (fixup, vision, validated, \"tag\", 'text', &, |, parentheses)")
@@ -834,221 +872,41 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.known_tags_list, stretch=1)
 
+        global_tag_buttons_row = QHBoxLayout()
+        global_tag_buttons_row.setSpacing(4)
+        self.bump_tag_button = QPushButton("Bump", self)
+        self.bump_tag_button.setToolTip("Move selected tag to first position (after description) in all images that contain it")
+        self.bump_tag_button.clicked.connect(self._bump_selected_tag)
+        global_tag_buttons_row.addWidget(self.bump_tag_button)
+        global_tag_buttons_row.addStretch(1)
+        layout.addLayout(global_tag_buttons_row)
+
         self.controls_tabs.addTab(tab, "Tags")
         self._refresh_known_tags_list()
 
     def _update_prompt_status(self, kind: str, edited: bool = False) -> None:
-        label = self.prompt_status_labels.get(kind)
-        editor = self.prompt_editors.get(kind)
-        if label is None or editor is None:
-            return
-
-        source = prompt_source_for_kind(kind)
-        source_text = "Default (code)"
-        if source == "memory":
-            source_text = "Applied (memory override)"
-        elif source == "file":
-            source_text = "File"
-
-        suffix = ""
-        if edited:
-            current_text = editor.toPlainText().strip()
-            try:
-                active_text = active_prompt_for_kind(kind)
-            except LlmProviderError:
-                active_text = load_prompt_for_kind(kind)
-
-            if current_text != active_text:
-                suffix = " | Edited (not applied)"
-
-        if source == "file":
-            file_text = load_prompt_for_kind(kind)
-            if file_text == get_default_prompt(kind):
-                source_text = "File (default content)"
-
-        label.setText(f"Active source: {source_text}{suffix}")
+        self.llm_controller._update_prompt_status(kind, edited)
 
     def _prompt_title(self, kind: str) -> str:
-        if kind == "description":
-            return "Description"
-        if kind == "tagging":
-            return "Tagging"
-        if kind == "vision":
-            return "Vision"
-        if kind == "refine":
-            return "Refine"
-        if kind == "validation":
-            return "Validation"
-        if kind == "search":
-            return "AI Search"
-        return kind
+        return self.llm_controller._prompt_title(kind)
 
     def _prompt_editor_text(self, kind: str) -> str:
-        editor = self.prompt_editors.get(kind)
-        if editor is None:
-            raise LlmProviderError(f"Prompt editor for {kind} is not available.")
-        return editor.toPlainText().strip()
+        return self.llm_controller._prompt_editor_text(kind)
 
     def _test_prompt(self, kind: str) -> None:
-        if self._llm_thread is not None:
-            QMessageBox.information(self, "LLM busy", "Wait for the current LLM task to finish before testing a prompt.")
-            return
-
-        session = self._active_provider_session()
-        if session is None:
-            QMessageBox.warning(self, "No model selected", f"Connect to {self._llm_provider.display_name} and choose a model first.")
-            return
-
-        if self.current_index < 0 or self.current_index >= len(self.records):
-            QMessageBox.information(self, "No image selected", "Select an image before testing the prompt.")
-            return
-
-        record = self.records[self.current_index]
-
-        try:
-            editor_text = self._prompt_editor_text(kind)
-        except LlmProviderError as exc:
-            QMessageBox.warning(self, "Prompt error", str(exc))
-            return
-
-        agent_role = self._cfg.get("agent_roles", {}).get(kind) or None
-
-        if kind == "vision":
-            tags_lines = self._parse_annotations_for_tag_list(record.text)
-            tags_text = "\n".join(tags_lines).strip()
-            prompt = editor_text.replace("{tags}", tags_text)
-            prompt = render_prompt_with_agent_role(prompt, agent_role)
-            prompt = render_prompt_with_user_hint(prompt)
-        elif kind == "validation":
-            prompt = editor_text.replace("{tags}", format_annotations_for_validation(record.text))
-            prompt = render_prompt_with_agent_role(prompt, agent_role)
-            prompt = render_prompt_with_user_hint(prompt)
-        elif kind == "search":
-            query = " ".join(self.ai_find_input.text().split())
-            if not query:
-                QMessageBox.information(self, "Missing search text", "Enter text in the AI Find box to test the search prompt.")
-                return
-            prompt = editor_text.replace("{query}", query)
-            prompt = render_prompt_with_agent_role(prompt, agent_role)
-            prompt = render_prompt_with_user_hint(prompt)
-        elif kind == "refine":
-            vision_data = read_sidecar_data(record.image_path)
-            if vision_data.description:
-                parts.append(f'description: "{vision_data.description}"')
-            if vision_data.reasoning:
-                parts.append(f'reasoning: "{vision_data.reasoning}"')
-            vision_text = "\n".join(parts) if parts else "(no vision data available for this image)"
-            prompt = editor_text.replace("{vision_data}", vision_text)
-            prompt = render_prompt_with_agent_role(prompt, agent_role)
-            prompt = render_prompt_with_user_hint(prompt)
-        else:
-            existing_tags = self._parse_annotations_for_tag_list(record.text)
-            prompt = render_prompt_with_agent_role(editor_text, agent_role)
-            prompt = render_prompt_with_existing_tags(prompt, existing_tags)
-            prompt = render_prompt_with_user_hint(prompt)
-
-        try:
-            self._apply_query_downscale_setting()
-        except LlmProviderError:
-            return
-
-        timeout = self._llm_timeout_seconds()
-        image_path = record.image_path
-        title = self._prompt_title(kind)
-        cancel_token = LlmRequestCancellation()
-
-        def test_task(report_progress: Callable[[str], None]) -> str:
-            return session.generate(
-                image_path,
-                prompt,
-                timeout=timeout,
-                cancellation=cancel_token,
-            )
-
-        test_thread = QThread(self)
-        test_worker = RegenerateWorker(test_task)
-        test_worker.moveToThread(test_thread)
-        test_thread.started.connect(test_worker.run)
-        test_worker.finished.connect(test_thread.quit)
-        test_worker.failed.connect(test_thread.quit)
-        test_worker.cancelled.connect(test_thread.quit)
-
-        def _on_test_finished(result: object) -> None:
-            test_thread.deleteLater()
-            test_worker.deleteLater()
-            from imagetagger.ui.llm_test_result_dialog import LlmTestResultDialog
-            display_text = (
-                "=== PROMPT ===\n"
-                + prompt
-                + "\n\n=== RESPONSE ===\n"
-                + str(result)
-            )
-            dlg = LlmTestResultDialog(f"Test — {title}", display_text, self)
-            dlg.exec()
-
-        def _on_test_failed(error: str) -> None:
-            test_thread.deleteLater()
-            test_worker.deleteLater()
-            QMessageBox.warning(self, f"Test failed — {title}", error)
-
-        test_worker.finished.connect(_on_test_finished)
-        test_worker.failed.connect(_on_test_failed)
-        test_worker.cancelled.connect(_on_test_failed)
-
-        self.statusBar().showMessage(f"Testing {title} prompt with {self._llm_provider.display_name}…")
-        test_thread.start()
+        self.llm_controller._test_prompt(kind)
 
     def _set_agent_role(self, kind: str) -> None:
-        role_input = self.prompt_role_inputs.get(kind)
-        role = role_input.text().strip() if role_input is not None else ""
-        if "agent_roles" not in self._cfg or not isinstance(self._cfg["agent_roles"], dict):
-            self._cfg["agent_roles"] = {}
-        if role:
-            self._cfg["agent_roles"][kind] = role
-        else:
-            self._cfg["agent_roles"].pop(kind, None)
-        _config.save(self._cfg)
-        self.statusBar().showMessage(
-            f"Role for {self._prompt_title(kind)} {'set' if role else 'cleared'}"
-        )
+        self.llm_controller._set_agent_role(kind)
 
     def _apply_prompt_override(self, kind: str) -> None:
-        try:
-            set_prompt_override(kind, self._prompt_editor_text(kind))
-        except LlmProviderError as exc:
-            QMessageBox.critical(self, "Apply prompt failed", str(exc))
-            return
-        self._update_prompt_status(kind)
-        self.statusBar().showMessage(f"Applied {self._prompt_title(kind)} prompt in memory")
+        self.llm_controller._apply_prompt_override(kind)
 
     def _save_prompt_to_file(self, kind: str) -> None:
-        try:
-            saved_text = save_prompt_for_kind(kind, self._prompt_editor_text(kind))
-        except LlmProviderError as exc:
-            QMessageBox.critical(self, "Save prompt failed", str(exc))
-            return
-
-        editor = self.prompt_editors.get(kind)
-        if editor is not None:
-            editor.setPlainText(saved_text)
-        self._update_prompt_status(kind)
-        self.statusBar().showMessage(f"Saved {self._prompt_title(kind)} prompt file")
+        self.llm_controller._save_prompt_to_file(kind)
 
     def _reset_prompt_to_default(self, kind: str) -> None:
-        try:
-            default_text = reset_prompt_to_default(kind)
-            clear_prompt_override(kind)
-        except LlmProviderError as exc:
-            QMessageBox.critical(self, "Reset prompt failed", str(exc))
-            return
-
-        editor = self.prompt_editors.get(kind)
-        if editor is not None:
-            editor.setPlainText(default_text)
-        self._update_prompt_status(kind)
-        self.statusBar().showMessage(
-            f"Reset {self._prompt_title(kind)} prompt to code default"
-        )
+        self.llm_controller._reset_prompt_to_default(kind)
 
     def _apply_config(self) -> None:
         font_point_size = self._cfg.get("font_point_size", 0)
@@ -1209,64 +1067,19 @@ class MainWindow(QMainWindow):
         self._apply_app_font_size(self._current_app_font_size() - 1)
 
     def fetch_provider_models(self) -> None:
-        server = self.llm_endpoint_input.text().strip()
-        self.llm_fetch_button.setEnabled(False)
-        try:
-            model_names = self._llm_provider.fetch_models(server, timeout=self._llm_timeout_seconds())
-            normalized_server = self._llm_provider.normalize_endpoint(server)
-        except LlmProviderError as exc:
-            QMessageBox.warning(self, f"{self._llm_provider.display_name} connection failed", str(exc))
-            return
-        finally:
-            self.llm_fetch_button.setEnabled(True)
-
-        self.llm_endpoint_input.setText(normalized_server)
-        self.llm_model_combo.clear()
-        self.llm_model_combo.addItems(model_names)
-        if model_names:
-            self.llm_model_combo.setCurrentIndex(0)
-            self.statusBar().showMessage(f"Fetched {len(model_names)} model(s) from {normalized_server}")
-        else:
-            self.statusBar().showMessage(f"No models found at {normalized_server}")
-            QMessageBox.information(self, "No models found", f"The {self._llm_provider.display_name} server returned no models.")
+        self.llm_controller.fetch_provider_models()
 
     def use_selected_provider_model(self) -> None:
-        model_name = self.llm_model_combo.currentText().strip()
-        if not model_name:
-            QMessageBox.warning(self, "No model selected", "Fetch models and choose one before using it.")
-            return
-
-        try:
-            normalized_server = self._llm_provider.normalize_endpoint(self.llm_endpoint_input.text())
-        except LlmProviderError as exc:
-            QMessageBox.warning(self, "Invalid server", str(exc))
-            return
-
-        self.llm_endpoint = normalized_server
-        self.llm_model_name = model_name
-        self.llm_endpoint_input.setText(normalized_server)
-        self._cfg["llm_endpoint"] = normalized_server
-        self._cfg["llm_model"] = model_name
-        try:
-            self._cfg["llm_threads"] = self._llm_thread_count(show_message=False)
-        except LlmProviderError:
-            self._cfg["llm_threads"] = 1
-        _config.save(self._cfg)
-        self._update_llm_controls()
-        self.statusBar().showMessage(f"{self._llm_provider.display_name} model selected: {self.llm_model_name}")
+        self.llm_controller.use_selected_provider_model()
 
     def _active_provider_session(self) -> VisionLlmSession | None:
-        if not self.llm_model_name.strip():
-            return None
-        return self._llm_provider.create_session(self.llm_endpoint, self.llm_model_name)
+        return self.llm_controller._active_provider_session()
 
     def _llm_timeout_seconds(self) -> float:
-        def show_error(msg: str) -> None:
-            QMessageBox.warning(self, "Invalid timeout", msg)
-        return InputValidator.parse_timeout_seconds(self.llm_timeout_input.text(), show_error)
+        return self.llm_controller._llm_timeout_seconds()
 
     def _llm_retry_count(self) -> int:
-        return InputValidator.parse_retry_count(self.llm_retry_input.text())
+        return self.llm_controller._llm_retry_count()
 
     @staticmethod
     def _format_mpx(value: float) -> str:
@@ -1279,88 +1092,15 @@ class MainWindow(QMainWindow):
         return InputValidator.parse_max_resolution_mpx(self.llm_max_resolution_input.text(), show_error)
 
     def _apply_query_downscale_setting(self) -> float:
-        max_resolution_mpx = self._llm_max_resolution_mpx_value()
-        max_pixels = max(1, int(max_resolution_mpx * 1_000_000))
-        configure_image_preparation(max_image_pixels=max_pixels)
-        return max_resolution_mpx
+        return self.llm_controller._apply_query_downscale_setting()
 
     def _llm_thread_count(self, show_message: bool = True) -> int:
-        raw_value = self.llm_threads_input.text().strip()
-        if not raw_value:
-            if show_message:
-                QMessageBox.warning(self, "Invalid threads", "Enter thread count (0 for auto).")
-            raise LlmProviderError("Enter thread count.")
-
-        try:
-            thread_count = int(raw_value)
-        except ValueError as exc:
-            if show_message:
-                QMessageBox.warning(self, "Invalid threads", "Thread count must be a whole number.")
-            raise LlmProviderError("Thread count must be a whole number.") from exc
-
-        if thread_count < 0:
-            if show_message:
-                QMessageBox.warning(self, "Invalid threads", "Thread count must be 0 or greater.")
-            raise LlmProviderError("Thread count must be 0 or greater.")
-
-        return thread_count
+        return self.llm_controller._llm_thread_count(show_message=show_message)
 
     def _update_llm_controls(self) -> None:
-        connected = bool(self.llm_model_name.strip())
-        if connected:
-            text = f"{self.llm_model_name} @ {self.llm_endpoint}"
-        else:
-            text = "no model"
-        if self.status_connection_label is not None:
-            self.status_connection_label.setText(text)
-        if self._llm_thread is not None and self._llm_action_name == "Generate":
-            self.generate_button.setText("&Stop generation")
-            self.generate_button.setEnabled(True)
-            self.validate_button.setText("&Validate")
-            self.validate_button.setEnabled(False)
-            self.ai_find_button.setText("AI Find")
-            self.ai_find_button.setEnabled(False)
-            self.ai_find_input.setEnabled(False)
-            self._update_fixup_button_state()
+        if not hasattr(self, "llm_controller"):
             return
-        if self._llm_thread is not None and self._llm_action_name == "Validate":
-            self.generate_button.setText("&Generate")
-            self.generate_button.setEnabled(False)
-            self.validate_button.setText("&Stop validation")
-            self.validate_button.setEnabled(True)
-            self.ai_find_button.setText("AI Find")
-            self.ai_find_button.setEnabled(False)
-            self.ai_find_input.setEnabled(False)
-            self._update_fixup_button_state()
-            return
-        if self._llm_thread is not None and self._llm_action_name == "AI Find":
-            self.generate_button.setText("&Generate")
-            self.generate_button.setEnabled(False)
-            self.validate_button.setText("&Validate")
-            self.validate_button.setEnabled(False)
-            self.ai_find_button.setText("Stop AI Find")
-            self.ai_find_button.setEnabled(True)
-            self.ai_find_input.setEnabled(False)
-            self._update_fixup_button_state()
-            return
-
-        self.generate_button.setText("&Generate")
-        self.validate_button.setText("&Validate")
-        self.ai_find_button.setText("AI Find")
-        active = connected and self._llm_thread is None
-        self.generate_button.setEnabled(
-            active
-            and (
-                self.generate_tags_checkbox.isChecked()
-                or self.generate_description_checkbox.isChecked()
-                or self.generate_vision_checkbox.isChecked()
-                or self.generate_refine_checkbox.isChecked()
-            )
-        )
-        self.validate_button.setEnabled(active)
-        self.ai_find_input.setEnabled(active)
-        self.ai_find_button.setEnabled(active and bool(self.ai_find_input.text().strip()))
-        self._update_fixup_button_state()
+        self.llm_controller._update_llm_controls()
 
     def _current_record(self) -> ImageRecord | None:
         if 0 <= self.current_index < len(self.records):
@@ -1439,6 +1179,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Save failed", f"Could not write {path.name}:\n\n{exc}")
             return
 
+        record._sidecar_validated = _UNKNOWN
         self._vision_loaded_description = vision_data.description
         self._vision_loaded_reasoning = vision_data.reasoning
         self._update_vision_dirty_state()
@@ -1537,7 +1278,7 @@ class MainWindow(QMainWindow):
             "fixup": lambda record: record.has_pending_fixup,
             "untagged": lambda record: not record.text_path.exists(),
             "vision": lambda record: get_sidecar_json_path(record.image_path).exists(),
-            "validated": lambda record: read_sidecar_data(record.image_path).validated is not None,
+            "validated": lambda record: record.sidecar_validated is not None,
         }
         return _FilterRuntime(
             named_filters=named_filters,
@@ -1657,90 +1398,22 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{self._filtered_total_status_text()} no images match filter")
 
     def _on_fixup_state_changed(self, image_path: Path | None = None) -> None:
-        if image_path is None:
-            for record in self.records:
-                record._sidecar_has_pending_fixup = None
-            # Defer the bulk visual refresh to the next event-loop iteration so
-            # _apply_image_filter and _update_fixup_button_state run first and
-            # the GUI stays responsive during large batch operations.
-            QTimer.singleShot(0, self._refresh_all_list_item_previews)
-        else:
-            for index, record in enumerate(self.records):
-                if record.image_path == image_path:
-                    record._sidecar_has_pending_fixup = None
-                    self._update_list_item_preview(index)
-                    break
-        self._apply_image_filter()
-        self._update_fixup_button_state()
-        # Refresh the image preview tooltip if the changed image is currently selected.
-        current = self._current_record()
-        if current is not None and (image_path is None or current.image_path == image_path):
-            self._update_image_label_tooltip()
+        self.fixup_controller._on_fixup_state_changed(image_path)
 
     def _update_fixup_button_state(self) -> None:
-        record = self._current_record()
-        enabled = record is not None and bool(self._list_item_badge_specs(record))
-        if enabled:
-            item = self.list_widget.item(self.current_index)
-            if item is None or item.isHidden():
-                enabled = False
-        if self._llm_thread is not None:
-            if self._llm_action_name != "Validate" or self.current_index in self._validate_pending_indices:
-                enabled = False
-        self.fixup_button.setEnabled(enabled)
+        self.fixup_controller._update_fixup_button_state()
 
     def _find_adjacent_fixup_index(self, start_index: int, direction: int) -> int | None:
-        if direction not in (-1, 1):
-            return None
-
-        index = start_index + direction
-        while 0 <= index < len(self.records):
-            item = self.list_widget.item(index)
-            if item is not None and item.isHidden():
-                index += direction
-                continue
-
-            if index in self._validate_pending_indices:
-                index += direction
-                continue
-
-            record = self.records[index]
-            if record.has_pending_fixup:
-                return index
-
-            index += direction
-
-        return None
+        return self.fixup_controller._find_adjacent_fixup_index(start_index, direction)
 
     def _find_fixup_index(self, reverse: bool) -> int | None:
-        if not self.records:
-            return None
-
-        indices = range(len(self.records) - 1, -1, -1) if reverse else range(len(self.records))
-        for index in indices:
-            if index in self._validate_pending_indices:
-                continue
-            item = self.list_widget.item(index)
-            if item is not None and item.isHidden():
-                continue
-            record = self.records[index]
-            if record.has_pending_fixup:
-                return index
-        return None
+        return self.fixup_controller._find_fixup_index(reverse)
 
     def _jump_to_first_fixup(self) -> None:
-        index = self._find_fixup_index(reverse=False)
-        if index is None:
-            self.statusBar().showMessage("No fixup image found in the current list")
-            return
-        self.list_widget.setCurrentRow(index)
+        self.fixup_controller._jump_to_first_fixup()
 
     def _jump_to_last_fixup(self) -> None:
-        index = self._find_fixup_index(reverse=True)
-        if index is None:
-            self.statusBar().showMessage("No fixup image found in the current list")
-            return
-        self.list_widget.setCurrentRow(index)
+        self.fixup_controller._jump_to_last_fixup()
 
     def _focus_tag_input_when_autotag(self) -> None:
         if self.controls_tabs.currentIndex() == 0:
@@ -1776,7 +1449,29 @@ class MainWindow(QMainWindow):
         return False
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # type: ignore[override]
-        if watched is self.tag_input and event.type() == QEvent.Type.KeyPress:
+        if watched is self.list_widget and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            modifiers = event.modifiers()
+            plain = not bool(modifiers & ~Qt.KeyboardModifier.KeypadModifier)
+            if plain and key == Qt.Key.Key_Home:
+                first = next(
+                    (i for i in range(self.list_widget.count())
+                     if not self.list_widget.item(i).isHidden()),
+                    None,
+                )
+                if first is not None:
+                    self.list_widget.setCurrentRow(first)
+                return True
+            if plain and key == Qt.Key.Key_End:
+                last = next(
+                    (i for i in range(self.list_widget.count() - 1, -1, -1)
+                     if not self.list_widget.item(i).isHidden()),
+                    None,
+                )
+                if last is not None:
+                    self.list_widget.setCurrentRow(last)
+                return True
+        if hasattr(self, "tag_input") and watched is self.tag_input and event.type() == QEvent.Type.KeyPress:
             key = event.key()
             if not self.tag_input.text().strip():
                 if key == Qt.Key.Key_Up:
@@ -1877,6 +1572,12 @@ class MainWindow(QMainWindow):
 
         was_current = self.current_index == record_index
         self.records.pop(record_index)
+        # Keep the index dict consistent: remove the deleted entry and
+        # shift down all indices that were above it.
+        del self._record_index_by_path[image_path]
+        for p, idx in self._record_index_by_path.items():
+            if idx > record_index:
+                self._record_index_by_path[p] = idx - 1
         deleted_item = self.list_widget.takeItem(record_index)
         del deleted_item
 
@@ -1923,33 +1624,10 @@ class MainWindow(QMainWindow):
         return os.path.normcase(str(path.resolve(strict=False)))
 
     def _set_watched_image(self, image_path: Path | None) -> None:
-        self._image_reload_helper.set_watched_image(image_path)
+        self.image_view_controller._set_watched_image(image_path)
 
     def _on_image_reload(self, image_path: Path) -> None:
-        """Callback invoked when watched image is reloaded."""
-        current_record = self._current_record()
-        if current_record is None:
-            return
-        if self._normalized_path_for_compare(current_record.image_path) != self._normalized_path_for_compare(image_path):
-            return
-
-        # Skip transient save states where the file is temporarily unavailable.
-        pixmap = QPixmap(str(image_path))
-        if pixmap.isNull():
-            return
-
-        # Invalidate the pixmap cache so _show_image re-reads the updated file.
-        if self._cached_pixmap_path == image_path:
-            self._cached_pixmap = None
-            self._cached_pixmap_path = None
-
-        self._show_image(image_path)
-
-        record_index = self._record_index_for_image_path(image_path)
-        if record_index >= 0:
-            self._update_list_item_preview(record_index)
-
-        self.statusBar().showMessage(f"Reloaded image: {image_path.name}")
+        self.image_view_controller._on_image_reload(image_path)
 
     def _open_current_image_in_default_app(self) -> None:
         image_path = self._current_image_path()
@@ -2027,10 +1705,7 @@ class MainWindow(QMainWindow):
         return list(editors)
 
     def _record_index_for_image_path(self, image_path: Path) -> int:
-        for index, record in enumerate(self.records):
-            if record.image_path == image_path:
-                return index
-        return -1
+        return self._record_index_by_path.get(image_path, -1)
 
     def _set_tags_for_image_path(self, image_path: Path, tags: list[str], status_prefix: str = "Auto-saved") -> None:
         record_index = self._record_index_for_image_path(image_path)
@@ -2039,15 +1714,18 @@ class MainWindow(QMainWindow):
 
         normalized_tags = [tag for tag in (item.strip() for item in tags) if tag]
         record = self.records[record_index]
+        old_tags = self._parse_tags(record.text)
         record.text = self._serialize_tags(normalized_tags)
 
         if self.current_index == record_index:
             self._populate_tag_list(normalized_tags)
 
         self._update_list_item_preview(record_index)
-        self._rebuild_known_tags_from_records()
+        self._update_tag_counts_incremental(old_tags, normalized_tags)
         self._refresh_tag_completions()
-        self._write_record_text(record, status_prefix=status_prefix)
+        # Use background write — in-memory state is already authoritative above.
+        bg_write_text(record.text_path, record.text, encoding="utf-8")
+        self.statusBar().showMessage(f"{status_prefix}: {record.text_path.name}")
 
     def _merge_dialog_geometry_from_config(self) -> dict[str, int] | None:
         raw = self._cfg.get("merge_dialog_geometry")
@@ -2099,334 +1777,74 @@ class MainWindow(QMainWindow):
         return relative_text or image_path.name
 
     def open_fixup_dialog(self) -> None:
-        record = self._current_record()
-        if record is None:
-            return
-
-        try:
-            regenerate_max_resolution_mpx = self._apply_query_downscale_setting()
-        except LlmProviderError:
-            return
-
-        initial_fixup_record_indices = [
-            i for i, item in enumerate(self.records)
-            if item.has_pending_fixup
-        ]
-        initial_fixup_total = len(initial_fixup_record_indices)
-        if initial_fixup_total <= 0:
-            return
-
-        regenerate_tags_enabled = self.generate_tags_checkbox.isChecked()
-        regenerate_description_enabled = self.generate_description_checkbox.isChecked()
-        timeout_text = self.llm_timeout_input.text().strip()
-        retry_text = self.llm_retry_input.text().strip()
-        try:
-            regenerate_timeout_seconds = int(timeout_text) if timeout_text else int(DEFAULT_LLM_TIMEOUT)
-        except ValueError:
-            regenerate_timeout_seconds = int(DEFAULT_LLM_TIMEOUT)
-        try:
-            regenerate_retry_count = int(retry_text) if retry_text else 0
-        except ValueError:
-            regenerate_retry_count = 0
-        
-        # Persistent settings across image navigation
-        regenerate_model_name = ""
-        regenerate_model_endpoint = ""
-        regenerate_user_hint = ""
-
-        def _capture_regenerate_settings(values: dict[str, int | float | bool | str]) -> None:
-            nonlocal regenerate_tags_enabled
-            nonlocal regenerate_description_enabled
-            nonlocal regenerate_timeout_seconds
-            nonlocal regenerate_retry_count
-            nonlocal regenerate_max_resolution_mpx
-            nonlocal regenerate_model_name
-            nonlocal regenerate_model_endpoint
-            nonlocal regenerate_user_hint
-
-            tags_enabled = values.get("tags_enabled")
-            description_enabled = values.get("description_enabled")
-            timeout_seconds = values.get("timeout_seconds")
-            retry_count = values.get("retry_count")
-            max_resolution_mpx = values.get("max_resolution_mpx")
-            model_name = values.get("model_name")
-            model_endpoint = values.get("model_endpoint")
-            user_hint = values.get("user_hint")
-
-            if isinstance(tags_enabled, bool):
-                regenerate_tags_enabled = tags_enabled
-            if isinstance(description_enabled, bool):
-                regenerate_description_enabled = description_enabled
-            if isinstance(timeout_seconds, int):
-                regenerate_timeout_seconds = max(1, timeout_seconds)
-            if isinstance(retry_count, int):
-                regenerate_retry_count = max(0, retry_count)
-            if isinstance(max_resolution_mpx, (int, float)) and max_resolution_mpx > 0:
-                regenerate_max_resolution_mpx = float(max_resolution_mpx)
-                self.llm_max_resolution_input.setText(self._format_mpx(regenerate_max_resolution_mpx))
-                configure_image_preparation(max_image_pixels=max(1, int(regenerate_max_resolution_mpx * 1_000_000)))
-            if isinstance(model_name, str):
-                regenerate_model_name = model_name
-            if isinstance(model_endpoint, str):
-                regenerate_model_endpoint = model_endpoint
-            if isinstance(user_hint, str):
-                regenerate_user_hint = user_hint
-
-        while True:
-            record = self._current_record()
-            if record is None:
-                return
-
-            try:
-                display_index = initial_fixup_record_indices.index(self.current_index) + 1
-            except ValueError:
-                display_index = 1
-
-            title_path = self._display_image_path(record.image_path)
-
-            dialog_title = f"Fixup - {title_path} ({display_index} of {initial_fixup_total})"
-
-            prev_fixup_index = self._find_adjacent_fixup_index(self.current_index, -1)
-            next_fixup_index = self._find_adjacent_fixup_index(self.current_index, 1)
-            mouse_actions_cfg = self._cfg.get("merge_table_mouse_actions", {})
-            if not isinstance(mouse_actions_cfg, dict):
-                mouse_actions_cfg = {}
-
-            outcome = open_fixup_dialog_for_image(
-                parent=self,
-                image_path=record.image_path,
-                current_annotations=self._current_tags(),
-                title_text=dialog_title,
-                parse_tags=self._parse_tags,
-                sanitize_annotation=self._sanitize_annotation_text,
-                apply_annotations=lambda tags, status_prefix, image_path=record.image_path: self._set_tags_for_image_path(
-                    image_path,
-                    tags,
-                    status_prefix=status_prefix,
-                ),
-                show_status=self.statusBar().showMessage,
-                refresh_fixup_state=self._on_fixup_state_changed,
-                initial_geometry=self._merge_dialog_geometry_from_config(),
-                save_geometry=self._save_merge_dialog_geometry,
-                can_navigate_prev=prev_fixup_index is not None,
-                can_navigate_next=next_fixup_index is not None,
-                tag_suggestions=self._sorted_tag_suggestions(),
-                provider_session=self._active_provider_session(),
-                provider=self._llm_provider,
-                regenerate_tags_enabled=regenerate_tags_enabled,
-                regenerate_description_enabled=regenerate_description_enabled,
-                regenerate_timeout_seconds=regenerate_timeout_seconds,
-                regenerate_retry_count=regenerate_retry_count,
-                regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
-                regenerate_model_name=regenerate_model_name,
-                regenerate_model_endpoint=regenerate_model_endpoint,
-                regenerate_user_hint=regenerate_user_hint,
-                merge_table_double_click_action_enabled=bool(
-                    mouse_actions_cfg.get("double_click_action_enabled", True)
-                ),
-                merge_table_swipe_actions_enabled=bool(
-                    mouse_actions_cfg.get("swipe_actions_enabled", False)
-                ),
-                merge_table_horizontal_scroll_actions_enabled=bool(
-                    mouse_actions_cfg.get("horizontal_scroll_actions_enabled", False)
-                ),
-                merge_table_horizontal_scroll_reverse_enabled=bool(
-                    mouse_actions_cfg.get("horizontal_scroll_reverse_enabled", False)
-                ),
-                merge_table_horizontal_scroll_stop_idle_seconds=float(
-                    mouse_actions_cfg.get("horizontal_scroll_stop_idle_seconds", 0.45)
-                ),
-                merge_table_horizontal_scroll_row_target_mode=int(
-                    mouse_actions_cfg.get(
-                        "horizontal_scroll_row_target_mode",
-                        _config.MERGE_TABLE_HSCROLL_TARGET_POINTER_ON_SELECTED,
-                    )
-                ),
-                delete_image=lambda image_path=record.image_path: self._delete_image_and_related_files(
-                    image_path,
-                    confirm=False,
-                ),
-                confirm_delete=self._confirm_on_delete_enabled(),
-                save_regenerate_settings=_capture_regenerate_settings,
-            )
-
-            if outcome == "prev":
-                target = self._find_adjacent_fixup_index(self.current_index, -1)
-                if target is not None:
-                    self.list_widget.setCurrentRow(target)
-                    continue
-                return
-
-            if outcome == "next":
-                # Deletion from merge dialog can change list indices while the dialog is open.
-                # Recompute target from current state instead of using stale pre-dialog indices.
-                current_record = self._current_record()
-                if current_record is not None and current_record.has_pending_fixup:
-                    continue
-
-                target = self._find_adjacent_fixup_index(self.current_index, 1)
-                if target is None:
-                    target = self._find_adjacent_fixup_index(self.current_index, -1)
-                if target is None:
-                    target = self._find_fixup_index(reverse=False)
-                if target is not None:
-                    self.list_widget.setCurrentRow(target)
-                    continue
-            return
+        self.fixup_controller.open_fixup_dialog()
 
     def open_folder(self) -> None:
-        if self._loader_thread and self._loader_thread.isRunning():
-            self.statusBar().showMessage("A folder is already loading")
-            return
-
-        start_dir = self._cfg.get("last_open_directory", "") or ""
-        folder = QFileDialog.getExistingDirectory(self, "Select image folder", start_dir)
-        if not folder:
-            return
-
-        self.load_directory(Path(folder))
+        self.directory_controller.open_folder()
 
     def refresh_directory(self) -> None:
-        if self._loader_thread and self._loader_thread.isRunning():
-            self.statusBar().showMessage("A folder is already loading")
-            return
-
-        folder = self._root_directory
-        if folder is None:
-            QMessageBox.information(self, "No folder selected", "Open a folder before refreshing it.")
-            return
-
-        current_record = self._current_record()
-        restore_selection = current_record.image_path if current_record is not None else None
-        self.load_directory(folder, restore_selection=restore_selection)
+        self.directory_controller.refresh_directory()
 
     def _active_directory(self) -> Path | None:
-        record = self._current_record()
-        if record is not None:
-            return record.image_path.parent
-
-        if self.records:
-            return self.records[0].image_path.parent
-
-        folder = str(self._cfg.get("last_open_directory", "")).strip()
-        if not folder:
-            return None
-
-        return Path(folder)
+        return self.directory_controller._active_directory()
 
     def _update_window_title(self, folder: Path | None) -> None:
-        base_title = "ImageTagger"
-        if folder is None:
-            self.setWindowTitle(base_title)
-            return
-
-        name = folder.name.strip() or str(folder)
-        self.setWindowTitle(f"{base_title} - {name}")
+        self.directory_controller._update_window_title(folder)
 
     def _find_image_name_collision(self, folder: Path) -> tuple[Path, Path] | None:
-        """Return the first pair of image files that would map to the same .txt path."""
-        try:
-            image_paths = sorted(
-                [
-                    p
-                    for p in folder.rglob("*")
-                    if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-                ],
-                key=lambda p: p.relative_to(folder).as_posix().lower(),
-            )
-        except OSError as exc:
-            QMessageBox.critical(self, "Folder load failed", f"Failed to read folder: {exc}")
-            return None
-
-        seen_by_txt_path: dict[str, Path] = {}
-        for image_path in image_paths:
-            txt_key = str(image_path.with_suffix(".txt")).casefold()
-            existing = seen_by_txt_path.get(txt_key)
-            if existing is None:
-                seen_by_txt_path[txt_key] = image_path
-                continue
-
-            if existing.suffix.lower() != image_path.suffix.lower():
-                return existing, image_path
-
-        return None
+        return self.directory_controller._find_image_name_collision(folder)
 
     def load_directory(self, folder: Path, restore_selection: Path | None = None) -> None:
-        self._directory_loading_active = True
-        self._directory_load_cancel_requested = False
-        self._directory_load_cancelled_by_user = False
-        self._set_loading_state(True)
-        self.statusBar().showMessage("Scanning folder...")
-        self._pending_selection_path = restore_selection
-        self._detected_external_editors = None
-
-        try:
-            max_thread_cap = int(self._cfg.get("directory_loader_max_threads", 8))
-        except (TypeError, ValueError):
-            max_thread_cap = 8
-        max_thread_cap = max(1, max_thread_cap)
-
-        self._loader_thread = QThread(self)
-        self._loader_worker = FolderLoadWorker(folder, max_thread_cap=max_thread_cap)
-        self._loader_worker.moveToThread(self._loader_thread)
-
-        self._loader_thread.started.connect(self._loader_worker.run)
-        self._loader_worker.scan_progress.connect(self._on_scan_progress)
-        self._loader_worker.scan_ready.connect(self._on_scan_ready)
-        self._loader_worker.collision_detected.connect(self._on_collision_detected)
-        self._loader_worker.item_loaded.connect(self._on_item_loaded)
-        self._loader_worker.progress.connect(self._on_load_progress)
-        self._loader_worker.icc_warning.connect(self._on_icc_warning_detected)
-        self._loader_worker.finished.connect(self._on_load_finished)
-        self._loader_worker.failed.connect(self._on_load_failed)
-        self._loader_worker.finished.connect(self._loader_thread.quit)
-        self._loader_worker.failed.connect(self._loader_thread.quit)
-        self._loader_thread.finished.connect(self._cleanup_loader)
-
-        self._loader_thread.start()
+        self.directory_controller.load_directory(folder, restore_selection=restore_selection)
 
     def _on_scan_ready(self, total: int) -> None:
-        if self._directory_load_cancel_requested:
-            return
-
-        folder = self._loader_worker.folder if self._loader_worker is not None else None
-        if folder is None:
-            return
-
-        self._root_directory = folder
-        self._update_window_title(folder)
-        self._clear_loaded_directory_data(reset_root=False)
-
-        # _clear_loaded_directory_data already calls _refresh_tag_completions() on
-        # the now-empty known_tags — no need to call it again here.
-
-        self.statusBar().showMessage(f"Loading {total} images...")
-        self._loader_worker.allow_processing()
+        self.directory_controller._on_scan_ready(total)
 
     def _on_scan_progress(self, files: int, directories: int, images: int) -> None:
-        if self._directory_load_cancel_requested:
-            return
-        self.statusBar().showMessage(
-            f"Scanning folder... {files} files, {directories} directories, {images} images"
-        )
+        self.directory_controller._on_scan_progress(files, directories, images)
 
     def _on_collision_detected(self, first: str, second: str) -> None:
-        self._directory_loading_active = False
-        self.statusBar().showMessage("Duplicate images detected")
-        self._set_loading_state(False)
-        if self._loader_worker is not None:
-            self._loader_worker.cancel()
-        if self._loader_thread is not None and self._loader_thread.isRunning():
-            self._loader_thread.quit()
+        self.directory_controller._on_collision_detected(first, second)
 
-        QMessageBox.warning(
-            self,
-            "Duplicate image names detected",
-            "Two image files have the same name with different extensions, which would "
-            "collide on the same .txt description file.\n\n"
-            f"Filename: {Path(first).stem}\n"
-            f"Files:\n- {first}\n- {second}",
-        )
+    def _set_loading_state(self, loading: bool) -> None:
+        self.directory_controller._set_loading_state(loading)
+
+    def _clear_loaded_directory_data(self, reset_root: bool) -> None:
+        self.directory_controller._clear_loaded_directory_data(reset_root)
+
+    def _request_stop_directory_loading(self) -> None:
+        self.directory_controller._request_stop_directory_loading()
+
+    def _apply_tag_list_height(self) -> None:
+        if self._right_splitter_initialized:
+            return
+
+        total_height = max(420, self.right_panel.height() if self.right_panel.height() > 0 else self.height())
+        top_height = max(180, int(total_height * 0.6))
+        bottom_height = max(180, total_height - top_height)
+        self.right_splitter.setSizes([top_height, bottom_height])
+        self._right_splitter_initialized = True
+
+    def _on_item_loaded(self, payload: object) -> None:
+        self.directory_controller._on_item_loaded(payload)
+
+    def _on_load_progress(self, processed: int, total: int, percent: int) -> None:
+        self.directory_controller._on_load_progress(processed, total, percent)
+
+    def _on_icc_warning_detected(self, image_path: str) -> None:
+        self.directory_controller._on_icc_warning_detected(image_path)
+
+    def _on_load_finished(self, total: int, folder: str) -> None:
+        self.directory_controller._on_load_finished(total, folder)
+
+    def _on_load_failed(self, message: str) -> None:
+        self.directory_controller._on_load_failed(message)
+
+    def _cleanup_loader(self) -> None:
+        self.directory_controller._cleanup_loader()
+
+    def _restore_selection_after_load(self) -> None:
+        self.directory_controller._restore_selection_after_load()
 
     def _add_list_item(
         self,
@@ -2460,271 +1878,6 @@ class MainWindow(QMainWindow):
         visible = is_visible if is_visible is not None else self._record_matches_filter(record)
         item.setHidden(not visible)
         self.list_widget.addItem(item)
-
-    def _set_loading_state(self, loading: bool) -> None:
-        if self.open_action is not None:
-            self.open_action.setEnabled(not loading)
-        if self.refresh_action is not None:
-            self.refresh_action.setEnabled(not loading)
-        if self.save_action is not None:
-            self.save_action.setEnabled(not loading)
-        self.list_widget.setEnabled(not loading)
-        self.tag_input.setEnabled(not loading)
-        self.tag_list.setEnabled(not loading)
-        self.llm_endpoint_input.setEnabled(not loading and self._llm_thread is None)
-        self.llm_fetch_button.setEnabled(not loading and self._llm_thread is None)
-        self.llm_model_combo.setEnabled(not loading and self._llm_thread is None)
-        self.llm_timeout_input.setEnabled(not loading and self._llm_thread is None)
-        self.llm_retry_input.setEnabled(not loading and self._llm_thread is None)
-        self.llm_max_resolution_input.setEnabled(not loading and self._llm_thread is None)
-        self.llm_use_button.setEnabled(not loading and self._llm_thread is None)
-        self.ai_find_input.setEnabled(not loading and self._llm_thread is None)
-        self.ai_find_button.setEnabled(not loading and self._llm_thread is None and bool(self.llm_model_name.strip()))
-        self.fixup_button.setEnabled(False)
-        self.stop_loading_button.setVisible(loading)
-        self.stop_loading_button.setEnabled(loading and self._directory_loading_active)
-        if loading:
-            self.generate_button.setEnabled(False)
-            self.validate_button.setEnabled(False)
-            self.ai_find_button.setEnabled(False)
-        else:
-            self._update_llm_controls()
-
-    def _clear_loaded_directory_data(self, reset_root: bool) -> None:
-        self._icc_warning_paths = []
-        self.records = []
-        self.known_tags.clear()
-        self.tag_counts.clear()
-        self.list_widget.clear()
-        self.image_label.setText("No image selected")
-        self.tag_input.clear()
-        self.tag_list.clear()
-        self._clear_vision_fields()
-        self.current_index = -1
-        self._set_watched_image(None)
-        if reset_root:
-            self._root_directory = None
-            self._update_window_title(self._active_directory())
-        self._refresh_tag_completions()
-
-    def _request_stop_directory_loading(self) -> None:
-        if not self._directory_loading_active:
-            return
-
-        self._directory_load_cancel_requested = True
-        self._directory_load_cancelled_by_user = True
-
-        if self._loader_worker is not None:
-            self._loader_worker.cancel()
-
-        # Aborted loads should not auto-resume on next app start.
-        self._cfg["last_open_directory"] = ""
-        self._cfg.pop("last_selected_image", None)
-        _config.save(self._cfg)
-
-        self._clear_loaded_directory_data(reset_root=True)
-        self.statusBar().showMessage("Stopping folder load and discarding partial results...")
-        self.stop_loading_button.setEnabled(False)
-
-    def _apply_tag_list_height(self) -> None:
-        if self._right_splitter_initialized:
-            return
-
-        total_height = max(420, self.right_panel.height() if self.right_panel.height() > 0 else self.height())
-        top_height = max(180, int(total_height * 0.6))
-        bottom_height = max(180, total_height - top_height)
-        self.right_splitter.setSizes([top_height, bottom_height])
-        self._right_splitter_initialized = True
-
-    def _on_item_loaded(self, payload: object) -> None:
-        if self._directory_load_cancel_requested:
-            return
-
-        # payload is a list[dict] batch emitted per chunk from FolderLoadWorker.
-        items = payload if isinstance(payload, list) else []
-        if not items:
-            return
-
-        # Parse the filter expression once per batch instead of once per item.
-        expression = self.filter_input.text().strip()
-        batch_parsed: _FilterNode | None = None
-        batch_runtime: _FilterRuntime | None = None
-        if expression:
-            try:
-                batch_parsed = _parse_filter_expression(expression)
-                if batch_parsed is not None:
-                    batch_runtime = self._build_filter_runtime()
-            except FilterSyntaxError:
-                pass
-
-        self.list_widget.setUpdatesEnabled(False)
-        try:
-            for data in items:
-                if self._directory_load_cancel_requested:
-                    break
-
-                if not isinstance(data, dict):
-                    continue
-                image_path_str = str(data.get("image_path", "")).strip()
-                text_path_str = str(data.get("text_path", "")).strip()
-                text = str(data.get("text", ""))
-                thumb_payload = data.get("thumbnail")
-                thumb_image: QImage | None = None
-                if isinstance(thumb_payload, dict):
-                    try:
-                        b = thumb_payload.get("bytes")
-                        width = int(thumb_payload.get("width", 0))
-                        height = int(thumb_payload.get("height", 0))
-                        bytes_per_line = int(thumb_payload.get("bytes_per_line", width * 4))
-                        has_alpha = bool(thumb_payload.get("has_alpha", True))
-                        if b is not None and width > 0 and height > 0 and bytes_per_line > 0:
-                            fmt = QImage.Format.Format_RGBA8888 if has_alpha else QImage.Format.Format_RGB888
-                            qimage = QImage(
-                                b,
-                                width,
-                                height,
-                                bytes_per_line,
-                                fmt,
-                            )
-                            # Detach from the underlying bytes buffer to avoid lifetime issues.
-                            thumb_image = qimage.copy()
-                    except Exception:
-                        thumb_image = None
-
-                if not image_path_str or not text_path_str:
-                    continue
-
-                image_path = Path(image_path_str)
-                text_path = Path(text_path_str)
-
-                # active_badges and has_pending_fixup were computed in the worker thread
-                # alongside the thumbnail; no main-thread sidecar I/O needed here.
-                active_badges_raw = data.get("active_badges")
-                active_badges: frozenset[str] | None = (
-                    active_badges_raw
-                    if isinstance(active_badges_raw, frozenset)
-                    else None
-                )
-                has_pending_fixup_raw = data.get("has_pending_fixup")
-
-                record = ImageRecord(image_path=image_path, text_path=text_path, text=text)
-                # Pre-populate the lazy sidecar cache on the record so the first
-                # access to record.has_pending_fixup never hits the filesystem.
-                if isinstance(has_pending_fixup_raw, bool):
-                    record._sidecar_has_pending_fixup = has_pending_fixup_raw
-                self.records.append(record)
-
-                # Compute visibility with the pre-parsed filter (avoids O(n) re-parses).
-                if batch_parsed is not None and batch_runtime is not None:
-                    is_visible: bool | None = batch_parsed.evaluate(record, batch_runtime)
-                elif expression:
-                    is_visible = True  # parse failed → show everything
-                else:
-                    is_visible = True
-                self._add_list_item(record, thumb_image, active_badges=active_badges, is_visible=is_visible)
-
-                # Accumulate tag counts incrementally so _on_load_finished can skip
-                # the full O(n) rebuild over all records.
-                parsed_tags = parse_tags_text(text)
-                self.tag_counts.update(parsed_tags)
-                self.known_tags.update(parsed_tags)
-        finally:
-            self.list_widget.setUpdatesEnabled(True)
-
-    def _on_load_progress(self, processed: int, total: int, percent: int) -> None:
-        if self._directory_load_cancel_requested:
-            return
-
-        self.statusBar().showMessage(
-            f"Processed {processed} images of {total}, {percent}% done"
-        )
-
-    def _on_icc_warning_detected(self, image_path: str) -> None:
-        normalized = image_path.strip()
-        if not normalized:
-            return
-        if normalized not in self._icc_warning_paths:
-            self._icc_warning_paths.append(normalized)
-        self.statusBar().showMessage(f"Warning: invalid ICC profile in {Path(normalized).name}")
-
-    def _on_load_finished(self, total: int, folder: str) -> None:
-        self._directory_loading_active = False
-        self._set_loading_state(False)
-        if self._directory_load_cancel_requested:
-            self._pending_selection_path = None
-            self._icc_warning_paths = []
-            self.statusBar().showMessage("Folder loading stopped")
-            return
-
-        # Persist startup folder only for completed (non-aborted) loads.
-        self._cfg["last_open_directory"] = folder
-        _config.save(self._cfg)
-
-        # Tag counts were built incrementally in _on_item_loaded; just refresh
-        # the sorted completion list and known-tags UI without re-iterating records.
-        self._refresh_tag_completions()
-        self._apply_tag_list_height()
-        self._restore_selection_after_load()
-        if self.records:
-            self.statusBar().showMessage(f"Loaded {len(self.records)} images from {folder}")
-            if self._icc_warning_paths:
-                affected = len(self._icc_warning_paths)
-                preview_lines = [Path(path).name for path in self._icc_warning_paths[:10]]
-                details = "\n".join(preview_lines)
-                if affected > 10:
-                    details += f"\n... and {affected - 10} more"
-                QMessageBox.warning(
-                    self,
-                    "Invalid ICC profiles detected",
-                    "Some images contain invalid ICC profiles.\n"
-                    "These images may trigger stderr warnings and should be fixed before downstream use.\n\n"
-                    f"Affected images ({affected}):\n{details}",
-                )
-        else:
-            self.statusBar().showMessage("No supported images found in selected folder")
-        self._icc_warning_paths = []
-
-    def _on_load_failed(self, message: str) -> None:
-        self._directory_loading_active = False
-        self._set_loading_state(False)
-        self._pending_selection_path = None
-        self._icc_warning_paths = []
-        QMessageBox.critical(self, "Folder load failed", message)
-        self.statusBar().showMessage("Folder load failed")
-
-    def _cleanup_loader(self) -> None:
-        was_active = self._directory_loading_active
-        if self._loader_worker is not None:
-            self._loader_worker.deleteLater()
-        if self._loader_thread is not None:
-            self._loader_thread.deleteLater()
-        self._loader_worker = None
-        self._loader_thread = None
-
-        if was_active:
-            self._directory_loading_active = False
-            self._set_loading_state(False)
-            if self._directory_load_cancelled_by_user:
-                self.statusBar().showMessage("Folder loading stopped")
-
-    def _restore_selection_after_load(self) -> None:
-        if not self.records:
-            self._pending_selection_path = None
-            return
-
-        target_path = self._pending_selection_path
-        self._pending_selection_path = None
-        if target_path is not None:
-            for index, record in enumerate(self.records):
-                if record.image_path == target_path:
-                    item = self.list_widget.item(index)
-                    if item is not None and not item.isHidden():
-                        self.list_widget.setCurrentRow(index)
-                        return
-
-        first_visible = self._first_visible_row()
-        if first_visible >= 0:
-            self.list_widget.setCurrentRow(first_visible)
 
     @staticmethod
     def _load_normalized_pixmap(image_path: Path) -> QPixmap:
@@ -2926,46 +2079,22 @@ class MainWindow(QMainWindow):
         record = self.records[index]
         self._set_watched_image(record.image_path)
 
-        self._show_image(record.image_path)
+        if not self._fixup_navigating:
+            self._show_image(record.image_path)
 
         tags = self._parse_annotations_for_tag_list(record.text)
         self._populate_tag_list(tags)
         self.tag_input.clear()
-        self._load_vision_for_current_image()
+        if not self._fixup_navigating:
+            self._load_vision_for_current_image()
         self._update_fixup_button_state()
         self.statusBar().showMessage(f"{self._filtered_total_status_text(selected_row=index)} {record.image_path}")
 
     def _show_image(self, image_path: Path) -> None:
-        # Re-use the cached pixmap when the same image is requested (e.g. during
-        # a window resize) to avoid a disk read on every resize event.
-        if self._cached_pixmap_path != image_path or self._cached_pixmap is None:
-            pixmap = self._load_normalized_pixmap(image_path)
-            if pixmap.isNull():
-                self.image_label.setText(f"Unable to load image:\n{image_path.name}")
-                self.image_label.setPixmap(QPixmap())
-                self._cached_pixmap = None
-                self._cached_pixmap_path = None
-                return
-            self._cached_pixmap = pixmap
-            self._cached_pixmap_path = image_path
-        else:
-            pixmap = self._cached_pixmap
-
-        target_size = self.image_label.size()
-        if target_size.width() < 50 or target_size.height() < 50:
-            return
-
-        scaled = pixmap.scaled(
-            target_size,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.image_label.setPixmap(scaled)
+        self.image_view_controller._show_image(image_path)
 
     def _on_resize_timer(self) -> None:
-        """Called after the resize debounce delay to re-scale the current image."""
-        if 0 <= self.current_index < len(self.records):
-            self._show_image(self.records[self.current_index].image_path)
+        self.image_view_controller._on_resize_timer()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -3037,14 +2166,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _populate_tag_list(self, tags: list[str]) -> None:
-        self._updating_tag_list = True
-        self.tag_list.clear()
-        for tag in tags:
-            item = QListWidgetItem(tag)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-            self.tag_list.addItem(item)
-        self._update_tag_item_heights()
-        self._updating_tag_list = False
+        self.tag_controller._populate_tag_list(tags)
 
     def _parse_tags(self, text: str) -> list[str]:
         return parse_tags_text(text)
@@ -3125,192 +2247,42 @@ class MainWindow(QMainWindow):
         self._write_record_text(record, status_prefix=status_prefix)
 
     def _rebuild_known_tags_from_records(self) -> None:
-        counts: Counter[str] = Counter()
-        for record in self.records:
-            counts.update(self._parse_tags(record.text))
-        self.tag_counts = counts
-        self.known_tags = set(counts)
+        self.tag_controller._rebuild_known_tags_from_records()
+
+    def _update_tag_counts_incremental(self, old_tags: list[str], new_tags: list[str]) -> None:
+        self.tag_controller._update_tag_counts_incremental(old_tags, new_tags)
 
     def _sorted_tag_suggestions(self) -> list[str]:
-        return sorted(
-            self.known_tags,
-            key=lambda tag: (-self.tag_counts.get(tag, 0), tag.lower(), tag),
-        )
+        return self.tag_controller._sorted_tag_suggestions()
 
     def _refresh_tag_completions(self) -> None:
-        suggestions = self._sorted_tag_suggestions()
-        self.tag_suggestions_model.setStringList(suggestions)
-        self._refresh_known_tags_list()
+        self.tag_controller._refresh_tag_completions()
 
     def _refresh_known_tags_list(self) -> None:
-        if not hasattr(self, "known_tags_list"):
+        if not hasattr(self, "tag_controller"):
             return
-
-        filter_text = ""
-        if hasattr(self, "known_tags_filter"):
-            filter_text = self.known_tags_filter.text().strip().casefold()
-
-        self.known_tags_list.setUpdatesEnabled(False)
-        try:
-            self.known_tags_list.clear()
-            for tag in self._sorted_tag_suggestions():
-                if filter_text and filter_text not in tag.casefold():
-                    continue
-                count = self.tag_counts.get(tag, 0)
-                item = QListWidgetItem(f"{tag} ({count})")
-                item.setData(Qt.ItemDataRole.UserRole, tag)
-                self.known_tags_list.addItem(item)
-        finally:
-            self.known_tags_list.setUpdatesEnabled(True)
+        self.tag_controller._refresh_known_tags_list()
 
     def _delete_global_tag(self, tags_to_delete: list[str]) -> None:
-        tags_set = set(tags_to_delete)
-        affected = [r for r in self.records if tags_set & set(self._parse_tags(r.text))]
-        if not affected:
-            return
-        tag_count = len(tags_set)
-        tag_label = f'"{next(iter(tags_set))}"' if tag_count == 1 else f"{tag_count} tags"
-        confirm = QMessageBox(self)
-        confirm.setWindowTitle("Remove tags from all images")
-        confirm.setText(f'Remove {tag_label} from {len(affected)} image(s)?')
-        confirm.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        confirm.setDefaultButton(QMessageBox.StandardButton.No)
-        confirm.raise_()
-        confirm.activateWindow()
-        if confirm.exec() != QMessageBox.StandardButton.Yes:
-            return
-
-        # Compute new text for every affected record on the main thread (fast, no I/O).
-        jobs: list[tuple] = []
-        for record in affected:
-            new_tags = [t for t in self._parse_tags(record.text) if t not in tags_set]
-            new_text = self._serialize_tags(new_tags)
-            record.text = new_text
-            jobs.append((record.text_path, new_text))
-
-        # Refresh UI immediately so the user sees the change right away.
-        self._rebuild_known_tags_from_records()
-        self._refresh_tag_completions()
-        if self.current_index >= 0 and self.current_index < len(self.records):
-            record = self.records[self.current_index]
-            if record in affected:
-                self._populate_tag_list(self._parse_tags(record.text))
-
-        total = len(jobs)
-        self.statusBar().showMessage(f'Removing {tag_label} — writing 0 / {total}…')
-
-        worker = TagPurgeWorker(jobs)
-        thread = QThread(self)
-        worker.moveToThread(thread)
-
-        def on_progress(done: int, total: int) -> None:
-            self.statusBar().showMessage(f'Removing {tag_label} — writing {done} / {total}…')
-
-        def on_finished() -> None:
-            self.statusBar().showMessage(f'Removed {tag_label} from {total} file(s).')
-            thread.quit()
-
-        def on_failed(msg: str) -> None:
-            QMessageBox.critical(self, "Save failed", f"Could not write some files:\n{msg}")
-            thread.quit()
-
-        worker.progress.connect(on_progress)
-        worker.finished.connect(on_finished)
-        worker.failed.connect(on_failed)
-        thread.started.connect(worker.run)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-
-        # Keep references so Python doesn't GC the thread/worker before they finish.
-        self._purge_thread = thread
-        self._purge_worker = worker
-
-        thread.start()
+        self.tag_controller._delete_global_tag(tags_to_delete)
 
     def _add_tag_from_input(self) -> None:
-        if self.current_index < 0 or self.current_index >= len(self.records):
-            return
-
-        new_tag = sanitize_tag_text(self.tag_input.text())
-        if not new_tag:
-            return
-
-        existing_keys = {
-            sanitize_tag_text(existing_tag)
-            for existing_tag in self._current_tags()
-            if sanitize_tag_text(existing_tag)
-        }
-        if new_tag in existing_keys:
-            self.statusBar().showMessage(f"Tag already exists: {new_tag}")
-            self.tag_input.selectAll()
-            return
-
-        item = QListWidgetItem(new_tag)
-        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-        self.tag_list.addItem(item)
-        self.tag_input.clear()
-        QTimer.singleShot(0, self.tag_input.clear)
-        self._update_tag_item_heights()
-        self._sync_record_from_tag_list()
+        self.tag_controller._add_tag_from_input()
 
     def _on_tag_item_changed(self, item: QListWidgetItem) -> None:
-        if self._updating_tag_list:
-            return
-
-        new_text = item.text().strip()
-        row = self.tag_list.row(item)
-
-        if not new_text:
-            removed = self.tag_list.takeItem(row)
-            del removed
-            self._update_tag_item_heights()
-            self._sync_record_from_tag_list()
-            return
-
-        self._updating_tag_list = True
-        item.setText(new_text)
-        self._updating_tag_list = False
-        self._update_tag_item_heights()
-        self._sync_record_from_tag_list()
+        self.tag_controller._on_tag_item_changed(item)
 
     def _remove_selected_tags(self) -> None:
-        if self.current_index < 0 or self.current_index >= len(self.records):
-            return
-
-        selected = self.tag_list.selectedItems()
-        if not selected:
-            return
-
-        first_row = min(self.tag_list.row(item) for item in selected)
-
-        for item in selected:
-            row = self.tag_list.row(item)
-            removed = self.tag_list.takeItem(row)
-            del removed
-
-        self._update_tag_item_heights()
-        self._sync_record_from_tag_list()
-
-        count = self.tag_list.count()
-        if count > 0:
-            next_row = min(first_row, count - 1)
-            self.tag_list.setCurrentRow(next_row)
+        self.tag_controller._remove_selected_tags()
 
     def _on_tags_reordered(self) -> None:
-        self._update_tag_item_heights()
-        self._sync_record_from_tag_list()
+        self.tag_controller._on_tags_reordered()
+
+    def _bump_selected_tag(self) -> None:
+        self.tag_controller._bump_selected_tag()
 
     def _update_tag_item_heights(self) -> None:
-        viewport_width = max(60, self.tag_list.viewport().width() - 10)
-        fm = self.tag_list.fontMetrics()
-        for i in range(self.tag_list.count()):
-            item = self.tag_list.item(i)
-            text_rect = fm.boundingRect(
-                QRect(0, 0, viewport_width, 10000),
-                int(Qt.TextFlag.TextWordWrap),
-                item.text(),
-            )
-            item.setSizeHint(QSize(viewport_width, max(24, text_rect.height() + 8)))
+        self.tag_controller._update_tag_item_heights()
 
     def _update_list_item_preview(self, index: int) -> None:
         item = self.list_widget.item(index)
@@ -3349,12 +2321,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _llm_threads_status_suffix(self) -> str:
-        if self._llm_action_name is None:
-            return ""
-        current = max(1, int(self._llm_threads_current))
-        if self._llm_threads_auto_mode:
-            return f" | threads: {current} auto"
-        return f" | threads: {current}"
+        return self.llm_controller._llm_threads_status_suffix()
 
     def _run_parallel_llm_jobs(
         self,
@@ -3366,6 +2333,15 @@ class MainWindow(QMainWindow):
         report_item: Callable[[object], None],
         process_one: Callable[[int, object], dict],
     ) -> None:
+        self.llm_controller._run_parallel_llm_jobs(
+            jobs=jobs,
+            requested_threads=requested_threads,
+            action_prefix=action_prefix,
+            cancel_token=cancel_token,
+            report_progress=report_progress,
+            report_item=report_item,
+            process_one=process_one,
+        )
         total = len(jobs)
         if total <= 0:
             return
@@ -3513,597 +2489,13 @@ class MainWindow(QMainWindow):
             executor.shutdown(wait=True, cancel_futures=True)
 
     def generate_with_llm(self) -> None:
-        if self._llm_thread is not None and self._llm_action_name == "Generate":
-            self._request_stop_generation()
-            return
-
-        try:
-            self._apply_query_downscale_setting()
-        except LlmProviderError:
-            return
-
-        try:
-            thread_count = self._llm_thread_count()
-        except LlmProviderError:
-            return
-
-        selected_indexes = self._selected_record_indexes()
-        if not selected_indexes:
-            QMessageBox.information(self, "No image selected", "Select an image before generating annotations.")
-            return
-        include_tags = self.generate_tags_checkbox.isChecked()
-        include_description = self.generate_description_checkbox.isChecked()
-        include_vision = self.generate_vision_checkbox.isChecked()
-        include_refine = self.generate_refine_checkbox.isChecked()
-        if not include_tags and not include_description and not include_vision and not include_refine:
-            QMessageBox.information(self, "Nothing selected", "Enable Tags, Description, Vision, or Refine before generating.")
-            return
-
-        cancel_token = LlmRequestCancellation()
-        session = self._active_provider_session()
-        if session is None:
-            QMessageBox.warning(self, "No model selected", f"Choose a {self._llm_provider.display_name} model first.")
-            return
-
-        def generate_task(
-            report_progress: Callable[[str], None],
-            report_item: Callable[[object], None],
-        ) -> object:
-            timeout = self._llm_timeout_seconds()
-            retry_count = self._llm_retry_count()
-            total = len(selected_indexes)
-            vision_enabled = include_vision
-            refine_enabled = include_refine
-            agent_roles = self._cfg.get("agent_roles") or {}
-            description_role = agent_roles.get("description") or None
-            tagging_role = agent_roles.get("tagging") or None
-
-            def process_one(position: int, record_index: int) -> dict:
-                record = self.records[record_index]
-                image_name = self._display_image_path(record.image_path)
-
-                # Existing short tags guide LLM generation when the user pre-seeds 1-2 tags.
-                existing_parts = self._split_record_annotations(record.text)
-                existing_tags_hint = [
-                    part for part in existing_parts
-                    if not self._is_description_like_annotation(part)
-                ] or None
-                description_query = prepare_description_query(existing_tags=existing_tags_hint, agent_role=description_role) if include_description else None
-                tags_query = prepare_tagging_query(existing_tags=existing_tags_hint, agent_role=tagging_role) if include_tags else None
-                generated_description = ""
-                generated_tags: list[str] = []
-                vision_reasoning = ""
-                vision_description = ""
-                refine_tags: list[str] = []
-                refine_caption = ""
-                image_retried = False
-                image_perf_retry = False
-                image_timed_out = False
-                image_started_at = time.monotonic()
-
-                for attempt in range(retry_count + 1):
-                    cancel_token.raise_if_cancelled()
-                    if attempt > 0:
-                        image_retried = True
-
-                    attempt_start = time.monotonic()
-
-                    if attempt == 0:
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_start image={image_name}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_retry image={image_name} retry={attempt}/{retry_count}",
-                            flush=True,
-                        )
-
-                    def remaining_timeout(_start=attempt_start) -> float:
-                        elapsed = time.monotonic() - _start
-                        remaining = timeout - elapsed
-                        if remaining <= 0:
-                            raise LlmProviderError(
-                                f"Timed out after {int(timeout)} seconds while generating annotations for {record.image_path.name}."
-                            )
-                        return remaining
-
-                    attempt_description = ""
-                    attempt_tags: list[str] = []
-                    attempt_vision_reasoning = ""
-                    attempt_vision_description = ""
-                    attempt_refine_tags: list[str] = []
-                    attempt_refine_caption = ""
-                    retry_needed = False
-                    try:
-                        if description_query is not None:
-                            description = sanitize_description_text(
-                                session.generate(
-                                    record.image_path,
-                                    description_query.prompt,
-                                    timeout=remaining_timeout(),
-                                    cancellation=cancel_token,
-                                ).strip()
-                            )
-                            if description:
-                                attempt_description = description
-
-                        if tags_query is not None:
-                            attempt_tags.extend(
-                                [
-                                    tag.lower()
-                                    for tag in self._parse_tags(
-                                        session.generate(
-                                            record.image_path,
-                                            tags_query.prompt,
-                                            timeout=remaining_timeout(),
-                                            cancellation=cancel_token,
-                                        )
-                                    )
-                                ]
-                            )
-
-                        if vision_enabled:
-                            # Vision prompt consumes the outputs of description + tags.
-                            tags_input_lines: list[str] = []
-                            if attempt_description:
-                                tags_input_lines.append(attempt_description)
-                            if attempt_tags:
-                                tags_input_lines.extend(attempt_tags)
-                            if not tags_input_lines:
-                                # Vision-only generation should still treat existing annotations as ground truth.
-                                tags_input_lines = self._parse_annotations_for_tag_list(record.text)
-                            tags_input = "\n".join(tags_input_lines).strip()
-                            vision_query = prepare_vision_query(tags_text=tags_input, user_hint=None)
-                            vision_raw = session.generate(
-                                record.image_path,
-                                vision_query.prompt,
-                                timeout=remaining_timeout(),
-                                cancellation=cancel_token,
-                            )
-                            attempt_vision_reasoning, attempt_vision_description = parse_vision_response(vision_raw)
-
-                            if attempt_vision_reasoning or attempt_vision_description:
-                                # Persist immediately so multi-image batch can be applied without UI focus.
-                                try:
-                                    vision_data = read_sidecar_data(record.image_path)
-                                    vision_data.description = attempt_vision_description
-                                    vision_data.reasoning = attempt_vision_reasoning
-                                    write_sidecar_data(record.image_path, vision_data)
-                                except OSError as exc:
-                                    raise LlmProviderError(f"Could not write {record.image_path.with_suffix('.json').name}: {exc}") from exc
-
-                        if refine_enabled:
-                            # Refine reads the sidecar .json written by Vision (or a pre-existing one).
-                            sidecar = read_sidecar_data(record.image_path)
-                            if sidecar.description or sidecar.reasoning:
-                                refine_query = prepare_refine_query(
-                                    description=sidecar.description,
-                                    reasoning=sidecar.reasoning,
-                                )
-                                refine_raw = session.generate(
-                                    record.image_path,
-                                    refine_query.prompt,
-                                    timeout=remaining_timeout(),
-                                    cancellation=cancel_token,
-                                )
-                                attempt_refine_tags, attempt_refine_caption = parse_refine_response(refine_raw)
-
-                        if not attempt_description and not attempt_tags and not (attempt_vision_reasoning or attempt_vision_description) and not attempt_refine_tags and not attempt_refine_caption:
-                            retry_needed = True
-                    except LlmProviderCancelled:
-                        raise
-                    except LlmProviderError as exc:
-                        if "Timed out" in str(exc):
-                            image_timed_out = True
-                        if not getattr(exc, "no_backoff", False):
-                            image_perf_retry = True
-                        retry_needed = True
-
-                    elapsed_seconds = time.monotonic() - attempt_start
-                    if not retry_needed:
-                        generated_description = attempt_description
-                        generated_tags = attempt_tags
-                        vision_reasoning = attempt_vision_reasoning
-                        vision_description = attempt_vision_description
-                        refine_tags = attempt_refine_tags
-                        refine_caption = attempt_refine_caption
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_done image={image_name} elapsed_s={elapsed_seconds:.2f}",
-                            flush=True,
-                        )
-                        break
-
-                    print(
-                        f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] generation_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
-                        flush=True,
-                    )
-
-                return {
-                    "kind": "generate_item",
-                    "index": record_index,
-                    "description": generated_description,
-                    "tags": generated_tags,
-                    "vision_description": vision_description,
-                    "vision_reasoning": vision_reasoning,
-                    "refine_tags": refine_tags,
-                    "refine_caption": refine_caption,
-                    "retried": image_retried,
-                    "perf_retry": image_perf_retry,
-                    "timed_out": image_timed_out,
-                    "elapsed_s": max(0.0, time.monotonic() - image_started_at),
-                    "position": position,
-                    "total": total,
-                    "image_name": image_name,
-                }
-
-            self._run_parallel_llm_jobs(
-                jobs=[int(index) for index in selected_indexes],
-                requested_threads=thread_count,
-                action_prefix="Generate",
-                cancel_token=cancel_token,
-                report_progress=report_progress,
-                report_item=report_item,
-                process_one=lambda position, job: process_one(position, int(job)),
-            )
-
-            report_progress(f"Generate: finalizing {total}/{total}")
-            return {"batch": True, "streamed": True, "total": total}
-
-        self._generate_batch_total = len(selected_indexes)
-        self._generate_batch_processed = 0
-        self._generate_batch_updated = 0
-        self._generate_batch_vision_updated = 0
-        self._generate_batch_refine_updated = 0
-        self._generate_batch_new_annotations = 0
-        self._generate_batch_started_at = time.monotonic()
-        self._generate_batch_retry_images = 0
-
-        self._start_llm_task(
-            task=generate_task,
-            action_name="Generate",
-            empty_message="Ollama returned no annotations.",
-            cancel_token=cancel_token,
-            merge_with_existing=True,
-        )
+        self.llm_controller.generate_with_llm()
 
     def validate_tags_with_llm(self) -> None:
-        if self._llm_thread is not None and self._llm_action_name == "Validate":
-            self._request_stop_validation()
-            return
-
-        try:
-            self._apply_query_downscale_setting()
-        except LlmProviderError:
-            return
-
-        try:
-            thread_count = self._llm_thread_count()
-        except LlmProviderError:
-            return
-
-        selected_indexes = self._selected_record_indexes()
-        if not selected_indexes:
-            QMessageBox.information(self, "No image selected", "Select an image before validating tags.")
-            return
-
-        annotated_records: list[tuple[int, str]] = []
-        skipped_without_annotations = 0
-        for record_index in selected_indexes:
-            if record_index < 0 or record_index >= len(self.records):
-                continue
-            annotations = self.records[record_index].text
-            if not annotations.strip():
-                skipped_without_annotations += 1
-                continue
-            annotated_records.append((record_index, annotations))
-
-        if not annotated_records:
-            QMessageBox.information(self, "No annotations to validate", "Add tags or a description before validating.")
-            return
-
-        cancel_token = LlmRequestCancellation()
-        session = self._active_provider_session()
-        if session is None:
-            QMessageBox.warning(self, "No model selected", f"Choose a {self._llm_provider.display_name} model first.")
-            return
-
-        def validate_task(
-            report_progress: Callable[[str], None],
-            report_item: Callable[[object], None],
-        ) -> object:
-            timeout = self._llm_timeout_seconds()
-            retry_count = self._llm_retry_count()
-            total = len(annotated_records)
-
-            def process_one(position: int, record_index: int, annotations: str) -> dict:
-                record = self.records[record_index]
-                image_name = self._display_image_path(record.image_path)
-                image_retried = False
-                image_perf_retry = False
-                validation_result = ""
-                image_timed_out = False
-                image_started_at = time.monotonic()
-
-                for attempt in range(retry_count + 1):
-                    cancel_token.raise_if_cancelled()
-                    if attempt > 0:
-                        image_retried = True
-
-                    attempt_start = time.monotonic()
-
-                    if attempt == 0:
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_start image={image_name}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_retry image={image_name} retry={attempt}/{retry_count}",
-                            flush=True,
-                        )
-
-                    def remaining_timeout(_start=attempt_start) -> float:
-                        elapsed = time.monotonic() - _start
-                        remaining = timeout - elapsed
-                        if remaining <= 0:
-                            raise LlmProviderError(
-                                f"Timed out after {int(timeout)} seconds while validating annotations for {record.image_path.name}."
-                            )
-                        return remaining
-
-                    try:
-                        validation_result = session.generate(
-                            record.image_path,
-                            prepare_validation_query(annotations).prompt,
-                            timeout=remaining_timeout(),
-                            cancellation=cancel_token,
-                        )
-
-                        # Detect format hallucination and trigger retry
-                        if validation_result.strip().upper() != "OK":
-                            from imagetagger.utils.fixup_parser import has_fixup_section_headers
-                            if not has_fixup_section_headers(validation_result):
-                                raise LlmProviderError("Model hallucinated output format (missing headers).")
-                    except LlmProviderCancelled:
-                        raise
-                    except LlmProviderError as exc:
-                        if "Timed out" in str(exc):
-                            image_timed_out = True
-                        if not getattr(exc, "no_backoff", False):
-                            image_perf_retry = True
-                        elapsed_seconds = time.monotonic() - attempt_start
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
-                            flush=True,
-                        )
-                        if attempt >= retry_count:
-                            # Return a per-image error instead of raising so one
-                            # failing image does not abort the entire batch.
-                            return {
-                                "kind": "validate_item_error",
-                                "index": record_index,
-                                "error": str(exc),
-                                "timed_out": image_timed_out,
-                                "context_exhausted": getattr(exc, "context_exhausted", False),
-                                "position": position,
-                                "total": total,
-                                "image_name": image_name,
-                            }
-                        continue
-
-                    elapsed_seconds = time.monotonic() - attempt_start
-                    print(
-                        f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_done image={image_name} elapsed_s={elapsed_seconds:.2f}",
-                        flush=True,
-                    )
-                    break
-
-                return {
-                    "kind": "validate_item",
-                    "index": record_index,
-                    "result": validation_result,
-                    "retried": image_retried,
-                    "perf_retry": image_perf_retry,
-                    "timed_out": image_timed_out,
-                    "elapsed_s": max(0.0, time.monotonic() - image_started_at),
-                    "position": position,
-                    "total": total,
-                    "image_name": image_name,
-                }
-
-            self._run_parallel_llm_jobs(
-                jobs=[(int(record_index), str(annotations)) for record_index, annotations in annotated_records],
-                requested_threads=thread_count,
-                action_prefix="Validate",
-                cancel_token=cancel_token,
-                report_progress=report_progress,
-                report_item=report_item,
-                process_one=lambda position, job: process_one(position, int(job[0]), str(job[1])),
-            )
-
-            report_progress(f"Validate: finalizing {total}/{total}")
-            return {
-                "batch": True,
-                "streamed": True,
-                "mode": "validate",
-                "total": total,
-                "skipped": skipped_without_annotations,
-            }
-
-        self._validate_batch_total = len(annotated_records)
-        self._validate_batch_processed = 0
-        self._validate_batch_clean = 0
-        self._validate_batch_issues = 0
-        self._validate_batch_skipped = skipped_without_annotations
-        self._validate_batch_started_at = time.monotonic()
-        self._validate_batch_retry_images = 0
-        self._validate_batch_llm_disobeyed = 0
-        self._validate_batch_errors = 0
-        self._validate_batch_context_exhausted = 0
-        self._validate_pending_indices = {idx for idx, _ in annotated_records}
-
-        self._start_llm_task(
-            task=validate_task,
-            action_name="Validate",
-            empty_message="Ollama returned no validation result.",
-            cancel_token=cancel_token,
-            validation_report=True,
-        )
+        self.llm_controller.validate_tags_with_llm()
 
     def ai_find_with_llm(self) -> None:
-        if self._llm_thread is not None and self._llm_action_name == "AI Find":
-            self._request_stop_ai_find()
-            return
-
-        try:
-            self._apply_query_downscale_setting()
-        except LlmProviderError:
-            return
-
-        try:
-            thread_count = self._llm_thread_count()
-        except LlmProviderError:
-            return
-
-        query = " ".join(self.ai_find_input.text().split())
-        if not query:
-            QMessageBox.information(self, "Missing search text", "Enter text to search for before running AI Find.")
-            return
-
-        selected_indexes = self._selected_record_indexes()
-        if not selected_indexes:
-            QMessageBox.information(self, "No image selected", "Select one or more images before running AI Find.")
-            return
-
-        cancel_token = LlmRequestCancellation()
-        session = self._active_provider_session()
-        if session is None:
-            QMessageBox.warning(self, "No model selected", f"Choose a {self._llm_provider.display_name} model first.")
-            return
-        search_query = prepare_search_query(query)
-
-        def find_task(
-            report_progress: Callable[[str], None],
-            report_item: Callable[[object], None],
-        ) -> object:
-            timeout = self._llm_timeout_seconds()
-            retry_count = self._llm_retry_count()
-            total = len(selected_indexes)
-
-            def process_one(position: int, record_index: int) -> dict:
-                record = self.records[record_index]
-                image_name = record.image_path.name
-                image_retried = False
-                image_perf_retry = False
-                matched = False
-                image_timed_out = False
-                image_started_at = time.monotonic()
-
-                for attempt in range(retry_count + 1):
-                    cancel_token.raise_if_cancelled()
-                    if attempt > 0:
-                        image_retried = True
-
-                    attempt_start = time.monotonic()
-                    if attempt == 0:
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_start image={image_name} query={query}",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_retry image={image_name} retry={attempt}/{retry_count}",
-                            flush=True,
-                        )
-
-                    def remaining_timeout(_start=attempt_start) -> float:
-                        elapsed = time.monotonic() - _start
-                        remaining = timeout - elapsed
-                        if remaining <= 0:
-                            raise LlmProviderError(
-                                f"Timed out after {int(timeout)} seconds while searching {record.image_path.name}."
-                            )
-                        return remaining
-
-                    try:
-                        matched = parse_yes_no_response(
-                            session.generate(
-                                record.image_path,
-                                search_query.prompt,
-                                timeout=remaining_timeout(),
-                                cancellation=cancel_token,
-                            ),
-                            context="AI Find",
-                        )
-                    except LlmProviderCancelled:
-                        raise
-                    except LlmProviderError as exc:
-                        if "Timed out" in str(exc):
-                            image_timed_out = True
-                        if not getattr(exc, "no_backoff", False):
-                            image_perf_retry = True
-                        elapsed_seconds = time.monotonic() - attempt_start
-                        print(
-                            f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_failed image={image_name} attempt={attempt + 1}/{retry_count + 1} elapsed_s={elapsed_seconds:.2f}",
-                            flush=True,
-                        )
-                        if attempt >= retry_count:
-                            raise
-                        continue
-
-                    elapsed_seconds = time.monotonic() - attempt_start
-                    print(
-                        f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_done image={image_name} matched={matched} elapsed_s={elapsed_seconds:.2f}",
-                        flush=True,
-                    )
-                    break
-
-                return {
-                    "kind": "ai_find_item",
-                    "index": record_index,
-                    "matched": matched,
-                    "retried": image_retried,
-                    "perf_retry": image_perf_retry,
-                    "timed_out": image_timed_out,
-                    "elapsed_s": max(0.0, time.monotonic() - image_started_at),
-                    "position": position,
-                    "total": total,
-                    "query": query,
-                    "image_name": image_name,
-                }
-
-            self._run_parallel_llm_jobs(
-                jobs=[int(index) for index in selected_indexes],
-                requested_threads=thread_count,
-                action_prefix="AI Find",
-                cancel_token=cancel_token,
-                report_progress=report_progress,
-                report_item=report_item,
-                process_one=lambda position, job: process_one(position, int(job)),
-            )
-
-            report_progress(f"AI Find: finalizing {total}/{total}")
-            return {
-                "batch": True,
-                "streamed": True,
-                "mode": "ai_find",
-                "total": total,
-                "query": query,
-            }
-
-        self._ai_find_batch_total = len(selected_indexes)
-        self._ai_find_batch_processed = 0
-        self._ai_find_batch_matched = 0
-        self._ai_find_batch_started_at = time.monotonic()
-        self._ai_find_batch_retry_images = 0
-
-        self._start_llm_task(
-            task=find_task,
-            action_name="AI Find",
-            empty_message="No matching images were found.",
-            cancel_token=cancel_token,
-        )
+        self.llm_controller.ai_find_with_llm()
 
     def _start_llm_task(
         self,
@@ -4115,6 +2507,15 @@ class MainWindow(QMainWindow):
         merge_with_existing: bool = False,
         validation_report: bool = False,
     ) -> None:
+        self.llm_controller._start_llm_task(
+            task=task,
+            action_name=action_name,
+            empty_message=empty_message,
+            cancel_token=cancel_token,
+            result_as_single=result_as_single,
+            merge_with_existing=merge_with_existing,
+            validation_report=validation_report,
+        )
         if not self.llm_model_name.strip():
             QMessageBox.warning(self, "No model selected", f"Connect to {self._llm_provider.display_name} and choose a model first.")
             return
@@ -4165,36 +2566,16 @@ class MainWindow(QMainWindow):
         self._llm_thread.start()
 
     def _request_stop_generation(self) -> None:
-        if self._llm_action_name != "Generate" or self._llm_cancel is None:
-            return
-        self.generate_button.setEnabled(False)
-        self.generate_button.setText("Stopping generation...")
-        self.statusBar().showMessage("Stopping generation...")
-        self._llm_cancel.cancel()
+        self.llm_controller._request_stop_generation()
 
     def _request_stop_validation(self) -> None:
-        if self._llm_action_name != "Validate" or self._llm_cancel is None:
-            return
-        self.validate_button.setEnabled(False)
-        self.validate_button.setText("Stopping validation...")
-        self.statusBar().showMessage("Stopping validation...")
-        self._llm_cancel.cancel()
+        self.llm_controller._request_stop_validation()
 
     def _request_stop_ai_find(self) -> None:
-        if self._llm_action_name != "AI Find" or self._llm_cancel is None:
-            return
-        self.ai_find_button.setEnabled(False)
-        self.ai_find_button.setText("Stopping AI Find...")
-        self.statusBar().showMessage("Stopping AI Find...")
-        self._llm_cancel.cancel()
+        self.llm_controller._request_stop_ai_find()
 
     def _format_duration(self, seconds: float) -> str:
-        total_seconds = max(0, int(seconds))
-        hours, remainder = divmod(total_seconds, 3600)
-        minutes, secs = divmod(remainder, 60)
-        if hours:
-            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-        return f"{minutes:02d}:{secs:02d}"
+        return self.llm_controller._format_duration(seconds)
 
     def _batch_progress_details(
         self,
@@ -4203,6 +2584,12 @@ class MainWindow(QMainWindow):
         started_at: float | None,
         retry_images: int,
     ) -> str:
+        return self.llm_controller._batch_progress_details(
+            processed=processed,
+            total=total,
+            started_at=started_at,
+            retry_images=retry_images,
+        )
         if started_at is None:
             return f" | elapsed --:-- | est --:-- | retried images {retry_images}"
 
@@ -4222,80 +2609,10 @@ class MainWindow(QMainWindow):
         )
 
     def _on_llm_task_progress(self, message: str) -> None:
-        if self._llm_action_name == "Generate" and (
-            message.startswith("Generate: processing")
-            or message.startswith("Generate: retry")
-            or message.startswith("Generate: finalizing")
-        ):
-            details = self._batch_progress_details(
-                self._generate_batch_processed,
-                self._generate_batch_total,
-                self._generate_batch_started_at,
-                self._generate_batch_retry_images,
-            )
-            self.statusBar().showMessage(f"{message}{details}{self._llm_threads_status_suffix()}")
-            return
-
-        if self._llm_action_name == "Validate" and (
-            message.startswith("Validate: processing")
-            or message.startswith("Validate: retry")
-            or message.startswith("Validate: finalizing")
-        ):
-            details = self._batch_progress_details(
-                self._validate_batch_processed,
-                self._validate_batch_total,
-                self._validate_batch_started_at,
-                self._validate_batch_retry_images,
-            )
-            issues_text = f" | invalid: {self._validate_batch_issues}"
-            errors_text = f" | errors: {self._validate_batch_errors}" if self._validate_batch_errors > 0 else ""
-            disobeyed_text = f" | LLM disobeyed: {self._validate_batch_llm_disobeyed}" if self._validate_batch_llm_disobeyed > 0 else ""
-            self.statusBar().showMessage(f"{message}{details}{issues_text}{errors_text}{disobeyed_text}{self._llm_threads_status_suffix()}")
-            return
-
-        if self._llm_action_name == "AI Find" and (
-            message.startswith("AI Find: processing")
-            or message.startswith("AI Find: retry")
-            or message.startswith("AI Find: finalizing")
-        ):
-            details = self._batch_progress_details(
-                self._ai_find_batch_processed,
-                self._ai_find_batch_total,
-                self._ai_find_batch_started_at,
-                self._ai_find_batch_retry_images,
-            )
-            found_text = f" | found images: {self._ai_find_batch_matched}"
-            self.statusBar().showMessage(f"{message}{details}{found_text}{self._llm_threads_status_suffix()}")
-            return
-
-        self.statusBar().showMessage(f"{message}{self._llm_threads_status_suffix()}")
+        self.llm_controller._on_llm_task_progress(message)
 
     def _on_llm_task_cancelled(self, message: str) -> None:
-        action = self._llm_action_name or "Request"
-        if action == "Validate":
-            total = self._validate_batch_total
-            processed = self._validate_batch_processed
-            if total > 0:
-                self.statusBar().showMessage(
-                    f"Validation stopped after {processed}/{total} image{'s' if total != 1 else ''}."
-                )
-            else:
-                self.statusBar().showMessage(message or "Validation stopped.")
-            return
-
-        if action == "AI Find":
-            total = self._ai_find_batch_total
-            processed = self._ai_find_batch_processed
-            matched = self._ai_find_batch_matched
-            if total > 0:
-                self.statusBar().showMessage(
-                    f"AI Find stopped after {processed}/{total} image{'s' if total != 1 else ''} (found images: {matched})."
-                )
-            else:
-                self.statusBar().showMessage(message or "AI Find stopped.")
-            return
-
-        self.statusBar().showMessage(message or f"{action} stopped.")
+        self.llm_controller._on_llm_task_cancelled(message)
 
     @staticmethod
     def _is_description_like_annotation(text: str) -> bool:
@@ -4405,177 +2722,7 @@ class MainWindow(QMainWindow):
         return (False, 0)
 
     def _on_llm_task_item_ready(self, payload: object) -> None:
-        if not isinstance(payload, dict):
-            return
-        kind = payload.get("kind")
-        if kind == "generate_item":
-            raw_index = payload.get("index")
-            raw_description = payload.get("description")
-            raw_tags = payload.get("tags")
-            raw_vision_description = payload.get("vision_description")
-            raw_vision_reasoning = payload.get("vision_reasoning")
-            raw_retried = payload.get("retried")
-            raw_position = payload.get("position")
-            raw_total = payload.get("total")
-
-            if not isinstance(raw_index, int):
-                return
-            if raw_index < 0 or raw_index >= len(self.records):
-                return
-            description = str(raw_description).strip() if isinstance(raw_description, str) else ""
-            tags = [str(item).strip() for item in raw_tags] if isinstance(raw_tags, list) else []
-            tags = [item for item in tags if item]
-
-            updated, added = self._apply_generated_items_to_record(raw_index, description, tags)
-            self._generate_batch_processed += 1
-            if isinstance(raw_retried, bool) and raw_retried:
-                self._generate_batch_retry_images += 1
-            if updated:
-                self._generate_batch_updated += 1
-                self._generate_batch_new_annotations += added
-                self._rebuild_known_tags_from_records()
-                self._refresh_tag_completions()
-
-            if isinstance(raw_position, int) and isinstance(raw_total, int) and raw_total > 0:
-                details = self._batch_progress_details(
-                    self._generate_batch_processed,
-                    self._generate_batch_total,
-                    self._generate_batch_started_at,
-                    self._generate_batch_retry_images,
-                )
-                self.statusBar().showMessage(
-                    f"Generate: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name}{details}{self._llm_threads_status_suffix()}"
-                )
-            vision_desc = str(raw_vision_description).strip() if isinstance(raw_vision_description, str) else ""
-            vision_reason = str(raw_vision_reasoning).strip() if isinstance(raw_vision_reasoning, str) else ""
-            if vision_desc or vision_reason:
-                self._generate_batch_vision_updated += 1
-                if self.current_index == raw_index:
-                    self._load_vision_for_current_image()
-
-            raw_refine_tags = payload.get("refine_tags")
-            raw_refine_caption = payload.get("refine_caption")
-            refine_tags = [str(t).strip() for t in raw_refine_tags if str(t).strip()] if isinstance(raw_refine_tags, list) else []
-            refine_caption = str(raw_refine_caption).strip() if isinstance(raw_refine_caption, str) else ""
-            if refine_tags or refine_caption:
-                try:
-                    record_refine_result_for_image(
-                        self.records[raw_index].image_path,
-                        refine_tags,
-                        refine_caption,
-                    )
-                except OSError:
-                    pass
-                else:
-                    self._generate_batch_refine_updated += 1
-                    self._on_fixup_state_changed(self.records[raw_index].image_path)
-            return
-
-        if kind == "ai_find_item":
-            raw_index = payload.get("index")
-            raw_matched = payload.get("matched")
-            raw_retried = payload.get("retried")
-            raw_position = payload.get("position")
-            raw_total = payload.get("total")
-            raw_query = payload.get("query")
-
-            if not isinstance(raw_index, int):
-                return
-            if raw_index < 0 or raw_index >= len(self.records):
-                return
-
-            matched = bool(raw_matched)
-            query = " ".join(str(raw_query or "").split())
-
-            self._ai_find_batch_processed += 1
-            if isinstance(raw_retried, bool) and raw_retried:
-                self._ai_find_batch_retry_images += 1
-
-            if matched and query:
-                try:
-                    record_ai_find_match_for_image(
-                        self.records[raw_index].image_path,
-                        query,
-                        normalize_annotation=self._sanitize_annotation_text,
-                    )
-                except OSError:
-                    pass
-                else:
-                    self._ai_find_batch_matched += 1
-                    self._on_fixup_state_changed(self.records[raw_index].image_path)
-
-            if isinstance(raw_position, int) and isinstance(raw_total, int) and raw_total > 0:
-                details = self._batch_progress_details(
-                    self._ai_find_batch_processed,
-                    self._ai_find_batch_total,
-                    self._ai_find_batch_started_at,
-                    self._ai_find_batch_retry_images,
-                )
-                result_text = "match" if matched else "no match"
-                found_text = f" | found images: {self._ai_find_batch_matched}"
-                self.statusBar().showMessage(
-                    f"AI Find: applied {raw_position}/{raw_total} - {self.records[raw_index].image_path.name} ({result_text}){details}{found_text}{self._llm_threads_status_suffix()}"
-                )
-            return
-
-        if kind == "validate_item_error":
-            raw_index = payload.get("index")
-            raw_error = str(payload.get("error") or "")
-            raw_image_name = str(payload.get("image_name") or "").strip()
-            raw_timed_out = bool(payload.get("timed_out"))
-            raw_context_exhausted = bool(payload.get("context_exhausted"))
-
-            if isinstance(raw_index, int) and 0 <= raw_index < len(self.records):
-                self._validate_pending_indices.discard(raw_index)
-            self._validate_batch_processed += 1
-            self._validate_batch_errors += 1
-            if raw_timed_out:
-                self._validate_batch_retry_images += 1
-            if raw_context_exhausted:
-                self._validate_batch_context_exhausted += 1
-
-            print(
-                f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] validation_error image={raw_image_name} error={raw_error!r}",
-                flush=True,
-            )
-            return
-
-        if kind != "validate_item":
-            return
-
-        raw_index = payload.get("index")
-        raw_result = payload.get("result")
-        raw_retried = payload.get("retried")
-        raw_position = payload.get("position")
-        raw_total = payload.get("total")
-
-        if not isinstance(raw_index, int):
-            return
-        if raw_index < 0 or raw_index >= len(self.records):
-            return
-
-        outcome, llm_violated_no_commas = self._apply_validation_result_to_record(raw_index, str(raw_result or ""))
-        self._validate_pending_indices.discard(raw_index)
-        self._validate_batch_processed += 1
-        if isinstance(raw_retried, bool) and raw_retried:
-            self._validate_batch_retry_images += 1
-        if outcome == "clean":
-            self._validate_batch_clean += 1
-        elif outcome == "issues":
-            self._validate_batch_issues += 1
-        if llm_violated_no_commas:
-            self._validate_batch_llm_disobeyed += 1
-
-        if isinstance(raw_position, int) and isinstance(raw_total, int) and raw_total > 0:
-            details = self._batch_progress_details(
-                self._validate_batch_processed,
-                self._validate_batch_total,
-                self._validate_batch_started_at,
-                self._validate_batch_retry_images,
-            )
-            self.statusBar().showMessage(
-                f"Validate: processed {self._validate_batch_processed}/{raw_total}{details}{self._llm_threads_status_suffix()}"
-            )
+        self.llm_controller._on_llm_task_item_ready(payload)
 
     def _on_llm_task_finished(
         self,
@@ -4586,6 +2733,14 @@ class MainWindow(QMainWindow):
         merge_with_existing: bool = False,
         validation_report: bool = False,
     ) -> None:
+        self.llm_controller._on_llm_task_finished(
+            result=result,
+            action_name=action_name,
+            empty_message=empty_message,
+            result_as_single=result_as_single,
+            merge_with_existing=merge_with_existing,
+            validation_report=validation_report,
+        )
         if (
             isinstance(result, dict)
             and result.get("batch") is True
@@ -4840,8 +2995,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{action_name} complete via {self._llm_provider.display_name}")
 
     def _on_llm_task_failed(self, message: str) -> None:
-        QMessageBox.warning(self, f"{self._llm_provider.display_name} request failed", message)
-        self.statusBar().showMessage(f"{self._llm_provider.display_name} request failed")
+        self.llm_controller._on_llm_task_failed(message)
 
     def _apply_validation_result_to_record(self, record_index: int, result: str) -> tuple[str, bool]:
         if record_index < 0 or record_index >= len(self.records):
@@ -4893,48 +3047,7 @@ class MainWindow(QMainWindow):
         return ("issues", llm_violated_no_commas)
 
     def _cleanup_llm_task(self) -> None:
-        if self._llm_worker is not None:
-            self._llm_worker.deleteLater()
-        if self._llm_thread is not None:
-            self._llm_thread.deleteLater()
-        self._llm_worker = None
-        self._llm_thread = None
-        self._generate_batch_total = 0
-        self._generate_batch_processed = 0
-        self._generate_batch_updated = 0
-        self._generate_batch_vision_updated = 0
-        self._generate_batch_new_annotations = 0
-        self._generate_batch_started_at = None
-        self._generate_batch_retry_images = 0
-        self._validate_batch_total = 0
-        self._validate_batch_processed = 0
-        self._validate_batch_clean = 0
-        self._validate_batch_issues = 0
-        self._validate_batch_skipped = 0
-        self._validate_batch_started_at = None
-        self._validate_batch_retry_images = 0
-        self._validate_batch_errors = 0
-        self._validate_batch_context_exhausted = 0
-        self._validate_pending_indices = set()
-        self._ai_find_batch_total = 0
-        self._ai_find_batch_processed = 0
-        self._ai_find_batch_matched = 0
-        self._ai_find_batch_started_at = None
-        self._ai_find_batch_retry_images = 0
-        self._llm_action_name = None
-        self._llm_cancel = None
-        self._llm_threads_auto_mode = False
-        self._llm_threads_current = 0
-        self._update_llm_controls()
-        self.llm_endpoint_input.setEnabled(True)
-        self.llm_fetch_button.setEnabled(True)
-        self.llm_model_combo.setEnabled(True)
-        self.llm_timeout_input.setEnabled(True)
-        self.llm_retry_input.setEnabled(True)
-        self.llm_max_resolution_input.setEnabled(True)
-        self.llm_threads_input.setEnabled(True)
-        self.llm_use_button.setEnabled(True)
-        self._update_fixup_button_state()
+        self.llm_controller._cleanup_llm_task()
 
 
 def main() -> None:

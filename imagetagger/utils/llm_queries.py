@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,7 +26,7 @@ _AGENT_ROLE_PLACEHOLDER = "{agent_role}"
 _PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
 
 
-_prompt_file_cache: dict[str, str] = {}
+_prompt_file_cache: dict[str, tuple[float, str]] = {}
 
 
 def _strip_unresolved_placeholders(prompt: str) -> str:
@@ -40,14 +41,26 @@ def _strip_unresolved_placeholders(prompt: str) -> str:
 
 
 def _load_prompt(filename: str, default: str) -> str:
-    cached = _prompt_file_cache.get(filename)
-    if cached is not None:
-        return cached
+    prompt_path = _PROMPTS_DIR / filename
     try:
-        text = (_PROMPTS_DIR / filename).read_text(encoding="utf-8").strip()
+        mtime = prompt_path.stat().st_mtime
     except OSError:
         return default
-    _prompt_file_cache[filename] = text
+
+    with _prompt_lock:
+        cached = _prompt_file_cache.get(filename)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+
+    # File I/O outside the lock so other threads aren't blocked during the read.
+    # Two threads may both read the file concurrently, but the result is idempotent.
+    try:
+        text = prompt_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return default
+
+    with _prompt_lock:
+        _prompt_file_cache[filename] = (mtime, text)
     return text
 
 
@@ -190,6 +203,10 @@ _PROMPT_FILENAMES: dict[str, str] = {
 
 _PROMPT_OVERRIDES: dict[str, str] = {}
 
+# Guards concurrent GUI-thread writes and LLM-worker-thread reads of
+# both _PROMPT_OVERRIDES and _prompt_file_cache.
+_prompt_lock = threading.RLock()
+
 
 def _assert_prompt_kind(kind: str) -> None:
     if kind not in _PROMPT_DEFAULTS:
@@ -208,7 +225,9 @@ def load_prompt_for_kind(kind: str) -> str:
 
 def prompt_source_for_kind(kind: str) -> str:
     _assert_prompt_kind(kind)
-    if kind in _PROMPT_OVERRIDES:
+    with _prompt_lock:
+        has_override = kind in _PROMPT_OVERRIDES
+    if has_override:
         return "memory"
 
     prompt_path = _PROMPTS_DIR / _PROMPT_FILENAMES[kind]
@@ -221,12 +240,14 @@ def prompt_source_for_kind(kind: str) -> str:
 
 def set_prompt_override(kind: str, prompt: str) -> None:
     _assert_prompt_kind(kind)
-    _PROMPT_OVERRIDES[kind] = prompt.strip()
+    with _prompt_lock:
+        _PROMPT_OVERRIDES[kind] = prompt.strip()
 
 
 def clear_prompt_override(kind: str) -> None:
     _assert_prompt_kind(kind)
-    _PROMPT_OVERRIDES.pop(kind, None)
+    with _prompt_lock:
+        _PROMPT_OVERRIDES.pop(kind, None)
 
 
 def save_prompt_for_kind(kind: str, prompt: str) -> str:
@@ -237,7 +258,8 @@ def save_prompt_for_kind(kind: str, prompt: str) -> str:
         (_PROMPTS_DIR / _PROMPT_FILENAMES[kind]).write_text(text, encoding="utf-8")
     except OSError as exc:
         raise LlmQueryError(f"Could not save prompt file: {exc}") from exc
-    _prompt_file_cache.pop(_PROMPT_FILENAMES[kind], None)
+    with _prompt_lock:
+        _prompt_file_cache.pop(_PROMPT_FILENAMES[kind], None)
     return text
 
 
@@ -249,17 +271,19 @@ def reset_prompt_to_default(kind: str) -> str:
         (_PROMPTS_DIR / _PROMPT_FILENAMES[kind]).write_text(default_text, encoding="utf-8")
     except OSError as exc:
         raise LlmQueryError(f"Could not reset prompt file: {exc}") from exc
-    _prompt_file_cache.pop(_PROMPT_FILENAMES[kind], None)
-    clear_prompt_override(kind)
+    with _prompt_lock:
+        _prompt_file_cache.pop(_PROMPT_FILENAMES[kind], None)
+    clear_prompt_override(kind)  # clear_prompt_override acquires the lock itself
     return default_text
 
 
 def _active_prompt(kind: str) -> str:
     _assert_prompt_kind(kind)
-    override = _PROMPT_OVERRIDES.get(kind)
+    with _prompt_lock:
+        override = _PROMPT_OVERRIDES.get(kind)
     if override is not None:
         return override
-    return load_prompt_for_kind(kind)
+    return load_prompt_for_kind(kind)  # load_prompt_for_kind → _load_prompt acquires the lock
 
 
 def active_prompt_for_kind(kind: str) -> str:
