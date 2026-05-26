@@ -624,6 +624,32 @@ class ComparisonPanel(QWidget):
             self.select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
         return True
 
+    def delete_proposed_rows_for_selected_rows(self) -> bool:
+        """Delete (from the left list) all currently selected rows whose action is '✕' (Right-arrow action).
+
+        Returns True if any rows were deleted.
+        """
+        selected_rows = sorted({index.row() for index in self.comparison_table.selectedIndexes()})
+        rows_to_delete: list[int] = []
+        for row in selected_rows:
+            if row < 0 or row >= len(self._table_row_map):
+                continue
+            if self._table_row_action_symbols.get(row) == "✕":
+                rows_to_delete.append(row)
+        if not rows_to_delete:
+            return False
+        current_row = self.comparison_table.currentRow()
+        self._remember_last_action_table_row(current_row)
+        for row in rows_to_delete:
+            self._trigger_action_for_table_row(row)
+        self._update_difference_highlights()
+        self.state_changed.emit()
+        new_row_count = self.comparison_table.rowCount()
+        if new_row_count > 0 and current_row >= 0:
+            target_row = min(current_row, new_row_count - 1)
+            self.select_comparison_row(target_row, Qt.FocusReason.ShortcutFocusReason)
+        return True
+
     def focus_left_tag_input(self) -> None:
         self.left_tag_input.clear()
         self.left_tag_input.setFocus(Qt.FocusReason.ShortcutFocusReason)

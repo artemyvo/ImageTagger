@@ -179,11 +179,30 @@ def open_fixup_dialog_for_image(
             has_headers=False,
         )
     else:
+        fixup_tags_raw = list(sidecar.fixup_tags or [])
+        fixup_description_raw = sidecar.fixup_description or ""
+
+        # Handle case where model erroneously placed a description inside fixup_tags.
+        # Detect the longest description-like entry (≥5 words or ≥40 chars) and promote
+        # it to corrected_description so the merge dialog shows a proper description diff.
+        if not fixup_description_raw and fixup_tags_raw:
+            best_idx: int | None = None
+            best_len = -1
+            for i, tag in enumerate(fixup_tags_raw):
+                stripped = tag.strip()
+                if stripped and (len(stripped.split()) >= 5 or len(stripped) >= 40):
+                    if len(stripped) > best_len:
+                        best_len = len(stripped)
+                        best_idx = i
+            if best_idx is not None:
+                fixup_description_raw = fixup_tags_raw[best_idx].strip()
+                fixup_tags_raw = [t for j, t in enumerate(fixup_tags_raw) if j != best_idx]
+
         fixup_data = FixupData(
             issues=sidecar.fixup_issues or "",
-            corrected_description=sanitize_description_text(sidecar.fixup_description or ""),
-            corrected_description_raw=sidecar.fixup_description or "",
-            corrected_tags=list(sidecar.fixup_tags or []),
+            corrected_description=sanitize_description_text(fixup_description_raw),
+            corrected_description_raw=fixup_description_raw,
+            corrected_tags=fixup_tags_raw,
             search_matches=list(sidecar.ai_find_matches or []),
             vision_tags=list(sidecar.vision_tags or []),
             vision_caption=sidecar.vision_caption or "",
@@ -284,36 +303,13 @@ def open_fixup_dialog_for_image(
 
     if save_regenerate_settings is not None:
         rp = dialog._regen_panel
-        timeout_raw = rp.regenerate_timeout_input.text().strip()
-        retry_raw = rp.regenerate_retry_input.text().strip()
-        max_resolution_raw = rp.regenerate_max_resolution_input.text().strip()
-        try:
-            timeout_value = int(timeout_raw) if timeout_raw else max(1, int(regenerate_timeout_seconds))
-        except ValueError:
-            timeout_value = max(1, int(regenerate_timeout_seconds))
-        try:
-            retry_value = int(retry_raw) if retry_raw else max(0, int(regenerate_retry_count))
-        except ValueError:
-            retry_value = max(0, int(regenerate_retry_count))
-        try:
-            max_resolution_value = float(max_resolution_raw) if max_resolution_raw else float(regenerate_max_resolution_mpx)
-            if max_resolution_value <= 0:
-                raise ValueError()
-        except (TypeError, ValueError):
-            try:
-                max_resolution_value = float(regenerate_max_resolution_mpx)
-                if max_resolution_value <= 0:
-                    raise ValueError()
-            except (TypeError, ValueError):
-                max_resolution_value = 5.0
-
         save_regenerate_settings(
             {
                 "tags_enabled": rp.regenerate_tags_checkbox.isChecked(),
                 "description_enabled": rp.regenerate_description_checkbox.isChecked(),
-                "timeout_seconds": max(1, timeout_value),
-                "retry_count": max(0, retry_value),
-                "max_resolution_mpx": max_resolution_value,
+                "timeout_seconds": rp._stored_timeout_seconds,
+                "retry_count": rp._stored_retry_count,
+                "max_resolution_mpx": rp._stored_max_resolution_mpx,
                 "model_name": rp.current_model_name,
                 "model_endpoint": rp.current_endpoint,
                 "user_hint": rp.current_user_hint,

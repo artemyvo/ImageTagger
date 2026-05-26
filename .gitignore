@@ -8,3 +8,4 @@ venv/
 prompts/
 *.log
 config.json
+IDEAS.md

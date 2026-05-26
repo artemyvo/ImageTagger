@@ -557,6 +557,12 @@ class MainWindow(QMainWindow):
         self.focus_tag_input_action.triggered.connect(self._focus_tag_input_when_autotag)
         self.addAction(self.focus_tag_input_action)
 
+        self.open_fixup_dialog_action = QAction("Open Fixup Dialog", self)
+        self.open_fixup_dialog_action.setShortcut(platform_key_sequence("Alt+X", "Alt+X"))
+        self.open_fixup_dialog_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.open_fixup_dialog_action.triggered.connect(self.open_fixup_dialog)
+        self.addAction(self.open_fixup_dialog_action)
+
         self.center_panel = QWidget(self)
         center_layout = QVBoxLayout(self.center_panel)
         center_layout.setContentsMargins(0, 0, 0, 0)
@@ -576,6 +582,7 @@ class MainWindow(QMainWindow):
         center_layout.addWidget(self.image_label)
 
         self.right_panel = QWidget(self)
+        self.right_panel.setMinimumWidth(0)
         right_layout = QVBoxLayout(self.right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -741,7 +748,7 @@ class MainWindow(QMainWindow):
 
         ai_find_row = QHBoxLayout()
         self.ai_find_input = QLineEdit(self)
-        self.ai_find_input.setPlaceholderText("Find concept in selected images (e.g. raven)")
+        self.ai_find_input.setPlaceholderText("Concept to find… (e.g. raven)")
         self.ai_find_input.textChanged.connect(lambda _text: self._update_llm_controls())
         self.ai_find_button = QPushButton("AI Find", self)
         self.ai_find_button.clicked.connect(self.ai_find_with_llm)
@@ -881,7 +888,7 @@ class MainWindow(QMainWindow):
         global_tag_buttons_row.addStretch(1)
         layout.addLayout(global_tag_buttons_row)
 
-        self.controls_tabs.addTab(tab, "Tags")
+        self.tag_tabs.addTab(tab, "Global tags")
         self._refresh_known_tags_list()
 
     def _update_prompt_status(self, kind: str, edited: bool = False) -> None:

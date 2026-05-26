@@ -78,7 +78,11 @@ class FixupDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._window_title_base = title_text or "Fixup"
+        _nav_match = re.search(r"\s\(\d+\s+of\s+\d+\)$", title_text or "")
+        self._nav_suffix: str = _nav_match.group(0) if _nav_match else ""
+        self._image_path = Path(image_path) if isinstance(image_path, str) else image_path
+        self._image_title_path: str = str(self._image_path) if self._image_path else (title_text or "Fixup")
+        self._window_title_base = self._make_window_title()
         self.setWindowTitle(self._window_title_base)
         self.resize(1280, 640)
         self._apply_annotations = apply_annotations
@@ -86,7 +90,6 @@ class FixupDialog(QDialog):
         self._restore_fixup = restore_fixup
         self._resolved = False
         self._undo_available = False
-        self._image_path = Path(image_path) if isinstance(image_path, str) else image_path
         self._global_key_filter_installed = False
         self._delete_image = delete_image
         self._confirm_delete = bool(confirm_delete)
@@ -210,6 +213,7 @@ class FixupDialog(QDialog):
         )
         self._image_pane.status_message.connect(self._regen_panel.set_status)
         self._image_pane.delete_result.connect(self._on_image_pane_delete_result)
+        self._image_pane.dimensions_changed.connect(self._on_image_dimensions_changed)
 
         # ── Auxiliary widgets ─────────────────────────────────────────────
         self.issues_label = QTextEdit(self)
@@ -279,8 +283,15 @@ class FixupDialog(QDialog):
             button.setDefault(False)
 
         # ── Layout ────────────────────────────────────────────────────────
+        left_widget = QWidget(self)
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+        left_layout.addWidget(self.issues_label)
+        left_layout.addWidget(self._comparison_panel, stretch=1)
+
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        splitter.addWidget(self._comparison_panel)
+        splitter.addWidget(left_widget)
         splitter.addWidget(self._image_pane)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
@@ -296,7 +307,6 @@ class FixupDialog(QDialog):
         button_row.addWidget(self.next_button)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.issues_label)
         layout.addWidget(splitter, stretch=1)
         layout.addLayout(button_row)
 
@@ -347,6 +357,14 @@ class FixupDialog(QDialog):
         title_prefix = self._window_title_base[:match.start()]
         title_suffix = self._window_title_base[match.start():]
         self.setWindowTitle(f"{title_prefix} *{title_suffix}")
+
+    def _make_window_title(self, width: int = 0, height: int = 0) -> str:
+        dims = f" - {width}x{height} - {(width * height) / 1_000_000.0:.1f} MPx" if width > 0 and height > 0 else ""
+        return f"{self._image_title_path}{dims}{self._nav_suffix}"
+
+    def _on_image_dimensions_changed(self, width: int, height: int) -> None:
+        self._window_title_base = self._make_window_title(width, height)
+        self._update_window_title_unsaved_marker(self._has_local_changes())
 
     def _has_local_changes(self) -> bool:
         return self._comparison_panel.has_local_changes_compared_to(self._last_merged_annotations)
@@ -456,6 +474,53 @@ class FixupDialog(QDialog):
 
             selected_rows = sorted({index.row() for index in comparison_table.selectedIndexes()})
             if self._comparison_panel.apply_proposed_rows_for_selected_rows():
+                return True
+
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Right
+            and _is_plain_arrow_modifiers(event.modifiers())
+        ):
+            if isinstance(watched, QWidget) and not self.isAncestorOf(watched):
+                return super().eventFilter(watched, event)
+            if isinstance(watched, QWidget) and self._comparison_panel.comparison_editor_owns(watched):
+                return False
+            active_editor = self._comparison_panel.active_comparison_editor()
+            if active_editor is not None:
+                focused = self.focusWidget()
+                if self._comparison_panel.comparison_editor_owns(focused):
+                    return False
+            if comparison_table.state() == QAbstractItemView.State.EditingState:
+                _edit_focused = self.focusWidget()
+                if _edit_focused is comparison_table or _edit_focused is comparison_table.viewport():
+                    if active_editor is not None:
+                        active_editor.setFocus(Qt.FocusReason.OtherFocusReason)
+                        QApplication.sendEvent(active_editor, event)
+                        return True
+                    return False
+                return False
+            focused = self.focusWidget()
+            if (
+                focused is not None
+                and comparison_table.isAncestorOf(focused)
+                and focused is not comparison_table
+                and focused is not comparison_table.viewport()
+            ):
+                return False
+            if (
+                isinstance(focused, (QLineEdit, QTextEdit))
+                and self.isAncestorOf(focused)
+            ):
+                return False
+            if focused is not None and comparison_table.isAncestorOf(focused):
+                if isinstance(focused, (QLineEdit, QTextEdit, QAbstractSlider, QAbstractSpinBox, QComboBox)):
+                    return False
+            if focused is not None and not self.isAncestorOf(focused):
+                return False
+            if isinstance(focused, (QAbstractSlider, QAbstractSpinBox, QComboBox)):
+                return False
+
+            if self._comparison_panel.delete_proposed_rows_for_selected_rows():
                 return True
 
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):

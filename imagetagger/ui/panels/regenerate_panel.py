@@ -27,12 +27,7 @@ from imagetagger.utils.image_prep import (
     consume_image_preparation_warning,
     is_pillow_image_resize_available,
 )
-from imagetagger.utils.input_validators import InputValidator
-from imagetagger.utils.validators import (
-    create_max_resolution_validator,
-    create_retry_validator,
-    create_timeout_validator,
-)
+
 from imagetagger.utils.llm_queries import active_prompt_for_kind, render_prompt_with_agent_role, render_prompt_with_existing_tags, render_prompt_with_user_hint
 from imagetagger.providers.llm_provider import (
     LlmProviderCancelled,
@@ -119,26 +114,15 @@ class RegeneratePanel(QWidget):
             lambda _state: self._update_regenerate_controls()
         )
 
-        self.regenerate_timeout_input = QLineEdit(self)
-        self.regenerate_timeout_input.setValidator(create_timeout_validator(self))
-        self.regenerate_timeout_input.setText(str(max(1, int(regenerate_timeout_seconds))))
-        self.regenerate_timeout_input.setMaximumWidth(90)
-
-        self.regenerate_retry_input = QLineEdit(self)
-        self.regenerate_retry_input.setValidator(create_retry_validator(self))
-        self.regenerate_retry_input.setText(str(max(0, int(regenerate_retry_count))))
-        self.regenerate_retry_input.setMaximumWidth(60)
-
-        self.regenerate_max_resolution_input = QLineEdit(self)
-        self.regenerate_max_resolution_input.setValidator(create_max_resolution_validator(self))
+        self._stored_timeout_seconds: float = float(max(1, int(regenerate_timeout_seconds)))
         try:
-            max_resolution_value = float(regenerate_max_resolution_mpx)
-            if max_resolution_value <= 0:
+            _max_res = float(regenerate_max_resolution_mpx)
+            if _max_res <= 0:
                 raise ValueError()
         except (TypeError, ValueError):
-            max_resolution_value = 5.0
-        self.regenerate_max_resolution_input.setText(self._format_mpx(max_resolution_value))
-        self.regenerate_max_resolution_input.setMaximumWidth(80)
+            _max_res = 5.0
+        self._stored_max_resolution_mpx: float = _max_res
+        self._stored_retry_count: int = max(0, int(regenerate_retry_count))
 
         self.llm_endpoint_input = QLineEdit(self)
         self.llm_endpoint_input.setPlaceholderText(
@@ -191,7 +175,7 @@ class RegeneratePanel(QWidget):
             Qt.WidgetAttribute.WA_TransparentForMouseEvents,
             True,
         )
-        self.regenerate_user_hint_overlay_label.setStyleSheet("color: palette(mid);")
+        self.regenerate_user_hint_overlay_label.setStyleSheet("color: palette(placeholder-text);")
 
         self.regenerate_user_hint_clear_button = QPushButton("Clear", self)
         self.regenerate_user_hint_clear_button.setAutoDefault(False)
@@ -247,7 +231,15 @@ class RegeneratePanel(QWidget):
         user_hint_row.addWidget(self.regenerate_user_hint_clear_button, stretch=0)
         layout.addLayout(user_hint_row)
 
-        layout.addWidget(self.regenerate_button, stretch=0)
+        regen_row = QHBoxLayout()
+        regen_row.setContentsMargins(0, 0, 0, 0)
+        regen_row.setSpacing(6)
+        regen_row.addWidget(self.regenerate_tags_checkbox)
+        regen_row.addSpacing(8)
+        regen_row.addWidget(self.regenerate_description_checkbox)
+        regen_row.addSpacing(16)
+        regen_row.addWidget(self.regenerate_button, stretch=1)
+        layout.addLayout(regen_row)
         layout.addWidget(self.regenerate_status_label, stretch=0)
 
         # ── Initial state ───────────────────────────────────────────────────
@@ -312,9 +304,6 @@ class RegeneratePanel(QWidget):
         for widget in (
             self.regenerate_tags_checkbox,
             self.regenerate_description_checkbox,
-            self.regenerate_timeout_input,
-            self.regenerate_retry_input,
-            self.regenerate_max_resolution_input,
             self.llm_endpoint_input,
             self.llm_fetch_button,
             self.llm_model_combo,
@@ -334,11 +323,6 @@ class RegeneratePanel(QWidget):
             fetch_button=self.llm_fetch_button,
             model_combo=self.llm_model_combo,
             use_button=self.llm_use_button,
-            include_tags_checkbox=self.regenerate_tags_checkbox,
-            include_description_checkbox=self.regenerate_description_checkbox,
-            timeout_input=self.regenerate_timeout_input,
-            retry_input=self.regenerate_retry_input,
-            max_resolution_input=self.regenerate_max_resolution_input,
         )
 
     # ── Provider helpers (moved from FixupDialog) ───────────────────────────
@@ -468,9 +452,6 @@ class RegeneratePanel(QWidget):
 
         self.regenerate_tags_checkbox.setEnabled(not working)
         self.regenerate_description_checkbox.setEnabled(not working)
-        self.regenerate_timeout_input.setEnabled(not working)
-        self.regenerate_retry_input.setEnabled(not working)
-        self.regenerate_max_resolution_input.setEnabled(not working)
         self.llm_endpoint_input.setEnabled(not working)
         self.llm_fetch_button.setEnabled(not working and self._llm_provider is not None)
         self.llm_model_combo.setEnabled(not working)
@@ -533,27 +514,13 @@ class RegeneratePanel(QWidget):
     # ── Validation helpers ──────────────────────────────────────────────────
 
     def _regenerate_timeout_seconds(self) -> float:
-        def show_error(msg: str) -> None:
-            QMessageBox.warning(self, "Invalid timeout", msg)
-
-        return InputValidator.parse_timeout_seconds(
-            self.regenerate_timeout_input.text(), show_error
-        )
+        return self._stored_timeout_seconds
 
     def _regenerate_retry_count(self) -> int:
-        return InputValidator.parse_retry_count(self.regenerate_retry_input.text())
-
-    @staticmethod
-    def _format_mpx(value: float) -> str:
-        return InputValidator.format_megapixels(value)
+        return self._stored_retry_count
 
     def _regenerate_max_resolution_mpx(self) -> float:
-        def show_error(msg: str) -> None:
-            QMessageBox.warning(self, "Invalid query downscale", msg)
-
-        return InputValidator.parse_max_resolution_mpx(
-            self.regenerate_max_resolution_input.text(), show_error
-        )
+        return self._stored_max_resolution_mpx
 
     # ── Tag parsing helpers ─────────────────────────────────────────────────
 

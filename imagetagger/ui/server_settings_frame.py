@@ -10,13 +10,13 @@ def create_server_settings_frame(
     fetch_button: QPushButton,
     model_combo: QComboBox,
     use_button: QPushButton,
-    include_tags_checkbox: QCheckBox,
-    include_description_checkbox: QCheckBox,
+    include_tags_checkbox: QCheckBox | None = None,
+    include_description_checkbox: QCheckBox | None = None,
     include_vision_checkbox: QCheckBox | None = None,
     include_refine_checkbox: QCheckBox | None = None,
-    timeout_input: QLineEdit,
-    retry_input: QLineEdit,
-    max_resolution_input: QLineEdit,
+    timeout_input: QLineEdit | None = None,
+    retry_input: QLineEdit | None = None,
+    max_resolution_input: QLineEdit | None = None,
     threads_input: QLineEdit | None = None,
 ) -> QFrame:
     frame = QFrame(parent)
@@ -39,30 +39,29 @@ def create_server_settings_frame(
     model_row.addWidget(model_combo, stretch=1)
     model_row.addWidget(use_button)
 
-    options_row = QHBoxLayout()
-    options_row.setContentsMargins(0, 0, 0, 0)
-    options_row.addWidget(include_tags_checkbox)
-    options_row.addWidget(include_description_checkbox)
-    if include_vision_checkbox is not None:
-        options_row.addWidget(include_vision_checkbox)
-    if include_refine_checkbox is not None:
-        options_row.addWidget(include_refine_checkbox)
-    options_row.addSpacing(12)
-    options_row.addWidget(QLabel("Timeout", parent))
-    options_row.addWidget(timeout_input)
-    options_row.addSpacing(8)
-    options_row.addWidget(QLabel("Retries", parent))
-    options_row.addWidget(retry_input)
-    options_row.addSpacing(8)
-    options_row.addWidget(QLabel("Downscale", parent))
-    options_row.addWidget(max_resolution_input)
-    if threads_input is not None:
-        options_row.addSpacing(8)
-        options_row.addWidget(QLabel("Threads", parent))
-        options_row.addWidget(threads_input)
-    options_row.addStretch(1)
-
     layout.addLayout(server_row)
     layout.addLayout(model_row)
-    layout.addLayout(options_row)
+
+    checkboxes = [cb for cb in (include_tags_checkbox, include_description_checkbox, include_vision_checkbox, include_refine_checkbox) if cb is not None]
+    if checkboxes:
+        checkboxes_row = QHBoxLayout()
+        checkboxes_row.setContentsMargins(0, 0, 0, 0)
+        for cb in checkboxes:
+            checkboxes_row.addWidget(cb)
+        checkboxes_row.addStretch(1)
+        layout.addLayout(checkboxes_row)
+
+    param_entries = [("Timeout", timeout_input), ("Retries", retry_input), ("Downscale", max_resolution_input), ("Threads", threads_input)]
+    param_entries = [(label, w) for label, w in param_entries if w is not None]
+    if param_entries:
+        params_row = QHBoxLayout()
+        params_row.setContentsMargins(0, 0, 0, 0)
+        for i, (label_text, widget) in enumerate(param_entries):
+            if i > 0:
+                params_row.addSpacing(8)
+            params_row.addWidget(QLabel(label_text, parent))
+            params_row.addWidget(widget)
+        params_row.addStretch(1)
+        layout.addLayout(params_row)
+
     return frame

@@ -14,7 +14,6 @@ from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QFileDialog,
-    QLabel,
     QMenu,
     QMessageBox,
     QScrollArea,
@@ -69,9 +68,7 @@ class ImagePane(QWidget):
 
     status_message = pyqtSignal(str)
     delete_result = pyqtSignal(bool)
-
-    _PANE_HEADER_BOTTOM_SPACING = 4
-    _PANE_HEADER_EXTRA_HEIGHT = 4
+    dimensions_changed = pyqtSignal(int, int)
 
     def __init__(
         self,
@@ -92,17 +89,6 @@ class ImagePane(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-
-        self._image_header_label = QLabel("Image", self)
-        self._image_header_label.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._image_header_label.setContentsMargins(0, 0, 0, 0)
-        self._image_header_label.setMinimumHeight(
-            self._image_header_label.fontMetrics().height() + self._PANE_HEADER_EXTRA_HEIGHT
-        )
-        layout.addWidget(self._image_header_label)
-        layout.addSpacing(self._PANE_HEADER_BOTTOM_SPACING)
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -216,12 +202,10 @@ class ImagePane(QWidget):
         return pixmap
 
     def _set_header_text(self, width: int | None, height: int | None) -> None:
-        label = self._image_header_label
-        if width is None or height is None or width <= 0 or height <= 0:
-            label.setText("Image")
-            return
-        megapixels = (float(width) * float(height)) / 1_000_000.0
-        label.setText(f"Image: {width}x{height} - {megapixels:0.1f} MPx")
+        if width is not None and height is not None and width > 0 and height > 0:
+            self.dimensions_changed.emit(width, height)
+        else:
+            self.dimensions_changed.emit(0, 0)
 
     # ------------------------------------------------------------------
     # Context menu
