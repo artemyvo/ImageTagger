@@ -55,3 +55,10 @@ def success_accent_color(palette: QPalette) -> QColor:
 def success_text_on_accent_color(palette: QPalette) -> QColor:
     """Return text/icon color intended to sit on top of success accents."""
     return palette.color(QPalette.ColorRole.HighlightedText)
+
+
+def warning_text_color(palette: QPalette) -> QColor:
+    """Return a theme-aware amber used for non-blocking warning text."""
+    base = palette.color(QPalette.ColorRole.Base)
+    is_dark_theme = base.lightness() < 128
+    return QColor(255, 184, 77) if is_dark_theme else QColor(166, 84, 0)

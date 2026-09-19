@@ -26,6 +26,16 @@ class FixupController:
         # State moved off MainWindow
         self._fixup_navigating: bool = False
 
+        # While the merge dialog is open, navigation deliberately skips the main
+        # window image/vision refresh (see on_selection_changed) so that rapid
+        # "Merge and next" clicks stay responsive.  This debounced timer catches
+        # the main window up once the user pauses, so the image behind the dialog
+        # always matches the image the dialog is showing.
+        self._preview_sync_timer = QTimer(window)
+        self._preview_sync_timer.setSingleShot(True)
+        self._preview_sync_timer.setInterval(150)
+        self._preview_sync_timer.timeout.connect(self._sync_main_window_preview)
+
     # ------------------------------------------------------------------
     # Fixup button state
     # ------------------------------------------------------------------
@@ -42,6 +52,30 @@ class FixupController:
             if w._llm_action_name != "Validate" or w.current_index in w._validate_pending_indices:
                 enabled = False
         w.fixup_button.setEnabled(enabled)
+
+        bulk_enabled = any(
+            r.has_pending_fixup
+            for i, r in enumerate(w.records)
+            if not (w.list_widget.item(i) is not None and w.list_widget.item(i).isHidden())
+        )
+        w.bulk_fixup_button.setEnabled(bulk_enabled)
+
+    # ------------------------------------------------------------------
+    # Main window preview sync while the merge dialog is open
+    # ------------------------------------------------------------------
+
+    def _sync_main_window_preview(self) -> None:
+        """Show the currently selected image (and its vision fields) in the main window.
+
+        Called on a debounce while stepping through images from the merge dialog,
+        so the main window behind the dialog keeps showing the active image.
+        """
+        w = self._window
+        record = w._current_record()
+        if record is None:
+            return
+        w._show_image(record.image_path)
+        w._load_vision_for_current_image()
 
     # ------------------------------------------------------------------
     # Fixup state change (called after LLM validate/generate batch ops)
@@ -182,8 +216,16 @@ class FixupController:
         ]
         initial_fixup_total = len(initial_fixup_record_indices)
 
+        from imagetagger import config as _config
+
         regenerate_tags_enabled = w.generate_tags_checkbox.isChecked()
         regenerate_description_enabled = w.generate_description_checkbox.isChecked()
+        regenerate_tags_temperature = float(
+            w._cfg.get("merge_dialog_tags_temperature", 0.8)
+        )
+        regenerate_description_temperature = float(
+            w._cfg.get("merge_dialog_description_temperature", 0.8)
+        )
         timeout_text = w.llm_timeout_input.text().strip()
         retry_text = w.llm_retry_input.text().strip()
         try:
@@ -205,6 +247,8 @@ class FixupController:
             nonlocal regenerate_description_enabled
             nonlocal regenerate_timeout_seconds
             nonlocal regenerate_retry_count
+            nonlocal regenerate_tags_temperature
+            nonlocal regenerate_description_temperature
             nonlocal regenerate_max_resolution_mpx
             nonlocal regenerate_model_name
             nonlocal regenerate_model_endpoint
@@ -216,6 +260,8 @@ class FixupController:
             description_enabled = values.get("description_enabled")
             timeout_seconds = values.get("timeout_seconds")
             retry_count = values.get("retry_count")
+            tags_temperature = values.get("tags_temperature")
+            description_temperature = values.get("description_temperature")
             max_resolution_mpx = values.get("max_resolution_mpx")
             model_name = values.get("model_name")
             model_endpoint = values.get("model_endpoint")
@@ -229,6 +275,10 @@ class FixupController:
                 regenerate_timeout_seconds = max(1, timeout_seconds)
             if isinstance(retry_count, int):
                 regenerate_retry_count = max(0, retry_count)
+            if tags_temperature is None or isinstance(tags_temperature, (int, float)) and not isinstance(tags_temperature, bool):
+                regenerate_tags_temperature = None if tags_temperature is None else float(tags_temperature)
+            if description_temperature is None or isinstance(description_temperature, (int, float)) and not isinstance(description_temperature, bool):
+                regenerate_description_temperature = None if description_temperature is None else float(description_temperature)
             if isinstance(max_resolution_mpx, (int, float)) and max_resolution_mpx > 0:
                 regenerate_max_resolution_mpx = float(max_resolution_mpx)
                 w.llm_max_resolution_input.setText(w._format_mpx(regenerate_max_resolution_mpx))
@@ -239,8 +289,6 @@ class FixupController:
                 regenerate_model_endpoint = model_endpoint
             if isinstance(user_hint, str):
                 regenerate_user_hint = user_hint
-
-        from imagetagger import config as _config
 
         _deferred_refresh_needed = False
         while True:
@@ -291,6 +339,8 @@ class FixupController:
                 regenerate_description_enabled=regenerate_description_enabled,
                 regenerate_timeout_seconds=regenerate_timeout_seconds,
                 regenerate_retry_count=regenerate_retry_count,
+                regenerate_tags_temperature=regenerate_tags_temperature,
+                regenerate_description_temperature=regenerate_description_temperature,
                 regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
                 regenerate_model_name=regenerate_model_name,
                 regenerate_model_endpoint=regenerate_model_endpoint,
@@ -323,6 +373,7 @@ class FixupController:
                 confirm_delete=w._confirm_on_delete_enabled(),
                 save_regenerate_settings=_capture_regenerate_settings,
                 reasoning_lines=int(w._cfg.get("merge_dialog_reasoning_lines", 5)),
+                cfg=w._cfg,
             )
 
             if outcome == "prev":
@@ -334,6 +385,7 @@ class FixupController:
                     finally:
                         self._fixup_navigating = False
                     _deferred_refresh_needed = True
+                    self._preview_sync_timer.start()
                     continue
                 break
 
@@ -356,10 +408,13 @@ class FixupController:
                     finally:
                         self._fixup_navigating = False
                     _deferred_refresh_needed = True
+                    self._preview_sync_timer.start()
                     continue
             break
 
         if _deferred_refresh_needed:
+            # The dialog is gone; refresh now instead of waiting for the debounce.
+            self._preview_sync_timer.stop()
             record = w._current_record()
             if record is not None:
                 w._show_image(record.image_path)

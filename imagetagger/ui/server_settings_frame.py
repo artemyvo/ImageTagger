@@ -51,7 +51,12 @@ def create_server_settings_frame(
         checkboxes_row.addStretch(1)
         layout.addLayout(checkboxes_row)
 
-    param_entries = [("Timeout", timeout_input), ("Retries", retry_input), ("Downscale", max_resolution_input), ("Threads", threads_input)]
+    param_entries = [
+        ("Timeout", timeout_input),
+        ("Retries", retry_input),
+        ("Downscale", max_resolution_input),
+        ("Threads", threads_input),
+    ]
     param_entries = [(label, w) for label, w in param_entries if w is not None]
     if param_entries:
         params_row = QHBoxLayout()

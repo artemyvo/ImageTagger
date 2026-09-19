@@ -124,6 +124,8 @@ def open_fixup_dialog_for_image(
     regenerate_description_enabled: bool = True,
     regenerate_timeout_seconds: int = 300,
     regenerate_retry_count: int = 3,
+    regenerate_tags_temperature: float | None = None,
+    regenerate_description_temperature: float | None = None,
     regenerate_max_resolution_mpx: float = 5.0,
     regenerate_model_name: str = "",
     regenerate_model_endpoint: str = "",
@@ -138,6 +140,7 @@ def open_fixup_dialog_for_image(
     confirm_delete: bool = True,
     save_regenerate_settings: Callable[[dict[str, int | float | bool | str]], None] | None = None,
     reasoning_lines: int = 5,
+    cfg: dict | None = None,
 ) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
     try:
         sidecar = read_sidecar_data(image_path)
@@ -252,6 +255,8 @@ def open_fixup_dialog_for_image(
         regenerate_description_enabled=regenerate_description_enabled,
         regenerate_timeout_seconds=regenerate_timeout_seconds,
         regenerate_retry_count=regenerate_retry_count,
+        regenerate_tags_temperature=regenerate_tags_temperature,
+        regenerate_description_temperature=regenerate_description_temperature,
         regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
         regenerate_model_name=regenerate_model_name,
         regenerate_model_endpoint=regenerate_model_endpoint,
@@ -271,6 +276,7 @@ def open_fixup_dialog_for_image(
             if sanitize_tag_text(t)
         } if sidecar.fixup_tags is not None else None,
         reasoning_lines=reasoning_lines,
+        cfg=cfg,
         parent=parent,
     )
 
@@ -309,6 +315,8 @@ def open_fixup_dialog_for_image(
                 "description_enabled": rp.regenerate_description_checkbox.isChecked(),
                 "timeout_seconds": rp._stored_timeout_seconds,
                 "retry_count": rp._stored_retry_count,
+                "tags_temperature": rp._regenerate_tags_temperature(),
+                "description_temperature": rp._regenerate_description_temperature(),
                 "max_resolution_mpx": rp._stored_max_resolution_mpx,
                 "model_name": rp.current_model_name,
                 "model_endpoint": rp.current_endpoint,

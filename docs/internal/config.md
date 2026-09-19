@@ -55,6 +55,14 @@ These keys are used only when `llm_threads` is `0`. See [Ollama Settings](ollama
 
 ---
 
+## Dataset Aspect Ratios
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `allowed_ratios` | string | `"1:1, 2:3, 3:4, 4:5, 16:9"` | Comma-separated `w:h` aspect ratios a training image may have. Each ratio covers both orientations (`2:3` also allows `3:2`). The merge dialog warns in its status area when an image does not fit and offers **Fix ratio** to crop it to the closest allowed ratio. Invalid entries are dropped; if nothing valid remains the default is used. An empty string turns the check off. |
+
+---
+
 ## Merge Dialog Mouse Actions
 
 Stored as a nested object under `merge_table_mouse_actions`.

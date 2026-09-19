@@ -4,11 +4,14 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -39,6 +42,7 @@ from imagetagger.providers.llm_provider import (
 from imagetagger.ui.workers import RegenerateWorker
 from imagetagger.ui.server_settings_frame import create_server_settings_frame
 from imagetagger.ui.shortcuts import native_shortcut_text, platform_key_sequence
+from imagetagger.utils.theme_colors import warning_text_color
 
 
 class RegeneratePanel(QWidget):
@@ -77,14 +81,21 @@ class RegeneratePanel(QWidget):
         regenerate_description_enabled: bool = True,
         regenerate_timeout_seconds: int = 300,
         regenerate_retry_count: int = 3,
+        regenerate_tags_temperature: float | None = None,
+        regenerate_description_temperature: float | None = None,
         regenerate_max_resolution_mpx: float = 5.0,
         regenerate_model_name: str = "",
         regenerate_model_endpoint: str = "",
         regenerate_user_hint: str = "",
+        cfg: dict | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
 
+        # Shared in-memory config dict owned by the main window. When provided,
+        # temperature changes mutate this same object so they survive any later
+        # `config.save(<that dict>)` the main window performs (geometry, etc.).
+        self._shared_cfg = cfg
         self._image_path_getter = image_path_getter
         self._get_current_proposed = get_current_proposed
         self._normalize_tag = normalize_tag
@@ -114,6 +125,16 @@ class RegeneratePanel(QWidget):
             lambda _state: self._update_regenerate_controls()
         )
 
+        self.regenerate_tags_temperature_input = self._create_temperature_spinbox()
+        self.regenerate_tags_temperature_input.setToolTip(
+            "Temperature for tags regeneration."
+        )
+
+        self.regenerate_description_temperature_input = self._create_temperature_spinbox()
+        self.regenerate_description_temperature_input.setToolTip(
+            "Temperature for description regeneration."
+        )
+
         self._stored_timeout_seconds: float = float(max(1, int(regenerate_timeout_seconds)))
         try:
             _max_res = float(regenerate_max_resolution_mpx)
@@ -123,6 +144,10 @@ class RegeneratePanel(QWidget):
             _max_res = 5.0
         self._stored_max_resolution_mpx: float = _max_res
         self._stored_retry_count: int = max(0, int(regenerate_retry_count))
+        if isinstance(regenerate_tags_temperature, (int, float)) and not isinstance(regenerate_tags_temperature, bool):
+            self.regenerate_tags_temperature_input.setValue(float(regenerate_tags_temperature))
+        if isinstance(regenerate_description_temperature, (int, float)) and not isinstance(regenerate_description_temperature, bool):
+            self.regenerate_description_temperature_input.setValue(float(regenerate_description_temperature))
 
         self.llm_endpoint_input = QLineEdit(self)
         self.llm_endpoint_input.setPlaceholderText(
@@ -207,6 +232,21 @@ class RegeneratePanel(QWidget):
         self.clear_hint_action.triggered.connect(self._clear_and_focus_hint)
         self.addAction(self.clear_hint_action)
 
+        # Sticky warning line of the status area (e.g. disallowed aspect ratio).
+        # Kept separate from the status text so progress messages don't erase it.
+        self.status_warning_label = QLabel(self)
+        self.status_warning_label.setWordWrap(True)
+        self.status_warning_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.status_warning_label.setMinimumWidth(0)
+        self.status_warning_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.status_warning_label.hide()
+        self._apply_status_warning_color()
+
         self.regenerate_status_label = QLabel(self)
         self.regenerate_status_label.setWordWrap(True)
         self.regenerate_status_label.setAlignment(
@@ -231,15 +271,33 @@ class RegeneratePanel(QWidget):
         user_hint_row.addWidget(self.regenerate_user_hint_clear_button, stretch=0)
         layout.addLayout(user_hint_row)
 
+        selection_grid = QGridLayout()
+        selection_grid.setContentsMargins(0, 0, 0, 0)
+        selection_grid.setHorizontalSpacing(12)
+        selection_grid.setVerticalSpacing(4)
+        selection_grid.addWidget(self.regenerate_tags_checkbox, 0, 0)
+        selection_grid.addWidget(self.regenerate_description_checkbox, 0, 1)
+        selection_grid.addWidget(
+            self._create_temperature_editor("Temp", self.regenerate_tags_temperature_input),
+            1,
+            0,
+        )
+        selection_grid.addWidget(
+            self._create_temperature_editor(
+                "Temp",
+                self.regenerate_description_temperature_input,
+            ),
+            1,
+            1,
+        )
+
         regen_row = QHBoxLayout()
         regen_row.setContentsMargins(0, 0, 0, 0)
-        regen_row.setSpacing(6)
-        regen_row.addWidget(self.regenerate_tags_checkbox)
-        regen_row.addSpacing(8)
-        regen_row.addWidget(self.regenerate_description_checkbox)
-        regen_row.addSpacing(16)
+        regen_row.setSpacing(12)
+        regen_row.addLayout(selection_grid, stretch=0)
         regen_row.addWidget(self.regenerate_button, stretch=1)
         layout.addLayout(regen_row)
+        layout.addWidget(self.status_warning_label, stretch=0)
         layout.addWidget(self.regenerate_status_label, stretch=0)
 
         # ── Initial state ───────────────────────────────────────────────────
@@ -299,11 +357,27 @@ class RegeneratePanel(QWidget):
         """Set the status label text (used by the dialog for image-reload etc.)."""
         self.regenerate_status_label.setText(text)
 
+    def set_status_warning(self, text: str) -> None:
+        """Show a sticky warning above the status text; empty text hides it."""
+        self.status_warning_label.setText(text)
+        self.status_warning_label.setVisible(bool(text))
+
+    def _apply_status_warning_color(self) -> None:
+        color = warning_text_color(self.palette())
+        self.status_warning_label.setStyleSheet(f"color: {color.name()};")
+
+    def changeEvent(self, event) -> None:  # type: ignore[override]
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            self._apply_status_warning_color()
+
     def set_all_controls_enabled(self, enabled: bool) -> None:
         """Enable or disable all regenerate controls as a group."""
         for widget in (
             self.regenerate_tags_checkbox,
             self.regenerate_description_checkbox,
+            self.regenerate_tags_temperature_input,
+            self.regenerate_description_temperature_input,
             self.llm_endpoint_input,
             self.llm_fetch_button,
             self.llm_model_combo,
@@ -324,6 +398,28 @@ class RegeneratePanel(QWidget):
             model_combo=self.llm_model_combo,
             use_button=self.llm_use_button,
         )
+
+    def _create_temperature_editor(self, label_text: str, editor: QDoubleSpinBox) -> QWidget:
+        widget = QWidget(self)
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(QLabel(label_text, widget))
+        layout.addWidget(editor)
+        layout.addStretch(1)
+        return widget
+
+    def _create_temperature_spinbox(self) -> QDoubleSpinBox:
+        spinbox = QDoubleSpinBox(self)
+        spinbox.setRange(0.0, 2.0)
+        spinbox.setDecimals(2)
+        spinbox.setSingleStep(0.05)
+        spinbox.setValue(0.8)
+        spinbox.setMaximumWidth(90)
+        spinbox.setAlignment(Qt.AlignmentFlag.AlignRight)
+        spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.PlusMinus)
+        spinbox.setStepType(QAbstractSpinBox.StepType.DefaultStepType)
+        return spinbox
 
     # ── Provider helpers (moved from FixupDialog) ───────────────────────────
 
@@ -452,6 +548,12 @@ class RegeneratePanel(QWidget):
 
         self.regenerate_tags_checkbox.setEnabled(not working)
         self.regenerate_description_checkbox.setEnabled(not working)
+        self.regenerate_tags_temperature_input.setEnabled(
+            (not working) and self.regenerate_tags_checkbox.isChecked()
+        )
+        self.regenerate_description_temperature_input.setEnabled(
+            (not working) and self.regenerate_description_checkbox.isChecked()
+        )
         self.llm_endpoint_input.setEnabled(not working)
         self.llm_fetch_button.setEnabled(not working and self._llm_provider is not None)
         self.llm_model_combo.setEnabled(not working)
@@ -519,6 +621,12 @@ class RegeneratePanel(QWidget):
     def _regenerate_retry_count(self) -> int:
         return self._stored_retry_count
 
+    def _regenerate_tags_temperature(self) -> float:
+        return float(self.regenerate_tags_temperature_input.value())
+
+    def _regenerate_description_temperature(self) -> float:
+        return float(self.regenerate_description_temperature_input.value())
+
     def _regenerate_max_resolution_mpx(self) -> float:
         return self._stored_max_resolution_mpx
 
@@ -566,6 +674,8 @@ class RegeneratePanel(QWidget):
         active_session = self._active_regenerate_session(show_errors=True)
         if active_session is None:
             return
+
+        self._persist_temperature_settings()
 
         try:
             max_resolution_mpx = self._regenerate_max_resolution_mpx()
@@ -665,6 +775,7 @@ class RegeneratePanel(QWidget):
                                 timeout=remaining_timeout(),
                                 cancellation=cancel_token,
                                 thread_count=1,
+                                temperature=self._regenerate_description_temperature(),
                             ).strip()
                         )
                     if tags_prompt is not None:
@@ -676,6 +787,7 @@ class RegeneratePanel(QWidget):
                                     timeout=remaining_timeout(),
                                     cancellation=cancel_token,
                                     thread_count=1,
+                                    temperature=self._regenerate_tags_temperature(),
                                 )
                             )
                         )
@@ -708,6 +820,22 @@ class RegeneratePanel(QWidget):
         self.regeneration_started.emit()
         self._update_regenerate_controls()
         self._regenerate_thread.start()
+
+    def _persist_temperature_settings(self) -> None:
+        # Mutate the main window's shared config dict when available so the
+        # update is not clobbered by a subsequent save of that same dict.
+        cfg = self._shared_cfg if self._shared_cfg is not None else _config.load()
+        tags_temperature = self._regenerate_tags_temperature()
+        description_temperature = self._regenerate_description_temperature()
+
+        previous_tags = cfg.get("merge_dialog_tags_temperature")
+        previous_description = cfg.get("merge_dialog_description_temperature")
+        if previous_tags == tags_temperature and previous_description == description_temperature:
+            return
+
+        cfg["merge_dialog_tags_temperature"] = tags_temperature
+        cfg["merge_dialog_description_temperature"] = description_temperature
+        _config.save(cfg)
 
     def _on_regenerate_finished(self, payload: object) -> None:
         if self._discard_regenerate_result:

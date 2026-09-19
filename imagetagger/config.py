@@ -4,6 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from imagetagger.utils.aspect_ratio import (
+    DEFAULT_ALLOWED_RATIOS,
+    normalize_allowed_ratios_setting,
+)
+
 # config.json lives in the project root (one level above this package directory)
 _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
@@ -31,6 +36,8 @@ _DEFAULTS: dict = {
     "main_window_geometry": {},
     "llm_endpoint": "",
     "llm_model": "",
+    "merge_dialog_tags_temperature": 0.8,
+    "merge_dialog_description_temperature": 0.8,
     "llm_max_resolution_mpx": 5,
     "llm_threads": 1,
     "llm_auto_max_threads": 48,
@@ -46,6 +53,7 @@ _DEFAULTS: dict = {
     "merge_table_mouse_actions": dict(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS),
     "agent_roles": {},
     "merge_dialog_reasoning_lines": 5,
+    "allowed_ratios": DEFAULT_ALLOWED_RATIOS,
 }
 
 
@@ -61,11 +69,18 @@ def _normalize_int(value: Any, default: int, minimum: int | None = None) -> int:
     return value
 
 
-def _normalize_number(value: Any, default: float, minimum: float | None = None) -> float:
+def _normalize_number(
+    value: Any,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     numeric_value = float(value)
     if minimum is not None and numeric_value < minimum:
+        return default
+    if maximum is not None and numeric_value > maximum:
         return default
     return numeric_value
 
@@ -159,6 +174,18 @@ def _normalize_loaded_config(data: Any) -> dict:
         data.get("llm_model", data.get("ollama_model")),
         _DEFAULTS["llm_model"],
     )
+    normalized["merge_dialog_tags_temperature"] = _normalize_number(
+        data.get("merge_dialog_tags_temperature"),
+        float(_DEFAULTS["merge_dialog_tags_temperature"]),
+        minimum=0.0,
+        maximum=2.0,
+    )
+    normalized["merge_dialog_description_temperature"] = _normalize_number(
+        data.get("merge_dialog_description_temperature"),
+        float(_DEFAULTS["merge_dialog_description_temperature"]),
+        minimum=0.0,
+        maximum=2.0,
+    )
     normalized["llm_max_resolution_mpx"] = _normalize_number(
         data.get("llm_max_resolution_mpx", data.get("ollama_max_resolution_mpx")),
         float(_DEFAULTS["llm_max_resolution_mpx"]),
@@ -216,6 +243,10 @@ def _normalize_loaded_config(data: Any) -> dict:
         data.get("merge_dialog_reasoning_lines"),
         _DEFAULTS["merge_dialog_reasoning_lines"],
         minimum=1,
+    )
+    normalized["allowed_ratios"] = normalize_allowed_ratios_setting(
+        data.get("allowed_ratios"),
+        _DEFAULTS["allowed_ratios"],
     )
 
     raw_roles = data.get("agent_roles")

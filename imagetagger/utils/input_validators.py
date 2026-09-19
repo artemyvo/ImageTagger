@@ -113,6 +113,35 @@ class InputValidator:
         return value
 
     @staticmethod
+    def parse_temperature(
+        text: str,
+        on_error: Callable[[str], None] | None = None,
+    ) -> float | None:
+        """Parse optional temperature input.
+
+        Blank input means the backend default should be used.
+        """
+        raw_value = text.strip()
+        if not raw_value:
+            return None
+
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            error_msg = "Temperature must be a number between 0 and 2."
+            if on_error:
+                on_error(error_msg)
+            raise LlmProviderError(error_msg) from exc
+
+        if value < 0 or value > 2:
+            error_msg = "Temperature must be between 0 and 2."
+            if on_error:
+                on_error(error_msg)
+            raise LlmProviderError(error_msg)
+
+        return value
+
+    @staticmethod
     def format_megapixels(value: float) -> str:
         """Format megapixel value for display (3 decimal places).
         

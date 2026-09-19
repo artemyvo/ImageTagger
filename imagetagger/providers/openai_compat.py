@@ -82,6 +82,7 @@ def generate_with_image(
     prompt: str,
     timeout: float = DEFAULT_TIMEOUT,
     cancellation: LlmRequestCancellation | None = None,
+    temperature: float | None = None,
 ) -> str:
     payload: dict[str, object] = {
         "model": connection.model_name,
@@ -96,6 +97,8 @@ def generate_with_image(
         ],
         "stream": False,
     }
+    if temperature is not None:
+        payload["temperature"] = float(temperature)
 
     response_payload = request_json(
         server=connection.server_url,

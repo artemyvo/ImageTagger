@@ -48,6 +48,16 @@ def create_max_resolution_validator(parent: QWidget) -> QDoubleValidator:
     return validator
 
 
+def create_temperature_validator(parent: QWidget) -> QDoubleValidator:
+    """Create a QDoubleValidator for optional temperature input.
+
+    The paired line edit may still be left blank to use the backend default.
+    """
+    validator = QDoubleValidator(0.0, 2.0, 3, parent)
+    validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+    return validator
+
+
 def create_threads_validator(parent: QWidget) -> QIntValidator:
     """Create a QIntValidator for thread count (0 to 128).
     

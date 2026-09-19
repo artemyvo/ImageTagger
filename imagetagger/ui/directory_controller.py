@@ -83,7 +83,6 @@ class DirectoryController:
         self._set_loading_state(True)
         self._window.statusBar().showMessage("Scanning folder...")
         self._pending_selection_path = restore_selection
-        self._window._detected_external_editors = None
 
         try:
             max_thread_cap = int(self._window._cfg.get("directory_loader_max_threads", 8))

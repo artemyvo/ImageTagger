@@ -44,6 +44,7 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Next actionable row | Alt+Down | Option+Down | Dialog action |
 | Accept all proposed rows and merge | Alt+A | Option+A | Accept button |
 | Regenerate proposed annotations | Alt+R | Option+R | Regenerate button |
+| Fix ratio (crop to closest allowed ratio) | Alt+F | Option+F | Fix ratio button; enabled when the image ratio is not in `allowed_ratios` |
 | Previous image | Alt+Left | Command+[ | Prev button |
 | Next image | Alt+Right | Command+] | Next button |
 
@@ -57,6 +58,17 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Apply proposed value for selected row | Left arrow (default dialog intent; suppressed while a dialog text input has focus) | Left arrow (default dialog intent; suppressed while a dialog text input has focus) |
 | Trigger current row action | Enter/Return | Enter/Return |
 | Delete selected current rows | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) |
+
+## Merge Dialog Fix Ratio Mode
+
+Active after **Fix ratio**, while the crop frame is shown. The other merge dialog shortcuts are parked until the mode is left.
+
+| Behavior | Win/Linux | macOS |
+|---|---|---|
+| Move the crop frame | Arrow keys | Arrow keys |
+| Move the crop frame 10x further | Shift+Arrow keys | Shift+Arrow keys |
+| Apply the crop | Enter/Return | Enter/Return |
+| Cancel (leave the image unchanged) | Esc | Esc |
 
 ## Windows vs Linux Differences
 

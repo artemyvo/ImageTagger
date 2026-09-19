@@ -104,6 +104,13 @@ class ComparisonPanel(QWidget):
             tag.strip() for tag in initial_annotations if tag.strip()
         ]
         self._initial_proposed_description: str = initial_description.strip()
+        # If the LLM did not provide a description at all, fall back to the existing
+        # description-like item from the current annotations so the proposed column
+        # shows it as "stay unchanged" rather than leaving the right side blank.
+        if not self._initial_proposed_description:
+            _desc_idx = self._find_description_like_index(self._initial_annotations)
+            if _desc_idx is not None:
+                self._initial_proposed_description = self._initial_annotations[_desc_idx]
         self._initial_proposed_tags: list[tuple[str, str]] = self._build_initial_proposed_tags(
             self._initial_proposed_description,
             [tag.strip() for tag in initial_tags if tag.strip()],
@@ -1493,7 +1500,7 @@ class ComparisonPanel(QWidget):
     def _make_text_cell_label(self, text: str, ranges: list[tuple[int, int]]) -> QLabel:
         label = QLabel(self)
         label.setWordWrap(True)
-        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         label.setTextFormat(Qt.TextFormat.RichText)
         label.setContentsMargins(0, 0, 0, 0)
         label.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)

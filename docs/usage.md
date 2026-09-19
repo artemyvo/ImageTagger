@@ -188,6 +188,22 @@ Quick Actions:
 
 Use Merge/Reject buttons to apply your final decision and navigate to the next fixup image.
 
+### Merge Dialog Aspect Ratio Check (Fix ratio)
+
+Trainers batch images by aspect ratio, so a dataset that sticks to a few ratios batches cleanly. The merge dialog checks every image against the `allowed_ratios` list in config.json (default `"1:1, 2:3, 3:4, 4:5, 16:9"`). A ratio covers both orientations: `2:3` also allows `3:2`.
+
+- When the image ratio is not in the list, a warning stays in the status area under the Regenerate button. It names the closest allowed ratio and the size the image would be cropped to. Sizes that are only off by pixel rounding (for example 1000x1333 for 3:4) count as fitting.
+- **Fix ratio** (Alt+F) is enabled for such images. It shows a frame over the preview at the closest allowed ratio, "closest" meaning the one that keeps the most pixels. Everything outside the frame is dimmed and will be discarded.
+- The frame always has the largest possible size for the ratio, so you only choose its position: drag it, click outside it to re-centre it under the pointer, scroll over the image, or use the arrow keys (Shift+arrow moves 10x further).
+- The Ratio dropdown lists every allowed ratio in both orientations, closest first, in case another one suits the picture better.
+- **Apply** (Enter) crops the image file in place and reloads it; **Cancel** (Esc) leaves the file untouched. While the frame is shown the rest of the dialog is parked, and Esc leaves the crop mode instead of closing the dialog.
+
+Apply overwrites the image file; there is no undo, so keep your source images elsewhere. The crop keeps the file format, EXIF, ICC profile and PNG text chunks (for example Stable Diffusion generation parameters). JPEGs are re-encoded with the original quantization tables and chroma subsampling, and the cropped size is an exact multiple of the ratio (for example 999x1332 for 3:4). A symlinked image is cropped at its target. Animated images and 16-bit RGB PNGs are refused.
+
+Fix ratio is unavailable while a regeneration is running, because the model is looking at the uncropped file.
+
+Set `"allowed_ratios": ""` to turn the check off and hide the button.
+
 ### Merge Dialog Mouse Actions
 
 The merge comparison table also supports mouse and trackpad actions:
@@ -362,6 +378,7 @@ config.json stores session and UI state, including:
 - thread setting
 - window geometry state
 - merge-dialog mouse action settings in `merge_table_mouse_actions`
+- `allowed_ratios` (default `"1:1, 2:3, 3:4, 4:5, 16:9"`): aspect ratios the merge dialog accepts without a warning
 - `confirm_on_delete` (default `true`): show confirmation dialog before deleting from image context menu
 
 For a full list of Ollama and auto-mode keys, see [ollama_settings.md](internal/ollama_settings.md).

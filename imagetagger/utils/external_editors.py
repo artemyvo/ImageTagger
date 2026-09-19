@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import threading
 from typing import Iterable
 
 
@@ -15,6 +16,72 @@ class ExternalEditor:
     display_name: str
     launch_target: str
     launch_kind: str = "executable"  # executable | mac_app
+
+
+# Discovery walks /Applications (or the registry on Windows) and can take a
+# noticeable moment, so it runs once at program start instead of on demand.
+_detection_lock = threading.Lock()
+_detection_thread: threading.Thread | None = None
+_detected_editors: list[ExternalEditor] | None = None
+
+
+def start_graphics_editor_detection() -> None:
+    """Begin detecting installed editors in the background. Call once at startup."""
+    global _detection_thread
+
+    with _detection_lock:
+        if _detected_editors is not None or _detection_thread is not None:
+            return
+        thread = threading.Thread(
+            target=_run_background_detection,
+            name="external-editor-detection",
+            daemon=True,
+        )
+        _detection_thread = thread
+
+    thread.start()
+
+
+def get_graphics_editors(refresh: bool = False) -> list[ExternalEditor]:
+    """Return the detected editors, waiting for startup detection if it is still running."""
+    global _detected_editors
+
+    if refresh:
+        editors = _safe_discover()
+        with _detection_lock:
+            _detected_editors = editors
+        return list(editors)
+
+    with _detection_lock:
+        cached = _detected_editors
+        thread = _detection_thread
+
+    if cached is None and thread is not None:
+        thread.join()
+        with _detection_lock:
+            cached = _detected_editors
+
+    if cached is None:
+        # Detection was never started; fall back to detecting now and caching.
+        return get_graphics_editors(refresh=True)
+
+    return list(cached)
+
+
+def _run_background_detection() -> None:
+    global _detected_editors, _detection_thread
+
+    editors = _safe_discover()
+    with _detection_lock:
+        _detected_editors = editors
+        _detection_thread = None
+
+
+def _safe_discover() -> list[ExternalEditor]:
+    try:
+        return discover_graphics_editors()
+    except Exception:
+        return []
 
 
 def discover_graphics_editors() -> list[ExternalEditor]:
@@ -58,13 +125,14 @@ def _discover_linux_editors() -> list[ExternalEditor]:
 
 def _discover_macos_editors() -> list[ExternalEditor]:
     applications = [
+        ("photoscape_x", "PhotoScape X", ["PhotoScape X.app", "PhotoScapeX.app"]),
         ("photoshop", "Adobe Photoshop", ["Adobe Photoshop 2026.app", "Adobe Photoshop 2025.app", "Adobe Photoshop.app"]),
         ("gimp", "GIMP", ["GIMP.app"]),
         ("krita", "Krita", ["Krita.app"]),
         ("affinity_photo", "Affinity Photo", ["Affinity Photo 2.app", "Affinity Photo.app"]),
         ("pixelmator", "Pixelmator Pro", ["Pixelmator Pro.app", "Pixelmator.app"]),
     ]
-    roots = [Path("/Applications"), Path.home() / "Applications"]
+    roots = [Path("/System/Applications"), Path("/Applications"), Path.home() / "Applications"]
 
     found: list[ExternalEditor] = []
     seen: set[str] = set()

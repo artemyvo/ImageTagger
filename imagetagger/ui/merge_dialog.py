@@ -6,7 +6,7 @@ from typing import Callable
 
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer
+from PyQt6.QtCore import QElapsedTimer, QEvent, QObject, Qt, QTimer
 from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
@@ -30,6 +30,13 @@ from imagetagger.providers.llm_provider import (
     VisionLlmSession,
 )
 from imagetagger.ui.shortcuts import native_shortcut_text, platform_key_sequence, platform_key_sequences
+from imagetagger.utils.aspect_ratio import (
+    DEFAULT_ALLOWED_RATIOS,
+    closest_crop,
+    format_allowed_ratios,
+    matching_ratio,
+    parse_allowed_ratios,
+)
 from imagetagger.utils.fixup_parser import FixupData
 from imagetagger.ui.panels.regenerate_panel import RegeneratePanel
 from imagetagger.ui.panels.image_pane import ImagePane
@@ -60,6 +67,8 @@ class FixupDialog(QDialog):
         regenerate_description_enabled: bool = True,
         regenerate_timeout_seconds: int = 300,
         regenerate_retry_count: int = 3,
+        regenerate_tags_temperature: float | None = None,
+        regenerate_description_temperature: float | None = None,
         regenerate_max_resolution_mpx: float = 5.0,
         regenerate_model_name: str = "",
         regenerate_model_endpoint: str = "",
@@ -75,6 +84,7 @@ class FixupDialog(QDialog):
         allow_left_delete: bool = True,
         fixup_tag_keys: set[str] | None = None,
         reasoning_lines: int = 5,
+        cfg: dict | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -93,6 +103,17 @@ class FixupDialog(QDialog):
         self._global_key_filter_installed = False
         self._delete_image = delete_image
         self._confirm_delete = bool(confirm_delete)
+
+        # Allowed aspect ratios (config "allowed_ratios"); empty disables the check.
+        raw_allowed_ratios = cfg.get("allowed_ratios", DEFAULT_ALLOWED_RATIOS) if isinstance(cfg, dict) else DEFAULT_ALLOWED_RATIOS
+        self._allowed_ratios = parse_allowed_ratios(raw_allowed_ratios)
+        self._ratio_fix_available = False
+        self._crop_mode_active = False
+        self._actions_parked_for_crop: list[QAction] = []
+        # After crop mode ends, the Enter/Esc that ended it may still be held down
+        # or queued (the crop blocks the GUI thread while it saves); see eventFilter.
+        self._crop_exit_key_guard = False
+        self._crop_exit_timer = QElapsedTimer()
 
         # ── Keyboard shortcuts ────────────────────────────────────────────
         self.remove_left_tag_action = QAction("Remove Selected Existing Tags", self)
@@ -148,13 +169,17 @@ class FixupDialog(QDialog):
             regenerate_description_enabled=regenerate_description_enabled,
             regenerate_timeout_seconds=regenerate_timeout_seconds,
             regenerate_retry_count=regenerate_retry_count,
+            regenerate_tags_temperature=regenerate_tags_temperature,
+            regenerate_description_temperature=regenerate_description_temperature,
             regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
             regenerate_model_name=regenerate_model_name,
             regenerate_model_endpoint=regenerate_model_endpoint,
             regenerate_user_hint=regenerate_user_hint,
+            cfg=cfg,
             parent=self,
         )
         self._regen_panel.proposed_annotations_ready.connect(self._on_regen_proposed_ready)
+        self._regen_panel.regeneration_started.connect(self._refresh_button_state)
         self._regen_panel.regeneration_finished.connect(self._refresh_button_state)
 
         # ── ComparisonPanel ───────────────────────────────────────────────
@@ -214,6 +239,7 @@ class FixupDialog(QDialog):
         self._image_pane.status_message.connect(self._regen_panel.set_status)
         self._image_pane.delete_result.connect(self._on_image_pane_delete_result)
         self._image_pane.dimensions_changed.connect(self._on_image_dimensions_changed)
+        self._image_pane.crop_mode_changed.connect(self._on_crop_mode_changed)
 
         # ── Auxiliary widgets ─────────────────────────────────────────────
         self.issues_label = QTextEdit(self)
@@ -248,6 +274,14 @@ class FixupDialog(QDialog):
         )
         self.undo_button.clicked.connect(self._undo_merge)
 
+        self.fix_ratio_button = QPushButton("Fix ratio", self)
+        fix_ratio_shortcut = platform_key_sequence("Alt+F", "Alt+F")
+        self.fix_ratio_button.setShortcut(fix_ratio_shortcut)
+        self._fix_ratio_shortcut_hint = native_shortcut_text(fix_ratio_shortcut)
+        self.fix_ratio_button.setEnabled(False)
+        self.fix_ratio_button.setVisible(bool(self._allowed_ratios))
+        self.fix_ratio_button.clicked.connect(self._begin_ratio_fix)
+
         self.merge_next_button = QPushButton("Merge and Next", self)
         self.merge_next_button.setShortcut(merge_next_shortcut_labels[0])
         self.merge_next_button.setToolTip(
@@ -275,6 +309,7 @@ class FixupDialog(QDialog):
             self.accept_button,
             self.merge_button,
             self.undo_button,
+            self.fix_ratio_button,
             self.merge_next_button,
             self.prev_button,
             self.next_button,
@@ -284,6 +319,7 @@ class FixupDialog(QDialog):
 
         # ── Layout ────────────────────────────────────────────────────────
         left_widget = QWidget(self)
+        self._left_widget = left_widget
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
@@ -297,18 +333,25 @@ class FixupDialog(QDialog):
         splitter.setCollapsible(1, False)
         splitter.setSizes([700, 500])
 
-        button_row = QHBoxLayout()
+        # The row lives in a widget so crop mode can park it as a whole without
+        # fighting _refresh_button_state() over individual buttons.
+        self._button_bar = QWidget(self)
+        button_row = QHBoxLayout(self._button_bar)
+        button_row.setContentsMargins(0, 0, 0, 0)
         button_row.addWidget(self.prev_button)
         button_row.addWidget(self.accept_button)
         button_row.addWidget(self.merge_button)
         button_row.addWidget(self.undo_button)
         button_row.addStretch(1)
+        button_row.addWidget(self.fix_ratio_button)
+        if self._allowed_ratios:
+            button_row.addSpacing(24)
         button_row.addWidget(self.merge_next_button)
         button_row.addWidget(self.next_button)
 
         layout = QVBoxLayout(self)
         layout.addWidget(splitter, stretch=1)
-        layout.addLayout(button_row)
+        layout.addWidget(self._button_bar)
 
         # ── Initial render ────────────────────────────────────────────────
         self._last_merged_annotations = list(self._comparison_panel.initial_annotations)
@@ -340,6 +383,7 @@ class FixupDialog(QDialog):
         self.merge_button.setEnabled(has_local_changes)
         self.undo_button.setEnabled(self._undo_available or has_dialog_changes)
         self.merge_next_button.setEnabled(True)
+        self._refresh_fix_ratio_button()
         self._comparison_panel.set_action_buttons_enabled(True)
         self._update_window_title_unsaved_marker(has_local_changes)
 
@@ -365,6 +409,75 @@ class FixupDialog(QDialog):
     def _on_image_dimensions_changed(self, width: int, height: int) -> None:
         self._window_title_base = self._make_window_title(width, height)
         self._update_window_title_unsaved_marker(self._has_local_changes())
+        self._update_ratio_state(width, height)
+
+    # ── Aspect ratio check / Fix ratio ────────────────────────────────────
+
+    def _update_ratio_state(self, width: int, height: int) -> None:
+        """Warn in the status area when the image ratio is not an allowed one."""
+        warning = ""
+        self._ratio_fix_available = False
+        if self._allowed_ratios and width > 0 and height > 0:
+            if matching_ratio(width, height, self._allowed_ratios) is None:
+                warning = (
+                    f"\u26a0 Image ratio {width}\u00d7{height} is not one of the allowed ratios "
+                    f"({format_allowed_ratios(self._allowed_ratios)})."
+                )
+                closest = closest_crop(width, height, self._allowed_ratios)
+                if closest is not None:
+                    self._ratio_fix_available = True
+                    warning += (
+                        f" Closest: {closest.ratio.label} "
+                        f"({closest.width}\u00d7{closest.height}, keeps {closest.kept_fraction:.1%})"
+                        " \u2014 use Fix ratio."
+                    )
+        self._regen_panel.set_status_warning(warning)
+        self._refresh_fix_ratio_button()
+
+    def _refresh_fix_ratio_button(self) -> None:
+        # Not while regenerating: the model is looking at the uncropped file.
+        regenerating = self._regen_panel.is_regenerating
+        self.fix_ratio_button.setEnabled(
+            self._ratio_fix_available and not self._crop_mode_active and not regenerating
+        )
+        if self._ratio_fix_available and regenerating:
+            tooltip = "Available when regeneration has finished"
+        elif self._ratio_fix_available:
+            tooltip = "Crop the image to the closest allowed ratio"
+        elif self._allowed_ratios:
+            tooltip = "Image ratio is already one of the allowed ratios"
+        else:
+            tooltip = "No allowed ratios configured"
+        self.fix_ratio_button.setToolTip(f"{tooltip} ({self._fix_ratio_shortcut_hint})")
+
+    def _begin_ratio_fix(self) -> None:
+        if self._ratio_fix_available and not self._crop_mode_active and not self._regen_panel.is_regenerating:
+            self._image_pane.begin_ratio_fix(self._allowed_ratios)
+
+    def _on_crop_mode_changed(self, active: bool) -> None:
+        """Crop mode is modal inside the dialog: park everything but the image pane."""
+        self._crop_mode_active = active
+        for widget in (self._left_widget, self._regen_panel, self._button_bar):
+            widget.setEnabled(not active)
+        if active:
+            self._crop_exit_key_guard = False
+            self._actions_parked_for_crop = [action for action in self.actions() if action.isEnabled()]
+            for action in self._actions_parked_for_crop:
+                action.setEnabled(False)
+            return
+
+        for action in self._actions_parked_for_crop:
+            action.setEnabled(True)
+        self._actions_parked_for_crop = []
+        self._crop_exit_key_guard = True
+        self._crop_exit_timer.start()
+        self._refresh_button_state()
+        self._comparison_panel.comparison_table.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _event_targets_this_dialog(self, watched: QObject) -> bool:
+        # Widgets only: the same key press is also seen on its way through the
+        # QWindow, and popups (the ratio combo's list) live in their own window.
+        return isinstance(watched, QWidget) and (watched is self or self.isAncestorOf(watched))
 
     def _has_local_changes(self) -> bool:
         return self._comparison_panel.has_local_changes_compared_to(self._last_merged_annotations)
@@ -376,6 +489,27 @@ class FixupDialog(QDialog):
         comparison_table = getattr(self._comparison_panel, "comparison_table", None)
         left_tag_input = getattr(self._comparison_panel, "left_tag_input", None)
         if comparison_table is None or left_tag_input is None:
+            return super().eventFilter(watched, event)
+
+        if (
+            self._crop_exit_key_guard
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape)
+            and self._event_targets_this_dialog(watched)
+        ):
+            # The Enter/Esc that just ended crop mode must not also trigger a row
+            # action or close the dialog: swallow its auto-repeats, and any Enter
+            # that was queued while the crop was being saved.
+            is_enter = event.key() != Qt.Key.Key_Escape
+            if event.isAutoRepeat() or (is_enter and self._crop_exit_timer.elapsed() < 400):
+                return True
+            self._crop_exit_key_guard = False
+
+        if self._crop_mode_active and event.type() == QEvent.Type.KeyPress:
+            # Arrows move the crop frame, Enter applies, Esc leaves crop mode (not the
+            # dialog).  None of the merge-table key handling below may run meanwhile.
+            if self._event_targets_this_dialog(watched) and self._image_pane.handle_crop_key(event):
+                return True
             return super().eventFilter(watched, event)
 
         def _is_plain_arrow_modifiers(modifiers: Qt.KeyboardModifier) -> bool:
@@ -619,6 +753,7 @@ class FixupDialog(QDialog):
             self.accept_button,
             self.merge_button,
             self.undo_button,
+            self.fix_ratio_button,
             self.merge_next_button,
             self.prev_button,
             self.next_button,

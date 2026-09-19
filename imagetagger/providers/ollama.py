@@ -67,6 +67,7 @@ def generate_with_image(
     timeout: float = DEFAULT_TIMEOUT,
     cancellation: LlmRequestCancellation | None = None,
     thread_count: int | None = None,
+    temperature: float | None = None,
 ) -> str:
     payload: dict[str, object] = {
         "model": connection.model_name,
@@ -75,8 +76,13 @@ def generate_with_image(
         "stream": False,
     }
 
+    options: dict[str, object] = {}
     if thread_count is not None:
-        payload["options"] = {"num_thread": max(1, int(thread_count))}
+        options["num_thread"] = max(1, int(thread_count))
+    if temperature is not None:
+        options["temperature"] = float(temperature)
+    if options:
+        payload["options"] = options
 
     response_payload = request_json(
         server=connection.server_url,

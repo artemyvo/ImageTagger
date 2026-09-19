@@ -75,9 +75,10 @@ from imagetagger.ui.merge_actions import (
 )
 from imagetagger.utils.external_editors import (
     ExternalEditor,
-    discover_graphics_editors,
+    get_graphics_editors,
     launch_image_in_editor,
     launch_image_in_system_default,
+    start_graphics_editor_detection,
 )
 from imagetagger.utils.llm_queries import (
     active_prompt_for_kind,
@@ -117,6 +118,7 @@ from imagetagger.ui.server_settings_frame import create_server_settings_frame
 from imagetagger.ui.tag_controller import TagController
 from imagetagger.ui.llm_controller import LlmController
 from imagetagger.ui.directory_controller import DirectoryController
+from imagetagger.ui.bulk_fixup_dialog import BulkFixupDialog
 from imagetagger.ui.fixup_controller import FixupController
 from imagetagger.ui.image_view_controller import ImageViewController
 from imagetagger.utils.theme_colors import danger_accent_color, danger_text_on_accent_color, info_accent_color, info_text_on_accent_color, success_accent_color, success_text_on_accent_color
@@ -381,7 +383,6 @@ class MainWindow(QMainWindow):
         self.llm_endpoint = self._llm_provider.default_endpoint
         self.llm_model_name = ""
         self.status_connection_label: QLabel | None = None
-        self._detected_external_editors: list[ExternalEditor] | None = None
 
         # Image reload detection for external editor changes
         self._image_reload_helper = ImageReloadHelper(self, self._on_image_reload)
@@ -736,15 +737,19 @@ class MainWindow(QMainWindow):
         gen_row = QHBoxLayout()
         self.generate_button = QPushButton("&Generate", self)
         self.generate_button.clicked.connect(self.generate_with_llm)
-        gen_row.addWidget(self.generate_button)
-
-        buttons_row = QHBoxLayout()
         self.validate_button = QPushButton("&Validate", self)
         self.validate_button.clicked.connect(self.validate_tags_with_llm)
-        self.fixup_button = QPushButton("Fi&xup", self)
+        gen_row.addWidget(self.generate_button)
+        gen_row.addWidget(self.validate_button)
+
+        buttons_row = QHBoxLayout()
+        self.fixup_button = QPushButton("Fixup", self)
         self.fixup_button.clicked.connect(self.open_fixup_dialog)
-        buttons_row.addWidget(self.validate_button)
+        self.bulk_fixup_button = QPushButton("Bulk Fixup", self)
+        self.bulk_fixup_button.setEnabled(False)
+        self.bulk_fixup_button.clicked.connect(self.open_bulk_fixup_dialog)
         buttons_row.addWidget(self.fixup_button)
+        buttons_row.addWidget(self.bulk_fixup_button)
 
         ai_find_row = QHBoxLayout()
         self.ai_find_input = QLineEdit(self)
@@ -885,6 +890,10 @@ class MainWindow(QMainWindow):
         self.bump_tag_button.setToolTip("Move selected tag to first position (after description) in all images that contain it")
         self.bump_tag_button.clicked.connect(self._bump_selected_tag)
         global_tag_buttons_row.addWidget(self.bump_tag_button)
+        self.rename_tag_button = QPushButton("Rename…", self)
+        self.rename_tag_button.setToolTip("Rename selected tag in all images that contain it")
+        self.rename_tag_button.clicked.connect(self._rename_selected_tag)
+        global_tag_buttons_row.addWidget(self.rename_tag_button)
         global_tag_buttons_row.addStretch(1)
         layout.addLayout(global_tag_buttons_row)
 
@@ -1701,15 +1710,7 @@ class MainWindow(QMainWindow):
         self._open_current_image_with_editor(custom_editor)
 
     def _get_detected_external_editors(self, refresh: bool = False) -> list[ExternalEditor]:
-        if not refresh and self._detected_external_editors is not None:
-            return list(self._detected_external_editors)
-
-        try:
-            editors = discover_graphics_editors()
-        except Exception:
-            editors = []
-        self._detected_external_editors = editors
-        return list(editors)
+        return get_graphics_editors(refresh=refresh)
 
     def _record_index_for_image_path(self, image_path: Path) -> int:
         return self._record_index_by_path.get(image_path, -1)
@@ -1785,6 +1786,22 @@ class MainWindow(QMainWindow):
 
     def open_fixup_dialog(self) -> None:
         self.fixup_controller.open_fixup_dialog()
+
+    def open_bulk_fixup_dialog(self) -> None:
+        visible_records = [
+            r
+            for i, r in enumerate(self.records)
+            if not (self.list_widget.item(i) is not None and self.list_widget.item(i).isHidden())
+        ]
+        pending_records = [r for r in visible_records if r.has_pending_fixup]
+        dlg = BulkFixupDialog(
+            records=pending_records,
+            all_records=visible_records,
+            parse_tags=self._parse_tags,
+            is_description_like=self._is_description_like_annotation,
+            parent=self,
+        )
+        dlg.exec()
 
     def open_folder(self) -> None:
         self.directory_controller.open_folder()
@@ -2287,6 +2304,9 @@ class MainWindow(QMainWindow):
 
     def _bump_selected_tag(self) -> None:
         self.tag_controller._bump_selected_tag()
+
+    def _rename_selected_tag(self) -> None:
+        self.tag_controller._rename_selected_tag()
 
     def _update_tag_item_heights(self) -> None:
         self.tag_controller._update_tag_item_heights()
@@ -3059,6 +3079,7 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     QImageReader.setAllocationLimit(1024)
+    start_graphics_editor_detection()
 
     app = QApplication([])
     window = MainWindow()

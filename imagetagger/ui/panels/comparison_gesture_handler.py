@@ -126,6 +126,12 @@ class ComparisonGestureHandler(QObject):
         except RuntimeError:
             return super().eventFilter(watched, event)
 
+        # Event filters run before Qt drops input for a disabled widget, so a
+        # parked table (e.g. while the merge dialog is in crop mode) must be
+        # ignored explicitly.
+        if not table.isEnabled():
+            return super().eventFilter(watched, event)
+
         # ── Row drag ───────────────────────────────────────────────────
         if self._on_move_row is not None:
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:  # type: ignore[attr-defined]

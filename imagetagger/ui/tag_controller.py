@@ -4,7 +4,7 @@ from collections import Counter
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QRect, QSize, QStringListModel, QThread, Qt, QTimer
-from PyQt6.QtWidgets import QLineEdit, QListWidget, QListWidgetItem, QMessageBox
+from PyQt6.QtWidgets import QInputDialog, QLineEdit, QListWidget, QListWidgetItem, QMessageBox
 
 from imagetagger.utils.annotations import sanitize_tag_text
 from imagetagger.ui.workers import TagPurgeWorker
@@ -43,6 +43,8 @@ class TagController:
         self._purge_worker: TagPurgeWorker | None = None
         self._bump_thread: QThread | None = None
         self._bump_worker: TagPurgeWorker | None = None
+        self._rename_thread: QThread | None = None
+        self._rename_worker: TagPurgeWorker | None = None
 
         # Debounce timer for the expensive known-tags sidebar rebuild.
         # Coalesces rapid consecutive calls (e.g. during merge-dialog navigation)
@@ -380,4 +382,117 @@ class TagController:
 
         self._bump_thread = thread
         self._bump_worker = worker
+        thread.start()
+
+    def _rename_selected_tag(self) -> None:
+        selected = self._known_tags_list.selectedItems()
+        if len(selected) != 1:
+            return
+
+        old_tag = selected[0].data(Qt.ItemDataRole.UserRole) or selected[0].text().split(" (")[0]
+
+        new_tag_raw, ok = QInputDialog.getText(
+            self._window,
+            "Rename tag",
+            f'Rename "{old_tag}" to:',
+            QLineEdit.EchoMode.Normal,
+            old_tag,
+        )
+        if not ok:
+            return
+
+        new_tag = sanitize_tag_text(new_tag_raw)
+        if not new_tag:
+            QMessageBox.warning(self._window, "Rename tag", "Tag name cannot be empty.")
+            return
+        if new_tag == old_tag:
+            return
+
+        # Guard against renaming onto an already-existing tag.
+        if new_tag in self._window.known_tags and new_tag != old_tag:
+            confirm = QMessageBox(self._window)
+            confirm.setWindowTitle("Rename tag")
+            confirm.setText(
+                f'Tag "{new_tag}" already exists.\n'
+                "Renaming will merge all occurrences of the old tag into it.\n"
+                "Continue?"
+            )
+            confirm.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            confirm.setDefaultButton(QMessageBox.StandardButton.No)
+            confirm.raise_()
+            confirm.activateWindow()
+            if confirm.exec() != QMessageBox.StandardButton.Yes:
+                return
+
+        old_casefolded = old_tag.casefold()
+        affected = [
+            r for r in self._window.records
+            if any(t.casefold() == old_casefolded for t in self._window._parse_tags(r.text))
+        ]
+        if not affected:
+            return
+
+        # Build updated text for every affected record on the main thread (fast, no I/O).
+        jobs: list[tuple] = []
+        for record in affected:
+            old_tags = self._window._parse_tags(record.text)
+            new_tags = [new_tag if t.casefold() == old_casefolded else t for t in old_tags]
+            # Deduplicate while preserving order (handles merge-into-existing case).
+            seen: set[str] = set()
+            deduped: list[str] = []
+            for t in new_tags:
+                key = t.casefold()
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(t)
+            new_text = self._window._serialize_tags(deduped)
+            record.text = new_text
+            jobs.append((record.text_path, new_text))
+
+        # Update in-memory tag index immediately.
+        self._rebuild_known_tags_from_records()
+        self._refresh_tag_completions()
+
+        # Refresh the currently-visible image's tag list if it was affected.
+        idx = self._window.current_index
+        if 0 <= idx < len(self._window.records):
+            current_record = self._window.records[idx]
+            if current_record in affected:
+                self._populate_tag_list(self._window._parse_tags(current_record.text))
+
+        total = len(jobs)
+        old_label = f'"{old_tag}"'
+        new_label = f'"{new_tag}"'
+        self._window.statusBar().showMessage(
+            f'Renaming {old_label} → {new_label} — writing 0 / {total}…'
+        )
+
+        worker = TagPurgeWorker(jobs)
+        thread = QThread(self._window)
+        worker.moveToThread(thread)
+
+        def on_progress(done: int, total: int = total) -> None:
+            self._window.statusBar().showMessage(
+                f'Renaming {old_label} → {new_label} — writing {done} / {total}…'
+            )
+
+        def on_finished(total: int = total) -> None:
+            self._window.statusBar().showMessage(
+                f'Renamed {old_label} → {new_label} in {total} file(s).'
+            )
+            thread.quit()
+
+        def on_failed(msg: str) -> None:
+            QMessageBox.critical(self._window, "Save failed", f"Could not write some files:\n{msg}")
+            thread.quit()
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.failed.connect(on_failed)
+        thread.started.connect(worker.run)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._rename_thread = thread
+        self._rename_worker = worker
         thread.start()
