@@ -191,8 +191,10 @@ class FolderLoadWorker(QObject):
         Build a small thumbnail using Pillow.
 
         Returns: (thumbnail_payload, icc_invalid)
-        where thumbnail_payload is dict(width, height, bytes, bytes_per_line, has_alpha)
-        suitable for reconstructing a QImage on the GUI thread.
+        where thumbnail_payload is dict(width, height, bytes, bytes_per_line,
+        has_alpha, image_size) suitable for reconstructing a QImage on the GUI
+        thread.  ``image_size`` is the stored (width, height) of the file
+        itself, before any EXIF orientation transpose, for the ratio check.
         """
         try:
             img = Image.open(image_path)
@@ -200,6 +202,7 @@ class FolderLoadWorker(QObject):
             return None, False
 
         with img:
+            stored_size = (int(img.size[0]), int(img.size[1]))
             # Validate ICC profile using the raw ICC bytes (if present).
             raw_profile = img.info.get("icc_profile")
             icc_invalid = False
@@ -245,6 +248,7 @@ class FolderLoadWorker(QObject):
                     "bytes": raw_bytes,
                     "bytes_per_line": bytes_per_line,
                     "has_alpha": has_alpha,
+                    "image_size": stored_size,
                 },
                 icc_invalid,
             )

@@ -31,6 +31,9 @@ from imagetagger.providers.llm_provider import (
 )
 from imagetagger.ui.shortcuts import native_shortcut_text, platform_key_sequence, platform_key_sequences
 from imagetagger.utils.aspect_ratio import (
+    AUTOFIX_MIN_KEPT_FRACTION,
+    CropCandidate,
+    autofix_crop,
     DEFAULT_ALLOWED_RATIOS,
     closest_crop,
     format_allowed_ratios,
@@ -69,6 +72,8 @@ class FixupDialog(QDialog):
         regenerate_retry_count: int = 3,
         regenerate_tags_temperature: float | None = None,
         regenerate_description_temperature: float | None = None,
+        regenerate_tags_think: bool = False,
+        regenerate_description_think: bool = False,
         regenerate_max_resolution_mpx: float = 5.0,
         regenerate_model_name: str = "",
         regenerate_model_endpoint: str = "",
@@ -81,6 +86,7 @@ class FixupDialog(QDialog):
         merge_table_horizontal_scroll_row_target_mode: int = 3,
         delete_image: Callable[[], tuple[bool, bool]] | None = None,
         confirm_delete: bool = True,
+        on_image_cropped: Callable[[Path, int, int], None] | None = None,
         allow_left_delete: bool = True,
         fixup_tag_keys: set[str] | None = None,
         reasoning_lines: int = 5,
@@ -108,6 +114,8 @@ class FixupDialog(QDialog):
         raw_allowed_ratios = cfg.get("allowed_ratios", DEFAULT_ALLOWED_RATIOS) if isinstance(cfg, dict) else DEFAULT_ALLOWED_RATIOS
         self._allowed_ratios = parse_allowed_ratios(raw_allowed_ratios)
         self._ratio_fix_available = False
+        # Set when the closest fix keeps almost every pixel, so a centred crop is safe.
+        self._autofix_candidate: CropCandidate | None = None
         self._crop_mode_active = False
         self._actions_parked_for_crop: list[QAction] = []
         # After crop mode ends, the Enter/Esc that ended it may still be held down
@@ -171,6 +179,8 @@ class FixupDialog(QDialog):
             regenerate_retry_count=regenerate_retry_count,
             regenerate_tags_temperature=regenerate_tags_temperature,
             regenerate_description_temperature=regenerate_description_temperature,
+            regenerate_tags_think=regenerate_tags_think,
+            regenerate_description_think=regenerate_description_think,
             regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
             regenerate_model_name=regenerate_model_name,
             regenerate_model_endpoint=regenerate_model_endpoint,
@@ -239,6 +249,11 @@ class FixupDialog(QDialog):
         self._image_pane.status_message.connect(self._regen_panel.set_status)
         self._image_pane.delete_result.connect(self._on_image_pane_delete_result)
         self._image_pane.dimensions_changed.connect(self._on_image_dimensions_changed)
+        if on_image_cropped is not None:
+            # Lets the main window update the record's size, list badge and
+            # fixup state as soon as a crop lands, without waiting for its
+            # file watcher.
+            self._image_pane.image_cropped.connect(on_image_cropped)
         self._image_pane.crop_mode_changed.connect(self._on_crop_mode_changed)
 
         # ── Auxiliary widgets ─────────────────────────────────────────────
@@ -282,6 +297,14 @@ class FixupDialog(QDialog):
         self.fix_ratio_button.setVisible(bool(self._allowed_ratios))
         self.fix_ratio_button.clicked.connect(self._begin_ratio_fix)
 
+        self.autofix_ratio_button = QPushButton("Autofix ratio", self)
+        autofix_ratio_shortcut = platform_key_sequence("Alt+C", "Alt+C")
+        self.autofix_ratio_button.setShortcut(autofix_ratio_shortcut)
+        self._autofix_ratio_shortcut_hint = native_shortcut_text(autofix_ratio_shortcut)
+        self.autofix_ratio_button.setEnabled(False)
+        self.autofix_ratio_button.setVisible(bool(self._allowed_ratios))
+        self.autofix_ratio_button.clicked.connect(self._autofix_ratio)
+
         self.merge_next_button = QPushButton("Merge and Next", self)
         self.merge_next_button.setShortcut(merge_next_shortcut_labels[0])
         self.merge_next_button.setToolTip(
@@ -310,6 +333,7 @@ class FixupDialog(QDialog):
             self.merge_button,
             self.undo_button,
             self.fix_ratio_button,
+            self.autofix_ratio_button,
             self.merge_next_button,
             self.prev_button,
             self.next_button,
@@ -344,6 +368,7 @@ class FixupDialog(QDialog):
         button_row.addWidget(self.undo_button)
         button_row.addStretch(1)
         button_row.addWidget(self.fix_ratio_button)
+        button_row.addWidget(self.autofix_ratio_button)
         if self._allowed_ratios:
             button_row.addSpacing(24)
         button_row.addWidget(self.merge_next_button)
@@ -417,6 +442,7 @@ class FixupDialog(QDialog):
         """Warn in the status area when the image ratio is not an allowed one."""
         warning = ""
         self._ratio_fix_available = False
+        self._autofix_candidate = None
         if self._allowed_ratios and width > 0 and height > 0:
             if matching_ratio(width, height, self._allowed_ratios) is None:
                 warning = (
@@ -426,11 +452,15 @@ class FixupDialog(QDialog):
                 closest = closest_crop(width, height, self._allowed_ratios)
                 if closest is not None:
                     self._ratio_fix_available = True
+                    self._autofix_candidate = autofix_crop(width, height, self._allowed_ratios)
                     warning += (
                         f" Closest: {closest.ratio.label} "
                         f"({closest.width}\u00d7{closest.height}, keeps {closest.kept_fraction:.1%})"
-                        " \u2014 use Fix ratio."
                     )
+                    if self._autofix_candidate is not None:
+                        warning += " \u2014 use Autofix ratio (centre crop) or Fix ratio."
+                    else:
+                        warning += " \u2014 use Fix ratio."
         self._regen_panel.set_status_warning(warning)
         self._refresh_fix_ratio_button()
 
@@ -450,9 +480,42 @@ class FixupDialog(QDialog):
             tooltip = "No allowed ratios configured"
         self.fix_ratio_button.setToolTip(f"{tooltip} ({self._fix_ratio_shortcut_hint})")
 
+        candidate = self._autofix_candidate
+        self.autofix_ratio_button.setEnabled(
+            candidate is not None and not self._crop_mode_active and not regenerating
+        )
+        min_kept = f"{AUTOFIX_MIN_KEPT_FRACTION:.0%}"
+        if candidate is not None and regenerating:
+            tooltip = "Available when regeneration has finished"
+        elif candidate is not None:
+            tooltip = (
+                f"Crop the centre of the image to {candidate.ratio.label} "
+                f"({candidate.width}\u00d7{candidate.height}, keeps {candidate.kept_fraction:.1%}) "
+                "without showing the frame"
+            )
+        elif self._ratio_fix_available:
+            tooltip = (
+                f"Only for near misses: the closest ratio must keep at least {min_kept} of the pixels. "
+                "Use Fix ratio to place the crop by hand"
+            )
+        elif self._allowed_ratios:
+            tooltip = "Image ratio is already one of the allowed ratios"
+        else:
+            tooltip = "No allowed ratios configured"
+        self.autofix_ratio_button.setToolTip(f"{tooltip} ({self._autofix_ratio_shortcut_hint})")
+
     def _begin_ratio_fix(self) -> None:
         if self._ratio_fix_available and not self._crop_mode_active and not self._regen_panel.is_regenerating:
             self._image_pane.begin_ratio_fix(self._allowed_ratios)
+
+    def _autofix_ratio(self) -> None:
+        """Centre-crop to the closest ratio when almost nothing is lost (no frame, no confirmation)."""
+        candidate = self._autofix_candidate
+        if candidate is None or self._crop_mode_active or self._regen_panel.is_regenerating:
+            return
+        # The crop reloads the image, which re-runs _update_ratio_state via the
+        # dimensions signal and clears the button until the new size is known.
+        self._image_pane.autofix_ratio(candidate)
 
     def _on_crop_mode_changed(self, active: bool) -> None:
         """Crop mode is modal inside the dialog: park everything but the image pane."""
@@ -754,6 +817,7 @@ class FixupDialog(QDialog):
             self.merge_button,
             self.undo_button,
             self.fix_ratio_button,
+            self.autofix_ratio_button,
             self.merge_next_button,
             self.prev_button,
             self.next_button,

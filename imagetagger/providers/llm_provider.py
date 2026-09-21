@@ -22,6 +22,23 @@ class LlmProviderCancelled(LlmProviderError):
     pass
 
 
+class GeneratedText(str):
+    """Model output text plus the separate thinking trace, when the server returned one.
+
+    Behaves exactly like ``str`` for the answer text so existing call sites keep
+    working; ``thinking`` is empty unless thinking was enabled and the server
+    reported a trace in a dedicated field (Ollama ``thinking``, OpenAI-compatible
+    ``reasoning_content``/``reasoning``).
+    """
+
+    thinking: str
+
+    def __new__(cls, text: str = "", thinking: str = "") -> "GeneratedText":
+        obj = super().__new__(cls, text)
+        obj.thinking = thinking if isinstance(thinking, str) else ""
+        return obj
+
+
 def normalize_server_url(
     server: str,
     default_server: str,
@@ -112,6 +129,7 @@ class VisionLlmSession(Protocol):
         cancellation: LlmRequestCancellation | None = None,
         thread_count: int | None = None,
         temperature: float | None = None,
+        think: bool | None = None,
     ) -> str: ...
 
 
@@ -140,6 +158,7 @@ class _OllamaSession:
         cancellation: LlmRequestCancellation | None = None,
         thread_count: int | None = None,
         temperature: float | None = None,
+        think: bool | None = None,
     ) -> str:
         from imagetagger.providers.ollama import OllamaConnection, generate_with_image
 
@@ -151,6 +170,7 @@ class _OllamaSession:
             cancellation=cancellation,
             thread_count=thread_count,
             temperature=temperature,
+            think=think,
         )
 
 
@@ -226,6 +246,7 @@ class _OpenAiCompatSession:
         cancellation: LlmRequestCancellation | None = None,
         thread_count: int | None = None,
         temperature: float | None = None,
+        think: bool | None = None,
     ) -> str:
         from imagetagger.providers.openai_compat import OpenAiCompatConnection, generate_with_image
 
@@ -236,6 +257,7 @@ class _OpenAiCompatSession:
             timeout=timeout,
             cancellation=cancellation,
             temperature=temperature,
+            think=think,
         )
 
 

@@ -45,7 +45,22 @@ from PyQt6.QtWidgets import (
 
 from imagetagger import config as _config
 from imagetagger.utils.annotations import parse_tags_text, sanitize_annotation_text, sanitize_description_text, sanitize_tag_text
+from imagetagger.utils.aspect_ratio import (
+    AUTOFIX_MIN_KEPT_FRACTION,
+    DEFAULT_ALLOWED_RATIOS,
+    AspectRatio,
+    CropCandidate,
+    autofix_crop,
+    matching_ratio,
+    parse_allowed_ratios,
+)
 from imagetagger.utils.image_prep import configure_image_preparation, consume_image_preparation_warning
+from imagetagger.ui.ratio_autofix import (
+    RatioAutofixResult,
+    RatioAutofixTarget,
+    run_batch_autofix_ratio,
+    show_batch_autofix_summary,
+)
 from imagetagger.ui.image_reload_helper import ImageReloadHelper
 from imagetagger.utils.input_validators import InputValidator
 from imagetagger.utils.validators import (
@@ -295,7 +310,7 @@ class _ImageRowDelegate(QStyledItemDelegate):
             slot_h = row_h / slot_count
             for i, symbol in enumerate(w._IMAGE_ROW_BADGE_SLOT_ORDER):
                 if symbol in active_badges:
-                    if symbol == "\u2696\ufe0f":
+                    if symbol in ("\u2696\ufe0f", "\u2702\ufe0f"):
                         color = danger_col
                     elif symbol == "\u2705":
                         color = success_col
@@ -354,7 +369,7 @@ class _ImageRowDelegate(QStyledItemDelegate):
 
 
 class MainWindow(QMainWindow):
-    _IMAGE_ROW_BADGE_SLOT_ORDER = ("⚖️", "✨", "🔍", "✅")
+    _IMAGE_ROW_BADGE_SLOT_ORDER = ("⚖️", "✂️", "✨", "🔍", "✅")
 
     def __init__(self) -> None:
         super().__init__()
@@ -403,6 +418,14 @@ class MainWindow(QMainWindow):
         self._resize_timer.timeout.connect(self._on_resize_timer)
 
         self._cfg = _config.load()
+        # Allowed aspect ratios (config "allowed_ratios"); empty turns the ratio
+        # check off: no ✂️ badge, no ratio fixups, no Batch Autofix ratio button.
+        self._allowed_ratios: list[AspectRatio] = parse_allowed_ratios(
+            self._cfg.get("allowed_ratios", DEFAULT_ALLOWED_RATIOS)
+        )
+        # Batch Autofix ratio worker; referenced so it is not collected mid-run.
+        self._ratio_autofix_thread: QThread | None = None
+        self._ratio_autofix_worker: QObject | None = None
 
         self.directory_controller = DirectoryController(self)
         self.llm_controller = LlmController(self)
@@ -718,6 +741,28 @@ class MainWindow(QMainWindow):
         self.generate_refine_checkbox.setChecked(False)
         self.generate_refine_checkbox.checkStateChanged.connect(lambda _state: self._update_llm_controls())
 
+        # Model thinking (chain-of-thought) switches. Off by default: thinking
+        # roughly doubles per-image time and Ollama enables it automatically on
+        # models that support it (Gemma 4, Qwen3, ...), so the app sends an
+        # explicit off unless the user opts in.
+        self.llm_think_tags_checkbox = QCheckBox("Tags", self)
+        self.llm_think_tags_checkbox.setToolTip(
+            "Let the model think before answering tag queries (Tags, Validate, AI Find).\n"
+            "Slower; sent as Ollama's think flag or enable_thinking for OpenAI-compatible servers."
+        )
+        self.llm_think_tags_checkbox.toggled.connect(
+            lambda checked: self._on_think_setting_changed("llm_think_tags", checked)
+        )
+        self.llm_think_description_checkbox = QCheckBox("Description", self)
+        self.llm_think_description_checkbox.setToolTip(
+            "Let the model think before answering description queries (Description, Vision, Refine).\n"
+            "Slower; when the Vision response has no THOUGHT section the model's own thinking\n"
+            "trace is stored as the sidecar reasoning."
+        )
+        self.llm_think_description_checkbox.toggled.connect(
+            lambda checked: self._on_think_setting_changed("llm_think_description", checked)
+        )
+
         server_settings_frame = create_server_settings_frame(
             parent=self,
             endpoint_input=self.llm_endpoint_input,
@@ -732,6 +777,8 @@ class MainWindow(QMainWindow):
             retry_input=self.llm_retry_input,
             max_resolution_input=self.llm_max_resolution_input,
             threads_input=self.llm_threads_input,
+            think_tags_checkbox=self.llm_think_tags_checkbox,
+            think_description_checkbox=self.llm_think_description_checkbox,
         )
 
         gen_row = QHBoxLayout()
@@ -748,8 +795,13 @@ class MainWindow(QMainWindow):
         self.bulk_fixup_button = QPushButton("Bulk Fixup", self)
         self.bulk_fixup_button.setEnabled(False)
         self.bulk_fixup_button.clicked.connect(self.open_bulk_fixup_dialog)
+        self.batch_autofix_ratio_button = QPushButton("Batch Autofix ratio", self)
+        self.batch_autofix_ratio_button.setEnabled(False)
+        self.batch_autofix_ratio_button.setVisible(bool(self._allowed_ratios))
+        self.batch_autofix_ratio_button.clicked.connect(self.batch_autofix_ratio)
         buttons_row.addWidget(self.fixup_button)
         buttons_row.addWidget(self.bulk_fixup_button)
+        buttons_row.addWidget(self.batch_autofix_ratio_button)
 
         ai_find_row = QHBoxLayout()
         self.ai_find_input = QLineEdit(self)
@@ -805,6 +857,14 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar(self))
+        # "✂️ N ratio fixups": how many listed images do not have an allowed ratio.
+        self.status_ratio_label = QLabel("", self)
+        self.status_ratio_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self.status_ratio_label.setContentsMargins(0, 0, 12, 0)
+        self.status_ratio_label.setVisible(False)
+        self.statusBar().addPermanentWidget(self.status_ratio_label)
         self.status_connection_label = QLabel("no model", self)
         self.status_connection_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -953,6 +1013,14 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             thread_count = 1
         self.llm_threads_input.setText(str(thread_count))
+
+        for key, checkbox in (
+            ("llm_think_tags", self.llm_think_tags_checkbox),
+            ("llm_think_description", self.llm_think_description_checkbox),
+        ):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(bool(self._cfg.get(key, False)))
+            checkbox.blockSignals(False)
 
         if server:
             self.llm_endpoint = server
@@ -1118,6 +1186,12 @@ class MainWindow(QMainWindow):
             return
         self.llm_controller._update_llm_controls()
 
+    def _on_think_setting_changed(self, key: str, checked: bool) -> None:
+        if self._cfg.get(key) == bool(checked):
+            return
+        self._cfg[key] = bool(checked)
+        _config.save(self._cfg)
+
     def _current_record(self) -> ImageRecord | None:
         if 0 <= self.current_index < len(self.records):
             return self.records[self.current_index]
@@ -1253,7 +1327,7 @@ class MainWindow(QMainWindow):
     def _show_filter_rules_dialog(self) -> None:
         rules_text = (
             "Filter rules:\n\n"
-            "- fixup: show images with fixup files\n"
+            "- fixup: show images needing fixup (⚖️ pending corrections or ✂️ ratio to fix)\n"
             "- untagged: show images with no annotation file\n"
             "- vision: show images with a sidecar .json (vision data)\n"
             "- validated: show images that have passed validation (✅ badge)\n"
@@ -1281,17 +1355,189 @@ class MainWindow(QMainWindow):
         """Return image resolution in megapixels, caching the result on the record."""
         if record._resolution_mpx is not None:
             return record._resolution_mpx
+        size = record._image_size
+        if size is None:
+            size = self._refresh_record_image_size(record)
+        if size is None:
+            return None
+        return record._resolution_mpx
+
+    # ------------------------------------------------------------------
+    # Aspect ratio fixup (config "allowed_ratios")
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _set_record_image_size(record: ImageRecord, size: object) -> tuple[int, int] | None:
+        """Cache the stored pixel size (and the derived megapixels) on ``record``."""
+        if (
+            isinstance(size, (tuple, list))
+            and len(size) == 2
+            and all(isinstance(value, int) and value > 0 for value in size)
+        ):
+            width, height = int(size[0]), int(size[1])
+            record._image_size = (width, height)
+            record._resolution_mpx = (width * height) / 1_000_000.0
+            record._ratio_fix_needed = None
+            record._ratio_autofix = _UNKNOWN
+            return record._image_size
+        record._image_size = None
+        record._resolution_mpx = None
+        record._ratio_fix_needed = None
+        record._ratio_autofix = _UNKNOWN
+        return None
+
+    def _refresh_record_image_size(self, record: ImageRecord) -> tuple[int, int] | None:
+        """Re-read the image header (cheap: no pixel decode) and cache its size."""
         try:
             with Image.open(record.image_path) as image:
-                width, height = image.size
-                record._resolution_mpx = (width * height) / 1_000_000.0
-                return record._resolution_mpx
+                size = (int(image.size[0]), int(image.size[1]))
         except Exception:
+            size = None
+        return self._set_record_image_size(record, size)
+
+    def _ratio_fix_needed(self, record: ImageRecord) -> bool:
+        """True when the image size is known and fits none of the allowed ratios."""
+        if not self._allowed_ratios or record._image_size is None:
+            return False
+        # Cached: this runs for every record on each selection change (status
+        # count) and for every row on filter evaluation.
+        if record._ratio_fix_needed is None:
+            width, height = record._image_size
+            record._ratio_fix_needed = matching_ratio(width, height, self._allowed_ratios) is None
+        return record._ratio_fix_needed
+
+    def _ratio_autofix_candidate(self, record: ImageRecord) -> CropCandidate | None:
+        """The centre crop Batch Autofix ratio would apply, or None (fits, or too far off)."""
+        if not self._allowed_ratios or record._image_size is None:
             return None
+        if record._ratio_autofix is _UNKNOWN:
+            width, height = record._image_size
+            record._ratio_autofix = autofix_crop(width, height, self._allowed_ratios)
+        return record._ratio_autofix  # type: ignore[return-value]
+
+    def _record_needs_fixup(self, record: ImageRecord) -> bool:
+        """Fixup pipeline membership: pending sidecar fixup or a ratio to fix."""
+        return record.has_pending_fixup or self._ratio_fix_needed(record)
+
+    def _visible_ratio_fixup_records(self) -> list[ImageRecord]:
+        """Listed (not filtered out) records whose ratio is not an allowed one."""
+        if not self._allowed_ratios:
+            return []
+        filtered = bool(self.filter_input.text().strip())
+        result: list[ImageRecord] = []
+        for index, record in enumerate(self.records):
+            if filtered:
+                item = self.list_widget.item(index)
+                if item is not None and item.isHidden():
+                    continue
+            if self._ratio_fix_needed(record):
+                result.append(record)
+        return result
+
+    def _update_ratio_status(self) -> None:
+        """Refresh the status-bar ratio count and the Batch Autofix ratio button."""
+        if not self._allowed_ratios:
+            self.status_ratio_label.setVisible(False)
+            self.batch_autofix_ratio_button.setEnabled(False)
+            return
+        needing_fix = self._visible_ratio_fixup_records()
+        autofixable = sum(1 for record in needing_fix if self._ratio_autofix_candidate(record) is not None)
+        count = len(needing_fix)
+        if count:
+            self.status_ratio_label.setText(f"\u2702\ufe0f {count} ratio fixup{'s' if count != 1 else ''}")
+            self.status_ratio_label.setToolTip(
+                f"{count} listed image{'s' if count != 1 else ''} without an allowed aspect ratio "
+                f"({autofixable} autofixable)"
+            )
+        self.status_ratio_label.setVisible(bool(count))
+
+        busy = self._llm_thread is not None or self._ratio_autofix_thread is not None
+        self.batch_autofix_ratio_button.setEnabled(bool(autofixable) and not busy)
+        min_kept = f"{AUTOFIX_MIN_KEPT_FRACTION:.0%}"
+        if busy:
+            tooltip = "Available when the running batch has finished"
+        elif autofixable:
+            tooltip = (
+                f"Crop {autofixable} listed image{'s' if autofixable != 1 else ''} at the centre "
+                f"to the closest allowed ratio (only those keeping at least {min_kept} of the pixels)"
+            )
+        elif count:
+            tooltip = (
+                f"No near misses: the closest allowed ratio must keep at least {min_kept} of the pixels. "
+                "Use Fix ratio in the Fixup dialog to place the crop by hand"
+            )
+        else:
+            tooltip = "Every listed image already has an allowed aspect ratio"
+        self.batch_autofix_ratio_button.setToolTip(tooltip)
+
+    def batch_autofix_ratio(self) -> None:
+        """Centre-crop every listed near-miss image to its closest allowed ratio."""
+        if self._llm_thread is not None or self._ratio_autofix_thread is not None:
+            return
+        targets: list[RatioAutofixTarget] = []
+        for record in self._visible_ratio_fixup_records():
+            candidate = self._ratio_autofix_candidate(record)
+            if candidate is not None and record._image_size is not None:
+                targets.append(RatioAutofixTarget(record.image_path, record._image_size, candidate))
+        if not targets:
+            self.statusBar().showMessage("Batch Autofix ratio: no listed image is a near miss")
+            self._update_ratio_status()
+            return
+
+        count = len(targets)
+        min_kept = f"{AUTOFIX_MIN_KEPT_FRACTION:.0%}"
+        answer = QMessageBox.question(
+            self,
+            "Batch Autofix ratio",
+            f"Crop {count} image{'s' if count != 1 else ''} at the centre to the closest allowed ratio?\n\n"
+            f"Only images whose closest allowed ratio keeps at least {min_kept} of the pixels are "
+            "cropped. The image files are overwritten in place; there is no undo.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        def _on_item_done(result: RatioAutofixResult) -> None:
+            if result.new_size is not None:
+                self._on_image_cropped(result.image_path, result.new_size[0], result.new_size[1])
+
+        def _on_finished(cropped: int, failed: int, stopped: bool, failures: list[RatioAutofixResult]) -> None:
+            self._ratio_autofix_thread = None
+            self._ratio_autofix_worker = None
+            if self.filter_input.text().strip():
+                self._apply_image_filter()
+            self._update_fixup_button_state()
+            self.statusBar().showMessage(show_batch_autofix_summary(self, cropped, failed, stopped, failures))
+
+        self._ratio_autofix_thread, self._ratio_autofix_worker = run_batch_autofix_ratio(
+            self, targets, _on_item_done, _on_finished
+        )
+        self._update_ratio_status()
+
+    def _on_image_cropped(self, image_path: Path, width: int, height: int) -> None:
+        """An image file was cropped (Fixup dialog or batch): refresh its record and row."""
+        record_index = self._record_index_by_path.get(image_path, -1)
+        if record_index < 0:
+            return
+        record = self.records[record_index]
+        self._set_record_image_size(record, (int(width), int(height)))
+        self._update_list_item_preview(record_index)
+        if self.current_index == record_index:
+            # Show the cropped file now and re-arm the watcher on the new mtime,
+            # so the file watcher does not reload it a second time.
+            self.image_view_controller.invalidate_pixmap_cache(image_path)
+            self._show_image(image_path)
+            self._set_watched_image(image_path)
+        if self._ratio_autofix_thread is None:
+            # Single crop from the Fixup dialog; a batch refreshes once at the end.
+            if self.filter_input.text().strip():
+                self._apply_image_filter()
+            self._update_fixup_button_state()
 
     def _build_filter_runtime(self, tag_cache: dict[Path, set[str]] | None = None) -> _FilterRuntime:
         named_filters: dict[str, Callable[[ImageRecord], bool]] = {
-            "fixup": lambda record: record.has_pending_fixup,
+            "fixup": self._record_needs_fixup,
             "untagged": lambda record: not record.text_path.exists(),
             "vision": lambda record: get_sidecar_json_path(record.image_path).exists(),
             "validated": lambda record: record.sidecar_validated is not None,
@@ -1547,7 +1793,7 @@ class MainWindow(QMainWindow):
     def _delete_image_and_related_files(self, image_path: Path, *, confirm: bool = True) -> tuple[bool, bool]:
         record_index = self._record_index_for_image_path(image_path)
         if record_index < 0:
-            return (False, any(item.has_pending_fixup for item in self.records))
+            return (False, any(self._record_needs_fixup(item) for item in self.records))
 
         record = self.records[record_index]
         if confirm and self._confirm_on_delete_enabled():
@@ -1563,7 +1809,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
-                return (False, any(item.has_pending_fixup for item in self.records))
+                return (False, any(self._record_needs_fixup(item) for item in self.records))
 
         errors: list[str] = []
         try:
@@ -1584,7 +1830,7 @@ class MainWindow(QMainWindow):
                 "Delete failed",
                 "Could not delete one or more files:\n\n" + "\n".join(errors),
             )
-            return (False, any(item.has_pending_fixup for item in self.records))
+            return (False, any(self._record_needs_fixup(item) for item in self.records))
 
         was_current = self.current_index == record_index
         self.records.pop(record_index)
@@ -1619,7 +1865,7 @@ class MainWindow(QMainWindow):
         elif self.current_index > record_index:
             self.current_index -= 1
 
-        has_fixups_remaining = any(item.has_pending_fixup for item in self.records)
+        has_fixups_remaining = any(self._record_needs_fixup(item) for item in self.records)
         self.statusBar().showMessage(f"Deleted {record.image_path.name}")
         return (True, has_fixups_remaining)
 
@@ -1880,6 +2126,10 @@ class MainWindow(QMainWindow):
         if active_badges is None:
             badge_specs = self._list_item_badge_specs(record)
             active_badges = frozenset(s.text for s in badge_specs)
+        elif self._ratio_fix_needed(record):
+            # The loader computes sidecar badges only; the ratio badge needs
+            # the allowed-ratios list, which lives here.
+            active_badges = active_badges | {"✂️"}
 
         # Pre-scale thumbnail once so the delegate draws it without per-paint work.
         pixmap: QPixmap | None = None
@@ -1947,7 +2197,7 @@ class MainWindow(QMainWindow):
         for symbol in self._IMAGE_ROW_BADGE_SLOT_ORDER:
             if symbol not in active_badges:
                 continue
-            if symbol == "⚖️":
+            if symbol in ("⚖️", "✂️"):
                 specs.append(_ListItemBadgeSpec(text=symbol, background=danger_color, foreground=danger_fg))
             elif symbol == "✅":
                 specs.append(_ListItemBadgeSpec(text=symbol, background=success_color, foreground=success_fg))
@@ -1960,6 +2210,8 @@ class MainWindow(QMainWindow):
         active: set[str] = set()
         if sidecar.fixup_issues or sidecar.fixup_tags or sidecar.fixup_description:
             active.add("⚖️")
+        if self._ratio_fix_needed(record):
+            active.add("✂️")
         if sidecar.vision_tags or (sidecar.vision_caption or "").strip():
             active.add("✨")
         if sidecar.ai_find_matches:
@@ -1978,6 +2230,8 @@ class MainWindow(QMainWindow):
     def _badge_label_for_symbol(symbol: str) -> str:
         if symbol == "⚖️":
             return "fixup"
+        if symbol == "✂️":
+            return "ratio fixup"
         if symbol == "✨":
             return "vision"
         if symbol == "🔍":
@@ -2050,6 +2304,13 @@ class MainWindow(QMainWindow):
             active_symbols = {badge.text for badge in badges}
             legend = [f"{badge.text} {self._badge_label_for_symbol(badge.text)}" for badge in badges]
             parts.append(f"Badges: {', '.join(legend)}")
+            if "✂️" in active_symbols and record._image_size is not None:
+                width, height = record._image_size
+                candidate = self._ratio_autofix_candidate(record)
+                ratio_line = f"Ratio {width}x{height} is not an allowed ratio"
+                if candidate is not None:
+                    ratio_line += f" (autofixable: {candidate.ratio.label}, {candidate.width}x{candidate.height})"
+                parts.append(ratio_line)
             if "✅" in active_symbols:
                 sidecar = read_sidecar_data(record.image_path)
                 if sidecar.validated is not None:
@@ -2562,6 +2823,8 @@ class MainWindow(QMainWindow):
         self.llm_retry_input.setEnabled(False)
         self.llm_max_resolution_input.setEnabled(False)
         self.llm_threads_input.setEnabled(False)
+        self.llm_think_tags_checkbox.setEnabled(False)
+        self.llm_think_description_checkbox.setEnabled(False)
         self.llm_use_button.setEnabled(False)
         self._llm_action_name = action_name
         self._llm_cancel = cancel_token

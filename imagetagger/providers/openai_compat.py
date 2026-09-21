@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from imagetagger.utils.image_prep import prepare_image_for_query
-from imagetagger.providers.llm_provider import LlmProviderCancelled, LlmProviderError, LlmRequestCancellation
+from imagetagger.providers.llm_provider import (
+    GeneratedText,
+    LlmProviderCancelled,
+    LlmProviderError,
+    LlmRequestCancellation,
+)
 from imagetagger.providers.http_request import request_json
 
 
@@ -83,6 +88,7 @@ def generate_with_image(
     timeout: float = DEFAULT_TIMEOUT,
     cancellation: LlmRequestCancellation | None = None,
     temperature: float | None = None,
+    think: bool | None = None,
 ) -> str:
     payload: dict[str, object] = {
         "model": connection.model_name,
@@ -99,6 +105,10 @@ def generate_with_image(
     }
     if temperature is not None:
         payload["temperature"] = float(temperature)
+    # vLLM, llama.cpp server and SGLang route this into the chat template's
+    # ``enable_thinking`` switch; servers that do not know it ignore it.
+    if think is not None:
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(think)}
 
     response_payload = request_json(
         server=connection.server_url,
@@ -179,4 +189,10 @@ def generate_with_image(
         except Exception:
             pass
         raise OpenAiCompatError("Server returned an empty response.")
-    return content
+    thinking_text = ""
+    for key in ("reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            thinking_text = value.strip()
+            break
+    return GeneratedText(content, thinking=thinking_text)

@@ -6,7 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from imagetagger.utils.image_prep import prepare_image_for_query
-from imagetagger.providers.llm_provider import LlmProviderCancelled, LlmProviderError, LlmRequestCancellation
+from imagetagger.providers.llm_provider import (
+    GeneratedText,
+    LlmProviderCancelled,
+    LlmProviderError,
+    LlmRequestCancellation,
+)
 from imagetagger.providers.http_request import request_json, discard_pooled_connection_for_server
 
 
@@ -68,6 +73,7 @@ def generate_with_image(
     cancellation: LlmRequestCancellation | None = None,
     thread_count: int | None = None,
     temperature: float | None = None,
+    think: bool | None = None,
 ) -> str:
     payload: dict[str, object] = {
         "model": connection.model_name,
@@ -75,6 +81,12 @@ def generate_with_image(
         "images": [_encode_image(image_path)],
         "stream": False,
     }
+    # Ollama's per-request thinking switch.  ``False`` is sent explicitly
+    # because Ollama enables thinking by default on models that support it
+    # (Qwen3, Gemma 4, ...); a non-thinking model simply ignores ``False``.
+    # When enabled, the trace comes back in the separate ``thinking`` field.
+    if think is not None:
+        payload["think"] = bool(think)
 
     options: dict[str, object] = {}
     if thread_count is not None:
@@ -142,4 +154,8 @@ def generate_with_image(
         # result, so callers should skip further retries and warn the user.
         err.context_exhausted = _context_exhausted
         raise err
-    return response.strip()
+    thinking_text = response_payload.get("thinking")
+    return GeneratedText(
+        response.strip(),
+        thinking=thinking_text.strip() if isinstance(thinking_text, str) else "",
+    )

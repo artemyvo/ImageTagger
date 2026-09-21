@@ -20,6 +20,10 @@ DEFAULT_ALLOWED_RATIOS = "1:1, 2:3, 3:4, 4:5, 16:9"
 # Guards against absurd config values such as "1:100000".
 _MAX_RATIO_TERM = 10_000
 
+# "Autofix ratio" crops without asking when at least this share of the pixels
+# survives: the strip that goes is thin enough that its position cannot matter.
+AUTOFIX_MIN_KEPT_FRACTION = 0.99
+
 
 @dataclass(frozen=True)
 class AspectRatio:
@@ -46,7 +50,7 @@ class AspectRatio:
 
 @dataclass(frozen=True)
 class CropCandidate:
-    """The largest crop of an image that has exactly ``ratio``."""
+    """The largest crop of an image that fits ``ratio`` (see ``crop_candidates``)."""
 
     ratio: AspectRatio  # oriented the same way as the crop (w:h)
     width: int
@@ -158,10 +162,12 @@ def matching_ratio(width: int, height: int, allowed: Iterable[AspectRatio]) -> A
 def crop_candidates(width: int, height: int, allowed: Iterable[AspectRatio]) -> list[CropCandidate]:
     """All possible ratio fixes for an image, closest (most pixels kept) first.
 
-    Every candidate is the largest crop whose size is an exact multiple of the
-    ratio, so the result has *exactly* that ratio (``999x1332`` rather than
-    ``1000x1333`` for 3:4).  Both orientations of every allowed ratio are
-    offered; ties prefer the image's own orientation.
+    Every candidate spans the whole image along the axis the ratio constrains
+    and rounds the other side to the nearest pixel (``467x831`` for 9:16 on a
+    530x831 image), so no strip is lost to make the size an exact multiple of
+    the ratio.  The result is within the one-pixel rounding that
+    ``matching_ratio`` already accepts as fitting.  Both orientations of every
+    allowed ratio are offered; ties prefer the image's own orientation.
     """
     if width <= 0 or height <= 0:
         return []
@@ -170,10 +176,16 @@ def crop_candidates(width: int, height: int, allowed: Iterable[AspectRatio]) -> 
     image_is_landscape = width >= height
     candidates: list[CropCandidate] = []
     for ratio in _oriented(allowed):
-        scale = min(width // ratio.w, height // ratio.h)
-        if scale <= 0:
-            continue
-        crop_w, crop_h = ratio.w * scale, ratio.h * scale
+        if width * ratio.h <= height * ratio.w:
+            # The image is taller than the ratio: keep the full width.
+            crop_w = width
+            crop_h = min(height, max(1, round(width * ratio.h / ratio.w)))
+        else:
+            # The image is wider than the ratio: keep the full height.
+            crop_h = height
+            crop_w = min(width, max(1, round(height * ratio.w / ratio.h)))
+        if not _fits(crop_w, crop_h, ratio):
+            continue  # only for tiny images, where rounding is too coarse
         candidates.append(
             CropCandidate(
                 ratio=ratio,
@@ -195,3 +207,27 @@ def closest_crop(width: int, height: int, allowed: Iterable[AspectRatio]) -> Cro
     """The ratio fix that discards the fewest pixels, or ``None``."""
     candidates = crop_candidates(width, height, allowed)
     return candidates[0] if candidates else None
+
+
+def autofix_crop(width: int, height: int, allowed: Iterable[AspectRatio]) -> CropCandidate | None:
+    """The closest ratio fix if it keeps ``AUTOFIX_MIN_KEPT_FRACTION`` of the pixels.
+
+    Returns ``None`` when the image already has an allowed ratio (nothing to
+    fix) or when the closest fix would discard more than the tolerated share,
+    in which case the user should place the crop frame by hand.
+    """
+    if matching_ratio(width, height, allowed) is not None:
+        return None
+    closest = closest_crop(width, height, allowed)
+    if closest is None or closest.kept_fraction < AUTOFIX_MIN_KEPT_FRACTION:
+        return None
+    return closest
+
+
+def centered_crop_box(width: int, height: int, crop_width: int, crop_height: int) -> tuple[int, int, int, int]:
+    """``(left, top, right, bottom)`` of a ``crop_width x crop_height`` box centred in the image."""
+    crop_width = max(1, min(crop_width, width))
+    crop_height = max(1, min(crop_height, height))
+    left = (width - crop_width) // 2
+    top = (height - crop_height) // 2
+    return (left, top, left + crop_width, top + crop_height)

@@ -18,6 +18,8 @@ def create_server_settings_frame(
     retry_input: QLineEdit | None = None,
     max_resolution_input: QLineEdit | None = None,
     threads_input: QLineEdit | None = None,
+    think_tags_checkbox: QCheckBox | None = None,
+    think_description_checkbox: QCheckBox | None = None,
 ) -> QFrame:
     frame = QFrame(parent)
     frame.setFrameShape(QFrame.Shape.StyledPanel)
@@ -68,5 +70,15 @@ def create_server_settings_frame(
             params_row.addWidget(widget)
         params_row.addStretch(1)
         layout.addLayout(params_row)
+
+    think_checkboxes = [cb for cb in (think_tags_checkbox, think_description_checkbox) if cb is not None]
+    if think_checkboxes:
+        think_row = QHBoxLayout()
+        think_row.setContentsMargins(0, 0, 0, 0)
+        think_row.addWidget(QLabel("Thinking", parent))
+        for cb in think_checkboxes:
+            think_row.addWidget(cb)
+        think_row.addStretch(1)
+        layout.addLayout(think_row)
 
     return frame

@@ -34,11 +34,12 @@ Each image in the file list can show one or more status badges. Badges indicate 
 | Badge | Meaning | Source |
 |---|---|---|
 | ⚖️ | Fixup pending — the image has AI-proposed tag or description corrections waiting for review | Written by **Validate** |
+| ✂️ | Ratio fixup — the image size is not one of the `allowed_ratios` and needs a crop | Image size checked by the folder loader (see [Aspect Ratio Fixup](#aspect-ratio-fixup-in-the-main-window)) |
 | ✨ | Vision/Refine data available — the image has a vision caption or refine tags ready for comparison in the merge dialog | Written by **Generate** (with Refine enabled) |
 | 🔍 | AI Find match — at least one AI Find query matched this image | Written by **AI Find** |
 | ✅ | Validated — the image passed its last validation pass with no outstanding issues | Set by **Validate** (model returned OK) or by the user completing a merge in the **Fixup** dialog |
 
-Badges reflect the current state of the image's `.json` sidecar. They update automatically after each operation.
+Badges reflect the current state of the image's `.json` sidecar (✂️ reflects the image file itself). They update automatically after each operation.
 
 **Validated tooltip.** Hovering over a ✅-badged image in the list shows a tooltip with the validation date and source, for example: *"Validated by Qwen3-VL-8B on 2026-05-08"* or *"Validated by user on 2026-05-08"*. This lets you see at a glance whether a human or a model signed off on the annotation.
 
@@ -102,6 +103,7 @@ Generate adds tags, description, and/or vision annotations to selected images.
 - Retries can be configured.
 - Downscale controls image query resolution before sending to the model.
 - Threads can be fixed or set to 0 for auto behavior.
+- Thinking checkboxes (Tags / Description) let a thinking-capable model such as Gemma 4 or Qwen3-VL reason before answering. Both are off by default because thinking roughly doubles per-image time; ImageTagger sends an explicit off so Ollama does not enable it on its own. The Tags switch covers Tags, Validate, and AI Find; the Description switch covers Description, Vision, and Refine. With Vision, a native thinking trace is saved as the sidecar `reasoning` when the response has no THOUGHT section.
 - Default is 1 thread for safety; on strong GPUs, especially RTX 3090-class and newer hardware running Qwen3-VL-8B, testing higher values up to 16 can produce substantial speedups.
 - Setting threads to 0 enables automatic balancing; after it settles, it usually gives good results and the live thread count is visible in the status line while a task is running.
 
@@ -160,6 +162,7 @@ Fixup opens the merge dialog for the current image when a fixup exists.
 Inside the merge dialog, regeneration has local controls that can override your main-window defaults for the current fixup pass:
 
 - Server URL input, Fetch models, model dropdown, and Use button let you switch regenerate calls to a different Ollama/OpenAI-compatible endpoint and model.
+- Temp and Think controls under the Tags and Description checkboxes set the temperature and the thinking switch for each regenerate query. The Think state is shared with the main-window Thinking checkboxes.
 - Description prompt and Tags prompt tabs let you locally edit prompt text used by regenerate.
 - These overrides are scoped to merge-dialog regenerate behavior and do not replace your main-window model selection.
 
@@ -197,12 +200,26 @@ Trainers batch images by aspect ratio, so a dataset that sticks to a few ratios 
 - The frame always has the largest possible size for the ratio, so you only choose its position: drag it, click outside it to re-centre it under the pointer, scroll over the image, or use the arrow keys (Shift+arrow moves 10x further).
 - The Ratio dropdown lists every allowed ratio in both orientations, closest first, in case another one suits the picture better.
 - **Apply** (Enter) crops the image file in place and reloads it; **Cancel** (Esc) leaves the file untouched. While the frame is shown the rest of the dialog is parked, and Esc leaves the crop mode instead of closing the dialog.
+- **Autofix ratio** (Alt+C) is the one-click version for near misses. It is enabled only when the closest allowed ratio keeps at least 99% of the pixels (for example 1920x1090 to 16:9, or 1024x1360 to 3:4); the strip that goes is then too thin for its position to matter, so the image is cropped at the centre right away, with no frame and no confirmation. For anything further off, the button stays disabled and Fix ratio lets you place the crop by hand.
 
-Apply overwrites the image file; there is no undo, so keep your source images elsewhere. The crop keeps the file format, EXIF, ICC profile and PNG text chunks (for example Stable Diffusion generation parameters). JPEGs are re-encoded with the original quantization tables and chroma subsampling, and the cropped size is an exact multiple of the ratio (for example 999x1332 for 3:4). A symlinked image is cropped at its target. Animated images and 16-bit RGB PNGs are refused.
+Apply and Autofix ratio overwrite the image file; there is no undo, so keep your source images elsewhere. The crop keeps the file format, EXIF, ICC profile and PNG text chunks (for example Stable Diffusion generation parameters). JPEGs are re-encoded with the original quantization tables and chroma subsampling. The crop spans the full image along one axis and the other side is rounded to the nearest pixel (for example 467x831 for 9:16 on a 530x831 image), so no strip is lost to exactness; the result is within the same one-pixel tolerance the ratio check accepts. A symlinked image is cropped at its target. Animated images and 16-bit RGB PNGs are refused.
 
-Fix ratio is unavailable while a regeneration is running, because the model is looking at the uncropped file.
+Fix ratio and Autofix ratio are unavailable while a regeneration is running, because the model is looking at the uncropped file.
 
-Set `"allowed_ratios": ""` to turn the check off and hide the button.
+Set `"allowed_ratios": ""` to turn the check off and hide both buttons.
+
+### Aspect Ratio Fixup in the Main Window
+
+The same `allowed_ratios` check runs on every image when a folder is loaded (the loader already reads the image header for the thumbnail, so this costs nothing extra).
+
+- Images whose size is not an allowed ratio carry the ✂️ badge in the image list. The row tooltip names the size and, for near misses, the crop Autofix would apply.
+- Such images count as needing fixup: they are part of the Fixup pipeline (the Fixup dialog's prev/next navigation, "x of y" counter, Alt+F / Alt+L jumps) and match the `fixup` filter, even without any pending sidecar fixup. Open the Fixup dialog on one of them to crop it with Fix ratio or Autofix ratio; the badge clears as soon as the crop lands.
+- The status bar shows how many listed images still need a ratio fixup (respecting the active filter), for example *✂️ 7 ratio fixups*. It disappears when there are none.
+- **Batch Autofix ratio** (next to Bulk Fixup) applies the merge dialog's Autofix rule to the whole list at once: every listed image whose closest allowed ratio keeps at least 99% of the pixels is cropped at the centre. Images further off are left for Fix ratio. A confirmation names the number of images; a progress dialog with a Stop button follows, and stopping keeps the crops already made. Failures (for example animated images) are listed at the end. The button is enabled only when at least one listed image is a near miss and no batch operation is running.
+
+Batch Autofix ratio overwrites image files in place, like Autofix ratio in the merge dialog; there is no undo.
+
+With `"allowed_ratios": ""` the badge, the status count and the button are all hidden.
 
 ### Merge Dialog Mouse Actions
 
@@ -257,7 +274,7 @@ Use the image list filter to narrow large datasets quickly.
 
 Supported terms:
 
-- `fixup`: images with pending fixup data in their sidecar.
+- `fixup`: images that need a fixup: pending fixup data in their sidecar (⚖️) or a ratio to fix (✂️).
 - `untagged`: images that have no annotation (.txt) file at all.
 - `validated`: images that have passed validation (carry the ✅ badge).
 - `resolution <, >, <=, >=`: images matching a resolution threshold in megapixels.

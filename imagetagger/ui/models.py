@@ -14,6 +14,16 @@ class ImageRecord:
     text: str
     _sidecar_has_pending_fixup: bool | None = field(default=None, repr=False)
     _resolution_mpx: float | None = field(default=None, repr=False)
+    # Stored pixel size (width, height) as read by the folder loader; None when
+    # the file could not be opened.  Kept in the file's own pixel grid (no EXIF
+    # orientation applied), the grid the ratio crop works in.
+    _image_size: tuple[int, int] | None = field(default=None, repr=False)
+    # Cached "size fits none of the allowed ratios" verdict for _image_size;
+    # None until MainWindow._ratio_fix_needed has computed it.
+    _ratio_fix_needed: bool | None = field(default=None, repr=False)
+    # Cached Autofix crop for _image_size (a CropCandidate or None);
+    # _UNKNOWN until MainWindow._ratio_autofix_candidate has computed it.
+    _ratio_autofix: object = field(default_factory=lambda: _UNKNOWN, repr=False)
     # _UNKNOWN means "not yet loaded"; None means "loaded, no validated timestamp"
     _sidecar_validated: object = field(default_factory=lambda: _UNKNOWN, repr=False)
 

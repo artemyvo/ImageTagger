@@ -139,8 +139,7 @@ class CropOverlay(QWidget):
         """Room the frame has to move along x and y, in image pixels.
 
         A maximal crop spans the image along one axis, so only the other axis
-        has real room; the spanning axis keeps at most a few pixels of slack
-        from sizing the frame as an exact multiple of the ratio.
+        has room to move.
         """
         return (self._image_w - self._crop_w, self._image_h - self._crop_h)
 

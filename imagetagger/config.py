@@ -38,6 +38,8 @@ _DEFAULTS: dict = {
     "llm_model": "",
     "merge_dialog_tags_temperature": 0.8,
     "merge_dialog_description_temperature": 0.8,
+    "llm_think_tags": False,
+    "llm_think_description": False,
     "llm_max_resolution_mpx": 5,
     "llm_threads": 1,
     "llm_auto_max_threads": 48,
@@ -185,6 +187,14 @@ def _normalize_loaded_config(data: Any) -> dict:
         float(_DEFAULTS["merge_dialog_description_temperature"]),
         minimum=0.0,
         maximum=2.0,
+    )
+    normalized["llm_think_tags"] = _normalize_bool(
+        data.get("llm_think_tags"),
+        _DEFAULTS["llm_think_tags"],
+    )
+    normalized["llm_think_description"] = _normalize_bool(
+        data.get("llm_think_description"),
+        _DEFAULTS["llm_think_description"],
     )
     normalized["llm_max_resolution_mpx"] = _normalize_number(
         data.get("llm_max_resolution_mpx", data.get("ollama_max_resolution_mpx")),

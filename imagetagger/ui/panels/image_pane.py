@@ -1,8 +1,8 @@
 """Image pane widget for FixupDialog.
 
 Encapsulates image display, file-watching, the right-click context menu for
-the image, and the "Fix ratio" crop mode.  Emits signals instead of calling
-back into the dialog.
+the image, the "Fix ratio" crop mode and the one-click "Autofix ratio" crop.
+Emits signals instead of calling back into the dialog.
 """
 
 from __future__ import annotations
@@ -30,7 +30,12 @@ from PyQt6.QtWidgets import (
 from imagetagger.ui.crop_overlay import CropOverlay
 from imagetagger.ui.image_reload_helper import ImageReloadHelper
 from imagetagger.ui.scalable_image_label import ScalableImageLabel
-from imagetagger.utils.aspect_ratio import AspectRatio, CropCandidate, crop_candidates
+from imagetagger.utils.aspect_ratio import (
+    AspectRatio,
+    CropCandidate,
+    centered_crop_box,
+    crop_candidates,
+)
 from imagetagger.utils.external_editors import (
     ExternalEditor,
     get_graphics_editors,
@@ -74,6 +79,8 @@ class ImagePane(QWidget):
         delete_result(bool): Emitted after a context-menu delete succeeds.
             ``True``  — has more fixup files; caller should navigate to next.
             ``False`` — no more fixup files; caller should enter no-fixups state.
+        image_cropped(Path, int, int): Emitted after Fix ratio / Autofix ratio
+            replaced the file on disk, with the new (width, height).
         dimensions_changed(int, int): Emitted with the loaded image size, or
             ``(0, 0)`` while no image is available.
         crop_mode_changed(bool): Emitted when the "Fix ratio" crop mode is
@@ -84,6 +91,7 @@ class ImagePane(QWidget):
     status_message = pyqtSignal(str)
     delete_result = pyqtSignal(bool)
     dimensions_changed = pyqtSignal(int, int)
+    image_cropped = pyqtSignal(object, int, int)  # (Path, new width, new height)
     crop_mode_changed = pyqtSignal(bool)
 
     def __init__(
@@ -352,23 +360,54 @@ class ImagePane(QWidget):
         candidate = self._current_crop_candidate()
         if not self._crop_mode_active or image_path is None or candidate is None:
             return
+        box = self._crop_overlay.crop_box()
+        # The size the frame was laid out on: refuses the crop if the file on
+        # disk is no longer the image the user framed.
+        expected_size = self._crop_overlay.image_size()
+        # On success the reload ends crop mode; on failure the frame stays up.
+        self._crop_current_image("Fix ratio", box, expected_size, candidate)
+
+    def autofix_ratio(self, candidate: CropCandidate) -> bool:
+        """Crop the current image to ``candidate`` at the centre, without crop mode.
+
+        Used for near-miss ratios where the discarded strip is too thin for
+        its position to matter.  Returns ``True`` when the file was cropped.
+        """
+        image_path = self._current_image_path
+        image_size = self._image_size
+        if self._crop_mode_active or image_path is None or image_size is None:
+            return False
+        width, height = image_size
+        if candidate.width > width or candidate.height > height:
+            return False
+        box = centered_crop_box(width, height, candidate.width, candidate.height)
+        return self._crop_current_image("Autofix ratio", box, image_size, candidate)
+
+    def _crop_current_image(
+        self,
+        action_name: str,
+        box: tuple[int, int, int, int],
+        expected_size: tuple[int, int] | None,
+        candidate: CropCandidate,
+    ) -> bool:
+        """Crop the current file in place to ``box`` and reload it.
+
+        Returns ``False`` (after showing the error) when the crop failed; the
+        file is then untouched.  Note that the reload cancels crop mode.
+        """
+        image_path = self._current_image_path
+        if image_path is None:
+            return False
 
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            new_width, new_height = crop_image_file(
-                image_path,
-                self._crop_overlay.crop_box(),
-                # The size the frame was laid out on: refuses the crop if the
-                # file on disk is no longer the image the user framed.
-                expected_size=self._crop_overlay.image_size(),
-            )
+            new_width, new_height = crop_image_file(image_path, box, expected_size=expected_size)
         except ImageCropError as exc:
             QApplication.restoreOverrideCursor()
-            QMessageBox.warning(self, "Fix ratio failed", f"Could not crop {image_path.name}:\n{exc}")
-            return
+            QMessageBox.warning(self, f"{action_name} failed", f"Could not crop {image_path.name}:\n{exc}")
+            return False
         QApplication.restoreOverrideCursor()
 
-        self._end_crop_mode()
         try:
             self._self_written_mtime_ns = image_path.stat().st_mtime_ns
         except OSError:
@@ -379,6 +418,8 @@ class ImagePane(QWidget):
         self.status_message.emit(
             f"Cropped {image_path.name} to {new_width}\u00d7{new_height} ({candidate.ratio.label})"
         )
+        self.image_cropped.emit(image_path, new_width, new_height)
+        return True
 
     # ------------------------------------------------------------------
     # Internal helpers

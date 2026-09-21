@@ -83,6 +83,8 @@ class RegeneratePanel(QWidget):
         regenerate_retry_count: int = 3,
         regenerate_tags_temperature: float | None = None,
         regenerate_description_temperature: float | None = None,
+        regenerate_tags_think: bool = False,
+        regenerate_description_think: bool = False,
         regenerate_max_resolution_mpx: float = 5.0,
         regenerate_model_name: str = "",
         regenerate_model_endpoint: str = "",
@@ -133,6 +135,20 @@ class RegeneratePanel(QWidget):
         self.regenerate_description_temperature_input = self._create_temperature_spinbox()
         self.regenerate_description_temperature_input.setToolTip(
             "Temperature for description regeneration."
+        )
+
+        self.regenerate_tags_think_checkbox = QCheckBox("Think", self)
+        self.regenerate_tags_think_checkbox.setChecked(bool(regenerate_tags_think))
+        self.regenerate_tags_think_checkbox.setToolTip(
+            "Let the model think before answering the tags query. Slower.\n"
+            "Sent as Ollama's think flag or enable_thinking for OpenAI-compatible servers."
+        )
+
+        self.regenerate_description_think_checkbox = QCheckBox("Think", self)
+        self.regenerate_description_think_checkbox.setChecked(bool(regenerate_description_think))
+        self.regenerate_description_think_checkbox.setToolTip(
+            "Let the model think before answering the description query. Slower.\n"
+            "Sent as Ollama's think flag or enable_thinking for OpenAI-compatible servers."
         )
 
         self._stored_timeout_seconds: float = float(max(1, int(regenerate_timeout_seconds)))
@@ -278,7 +294,11 @@ class RegeneratePanel(QWidget):
         selection_grid.addWidget(self.regenerate_tags_checkbox, 0, 0)
         selection_grid.addWidget(self.regenerate_description_checkbox, 0, 1)
         selection_grid.addWidget(
-            self._create_temperature_editor("Temp", self.regenerate_tags_temperature_input),
+            self._create_temperature_editor(
+                "Temp",
+                self.regenerate_tags_temperature_input,
+                self.regenerate_tags_think_checkbox,
+            ),
             1,
             0,
         )
@@ -286,6 +306,7 @@ class RegeneratePanel(QWidget):
             self._create_temperature_editor(
                 "Temp",
                 self.regenerate_description_temperature_input,
+                self.regenerate_description_think_checkbox,
             ),
             1,
             1,
@@ -378,6 +399,8 @@ class RegeneratePanel(QWidget):
             self.regenerate_description_checkbox,
             self.regenerate_tags_temperature_input,
             self.regenerate_description_temperature_input,
+            self.regenerate_tags_think_checkbox,
+            self.regenerate_description_think_checkbox,
             self.llm_endpoint_input,
             self.llm_fetch_button,
             self.llm_model_combo,
@@ -399,13 +422,21 @@ class RegeneratePanel(QWidget):
             use_button=self.llm_use_button,
         )
 
-    def _create_temperature_editor(self, label_text: str, editor: QDoubleSpinBox) -> QWidget:
+    def _create_temperature_editor(
+        self,
+        label_text: str,
+        editor: QDoubleSpinBox,
+        think_checkbox: QCheckBox | None = None,
+    ) -> QWidget:
         widget = QWidget(self)
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         layout.addWidget(QLabel(label_text, widget))
         layout.addWidget(editor)
+        if think_checkbox is not None:
+            layout.addSpacing(8)
+            layout.addWidget(think_checkbox)
         layout.addStretch(1)
         return widget
 
@@ -554,6 +585,12 @@ class RegeneratePanel(QWidget):
         self.regenerate_description_temperature_input.setEnabled(
             (not working) and self.regenerate_description_checkbox.isChecked()
         )
+        self.regenerate_tags_think_checkbox.setEnabled(
+            (not working) and self.regenerate_tags_checkbox.isChecked()
+        )
+        self.regenerate_description_think_checkbox.setEnabled(
+            (not working) and self.regenerate_description_checkbox.isChecked()
+        )
         self.llm_endpoint_input.setEnabled(not working)
         self.llm_fetch_button.setEnabled(not working and self._llm_provider is not None)
         self.llm_model_combo.setEnabled(not working)
@@ -626,6 +663,12 @@ class RegeneratePanel(QWidget):
 
     def _regenerate_description_temperature(self) -> float:
         return float(self.regenerate_description_temperature_input.value())
+
+    def _regenerate_tags_think(self) -> bool:
+        return bool(self.regenerate_tags_think_checkbox.isChecked())
+
+    def _regenerate_description_think(self) -> bool:
+        return bool(self.regenerate_description_think_checkbox.isChecked())
 
     def _regenerate_max_resolution_mpx(self) -> float:
         return self._stored_max_resolution_mpx
@@ -776,6 +819,7 @@ class RegeneratePanel(QWidget):
                                 cancellation=cancel_token,
                                 thread_count=1,
                                 temperature=self._regenerate_description_temperature(),
+                                think=self._regenerate_description_think(),
                             ).strip()
                         )
                     if tags_prompt is not None:
@@ -788,6 +832,7 @@ class RegeneratePanel(QWidget):
                                     cancellation=cancel_token,
                                     thread_count=1,
                                     temperature=self._regenerate_tags_temperature(),
+                                    think=self._regenerate_tags_think(),
                                 )
                             )
                         )
@@ -825,16 +870,16 @@ class RegeneratePanel(QWidget):
         # Mutate the main window's shared config dict when available so the
         # update is not clobbered by a subsequent save of that same dict.
         cfg = self._shared_cfg if self._shared_cfg is not None else _config.load()
-        tags_temperature = self._regenerate_tags_temperature()
-        description_temperature = self._regenerate_description_temperature()
-
-        previous_tags = cfg.get("merge_dialog_tags_temperature")
-        previous_description = cfg.get("merge_dialog_description_temperature")
-        if previous_tags == tags_temperature and previous_description == description_temperature:
+        updates = {
+            "merge_dialog_tags_temperature": self._regenerate_tags_temperature(),
+            "merge_dialog_description_temperature": self._regenerate_description_temperature(),
+            "llm_think_tags": self._regenerate_tags_think(),
+            "llm_think_description": self._regenerate_description_think(),
+        }
+        if all(cfg.get(key) == value for key, value in updates.items()):
             return
 
-        cfg["merge_dialog_tags_temperature"] = tags_temperature
-        cfg["merge_dialog_description_temperature"] = description_temperature
+        cfg.update(updates)
         _config.save(cfg)
 
     def _on_regenerate_finished(self, payload: object) -> None:

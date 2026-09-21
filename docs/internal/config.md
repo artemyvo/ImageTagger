@@ -42,6 +42,8 @@ All settings are stored in `config.json` in the project root. The file is writte
 | `llm_model` | string | `""` | Model name to request from the server. |
 | `llm_max_resolution_mpx` | number | `5.0` | Maximum resolution (in megapixels) to which images are downscaled before being sent to the model. Minimum `0.01`. |
 | `llm_threads` | integer | `1` | Number of parallel inference requests. Set to `0` to enable auto mode (see [Ollama Settings](ollama_settings.md)). Minimum `0`. |
+| `llm_think_tags` | boolean | `false` | Let the model think (chain-of-thought) before answering tag-style queries: Tags, Validate, AI Find, and tags regeneration in the merge dialog. Sent as Ollama's `think` request flag, or as `chat_template_kwargs.enable_thinking` to OpenAI-compatible servers. |
+| `llm_think_description` | boolean | `false` | Same switch for description-style queries: Description, Vision, Refine, and description regeneration in the merge dialog. When enabled and the Vision response has no `THOUGHT:` section, the model's own thinking trace is stored as the sidecar `reasoning`. |
 
 ### Auto Thread Mode
 
@@ -59,7 +61,7 @@ These keys are used only when `llm_threads` is `0`. See [Ollama Settings](ollama
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allowed_ratios` | string | `"1:1, 2:3, 3:4, 4:5, 16:9"` | Comma-separated `w:h` aspect ratios a training image may have. Each ratio covers both orientations (`2:3` also allows `3:2`). The merge dialog warns in its status area when an image does not fit and offers **Fix ratio** to crop it to the closest allowed ratio. Invalid entries are dropped; if nothing valid remains the default is used. An empty string turns the check off. |
+| `allowed_ratios` | string | `"1:1, 2:3, 3:4, 4:5, 16:9"` | Comma-separated `w:h` aspect ratios a training image may have. Each ratio covers both orientations (`2:3` also allows `3:2`). The merge dialog warns in its status area when an image does not fit and offers **Fix ratio** to crop it to the closest allowed ratio (and **Autofix ratio**, a centred crop without a frame, when that ratio keeps at least 99% of the pixels). In the main window, images that do not fit carry the ✂️ badge, join the Fixup pipeline and the `fixup` filter, are counted in the status bar, and **Batch Autofix ratio** centre-crops every listed near miss at once. Invalid entries are dropped; if nothing valid remains the default is used. An empty string turns the check off. |
 
 ---
 

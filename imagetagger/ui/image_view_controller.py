@@ -50,17 +50,25 @@ class ImageViewController:
             return
 
         # Invalidate the pixmap cache so _show_image re-reads the updated file.
-        if self._cached_pixmap_path == image_path:
-            self._cached_pixmap = None
-            self._cached_pixmap_path = None
+        self.invalidate_pixmap_cache(image_path)
 
         self._show_image(image_path)
 
         record_index = w._record_index_for_image_path(image_path)
         if record_index >= 0:
+            # An external edit may have changed the size, and with it the
+            # ratio badge and fixup state.
+            w._refresh_record_image_size(w.records[record_index])
             w._update_list_item_preview(record_index)
+            w._update_fixup_button_state()
 
         w.statusBar().showMessage(f"Reloaded image: {image_path.name}")
+
+    def invalidate_pixmap_cache(self, image_path: Path) -> None:
+        """Forget the cached full-resolution pixmap for ``image_path``."""
+        if self._cached_pixmap_path == image_path:
+            self._cached_pixmap = None
+            self._cached_pixmap_path = None
 
     @staticmethod
     def _normalized_path_for_compare(path: Path) -> str:

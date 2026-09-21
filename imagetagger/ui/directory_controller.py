@@ -294,6 +294,11 @@ class DirectoryController:
                 # access to record.has_pending_fixup never hits the filesystem.
                 if isinstance(has_pending_fixup_raw, bool):
                     record._sidecar_has_pending_fixup = has_pending_fixup_raw
+                # The loader read the image header for the thumbnail; keep the
+                # size so the ratio check and the resolution filter never open
+                # the file again on the main thread.
+                if isinstance(thumb_payload, dict):
+                    w._set_record_image_size(record, thumb_payload.get("image_size"))
                 # Pre-populate the validated cache so filter evaluations never
                 # need to hit the filesystem for this record.
                 validated_raw = data.get("validated", _UNKNOWN)
@@ -353,6 +358,7 @@ class DirectoryController:
         w._refresh_tag_completions()
         w._apply_tag_list_height()
         self._restore_selection_after_load()
+        w._update_fixup_button_state()
         if w.records:
             w.statusBar().showMessage(f"Loaded {len(w.records)} images from {folder}")
             if self._icc_warning_paths:

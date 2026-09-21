@@ -59,6 +59,7 @@ class FixupController:
             if not (w.list_widget.item(i) is not None and w.list_widget.item(i).isHidden())
         )
         w.bulk_fixup_button.setEnabled(bulk_enabled)
+        w._update_ratio_status()
 
     # ------------------------------------------------------------------
     # Main window preview sync while the merge dialog is open
@@ -155,7 +156,7 @@ class FixupController:
                 continue
 
             record = w.records[index]
-            if record.has_pending_fixup:
+            if w._record_needs_fixup(record):
                 return index
 
             index += direction
@@ -175,7 +176,7 @@ class FixupController:
             if item is not None and item.isHidden():
                 continue
             record = w.records[index]
-            if record.has_pending_fixup:
+            if w._record_needs_fixup(record):
                 return index
         return None
 
@@ -212,7 +213,7 @@ class FixupController:
 
         initial_fixup_record_indices = [
             i for i, item in enumerate(w.records)
-            if item.has_pending_fixup
+            if w._record_needs_fixup(item)
         ]
         initial_fixup_total = len(initial_fixup_record_indices)
 
@@ -226,6 +227,8 @@ class FixupController:
         regenerate_description_temperature = float(
             w._cfg.get("merge_dialog_description_temperature", 0.8)
         )
+        regenerate_tags_think = w.llm_think_tags_checkbox.isChecked()
+        regenerate_description_think = w.llm_think_description_checkbox.isChecked()
         timeout_text = w.llm_timeout_input.text().strip()
         retry_text = w.llm_retry_input.text().strip()
         try:
@@ -249,6 +252,8 @@ class FixupController:
             nonlocal regenerate_retry_count
             nonlocal regenerate_tags_temperature
             nonlocal regenerate_description_temperature
+            nonlocal regenerate_tags_think
+            nonlocal regenerate_description_think
             nonlocal regenerate_max_resolution_mpx
             nonlocal regenerate_model_name
             nonlocal regenerate_model_endpoint
@@ -262,6 +267,8 @@ class FixupController:
             retry_count = values.get("retry_count")
             tags_temperature = values.get("tags_temperature")
             description_temperature = values.get("description_temperature")
+            tags_think = values.get("tags_think")
+            description_think = values.get("description_think")
             max_resolution_mpx = values.get("max_resolution_mpx")
             model_name = values.get("model_name")
             model_endpoint = values.get("model_endpoint")
@@ -279,6 +286,14 @@ class FixupController:
                 regenerate_tags_temperature = None if tags_temperature is None else float(tags_temperature)
             if description_temperature is None or isinstance(description_temperature, (int, float)) and not isinstance(description_temperature, bool):
                 regenerate_description_temperature = None if description_temperature is None else float(description_temperature)
+            # Keep the main-window thinking switches in sync with the merge
+            # dialog; setChecked also persists the value through the main window.
+            if isinstance(tags_think, bool):
+                regenerate_tags_think = tags_think
+                w.llm_think_tags_checkbox.setChecked(tags_think)
+            if isinstance(description_think, bool):
+                regenerate_description_think = description_think
+                w.llm_think_description_checkbox.setChecked(description_think)
             if isinstance(max_resolution_mpx, (int, float)) and max_resolution_mpx > 0:
                 regenerate_max_resolution_mpx = float(max_resolution_mpx)
                 w.llm_max_resolution_input.setText(w._format_mpx(regenerate_max_resolution_mpx))
@@ -341,6 +356,8 @@ class FixupController:
                 regenerate_retry_count=regenerate_retry_count,
                 regenerate_tags_temperature=regenerate_tags_temperature,
                 regenerate_description_temperature=regenerate_description_temperature,
+                regenerate_tags_think=regenerate_tags_think,
+                regenerate_description_think=regenerate_description_think,
                 regenerate_max_resolution_mpx=regenerate_max_resolution_mpx,
                 regenerate_model_name=regenerate_model_name,
                 regenerate_model_endpoint=regenerate_model_endpoint,
@@ -371,6 +388,7 @@ class FixupController:
                     confirm=False,
                 ),
                 confirm_delete=w._confirm_on_delete_enabled(),
+                on_image_cropped=w._on_image_cropped,
                 save_regenerate_settings=_capture_regenerate_settings,
                 reasoning_lines=int(w._cfg.get("merge_dialog_reasoning_lines", 5)),
                 cfg=w._cfg,
@@ -393,7 +411,7 @@ class FixupController:
                 # Deletion from merge dialog can change list indices while the dialog is open.
                 # Recompute target from current state instead of using stale pre-dialog indices.
                 current_record = w._current_record()
-                if current_record is not None and current_record.has_pending_fixup:
+                if current_record is not None and w._record_needs_fixup(current_record):
                     continue
 
                 target = self._find_adjacent_fixup_index(w.current_index, 1)

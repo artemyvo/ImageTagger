@@ -27,7 +27,7 @@ Built with PyQt6. Runs on Windows, Linux, and macOS.
 - **Batch-first.** Select any number of images and run Generate, Validate, or AI Find in one shot.
 - **Human in the loop.** The fixup workflow shows exactly what the AI wants to change. You accept, reject, or edit each suggestion before it is written.
 - **Smart filtering.** Expression-based filter lets you find exactly what needs attention: `fixup & "bird"`, `!validated & resolution > 5`, `untagged | 'blurry'`.
-- **Annotation status at a glance.** Each image in the list carries status badges — ⚖️ fixup pending (from Validate), ✨ vision/refine data ready (from Generate with Refine), 🔍 matched by AI Find, ✅ validated (from Validate or user merge) — so you always know what still needs work. Hover a ✅ image to see who validated it and when: model name or "user", plus the date.
+- **Annotation status at a glance.** Each image in the list carries status badges — ⚖️ fixup pending (from Validate), ✂️ aspect ratio to fix (not in `allowed_ratios`), ✨ vision/refine data ready (from Generate with Refine), 🔍 matched by AI Find, ✅ validated (from Validate or user merge) — so you always know what still needs work. Hover a ✅ image to see who validated it and when: model name or "user", plus the date.
 - **Customizable prompts.** Edit every workflow prompt (Tags, Description, Validation, AI Search, Vision, Refine) directly in the app. Each tab has an agent role field ("You are ..."), a Test button to see the full rendered prompt and model response against any image, and Apply / Save / Reset controls.
 
 ---
@@ -46,6 +46,7 @@ Built with PyQt6. Runs on Windows, Linux, and macOS.
 | **Regenerate in-dialog** | Switch model or prompt mid-review and regenerate fresh candidates without leaving the merge dialog |
 | **External editors** | Open With context menu auto-detects installed image editors |
 | **Auto thread mode** | Adaptive parallelism for Ollama — ramps up threads as GPU headroom allows |
+| **Thinking control** | Per-query switches for thinking-capable models (Gemma 4, Qwen3-VL) — off by default, native reasoning traces land in the sidecar |
 | **Cross-platform** | Windows, Linux, macOS — one-step install and run scripts included |
 
 ---

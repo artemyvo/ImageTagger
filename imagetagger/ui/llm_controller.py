@@ -403,6 +403,21 @@ class LlmController:
         w._update_fixup_button_state()
 
     # ------------------------------------------------------------------
+    # Thinking flags
+    # ------------------------------------------------------------------
+
+    def _think_flag_for_kind(self, kind: str) -> bool:
+        """Map a prompt kind onto the main-window thinking checkboxes.
+
+        Description, Vision and Refine follow the Description switch; Tags,
+        Validate and AI Find follow the Tags switch.
+        """
+        w = self._window
+        if kind in ("description", "vision", "refine"):
+            return w.llm_think_description_checkbox.isChecked()
+        return w.llm_think_tags_checkbox.isChecked()
+
+    # ------------------------------------------------------------------
     # Test prompt
     # ------------------------------------------------------------------
 
@@ -475,6 +490,7 @@ class LlmController:
         image_path = record.image_path
         title = w._prompt_title(kind)
         cancel_token = LlmRequestCancellation()
+        think = self._think_flag_for_kind(kind)
 
         def test_task(report_progress: Callable[[str], None]) -> str:
             return session.generate(
@@ -482,6 +498,7 @@ class LlmController:
                 prompt,
                 timeout=timeout,
                 cancellation=cancel_token,
+                think=think,
             )
 
         test_thread = QThread(w)
@@ -692,6 +709,8 @@ class LlmController:
         if not include_tags and not include_description and not include_vision and not include_refine:
             QMessageBox.information(w, "Nothing selected", "Enable Tags, Description, Vision, or Refine before generating.")
             return
+        think_tags = w.llm_think_tags_checkbox.isChecked()
+        think_description = w.llm_think_description_checkbox.isChecked()
 
         cancel_token = LlmRequestCancellation()
         session = self._active_provider_session()
@@ -777,6 +796,7 @@ class LlmController:
                                     description_query.prompt,
                                     timeout=remaining_timeout(),
                                     cancellation=cancel_token,
+                                    think=think_description,
                                 ).strip()
                             )
                             if description:
@@ -792,6 +812,7 @@ class LlmController:
                                             tags_query.prompt,
                                             timeout=remaining_timeout(),
                                             cancellation=cancel_token,
+                                            think=think_tags,
                                         )
                                     )
                                 ]
@@ -812,8 +833,14 @@ class LlmController:
                                 vision_query.prompt,
                                 timeout=remaining_timeout(),
                                 cancellation=cancel_token,
+                                think=think_description,
                             )
                             attempt_vision_reasoning, attempt_vision_description = parse_vision_response(vision_raw)
+                            if not attempt_vision_reasoning and attempt_vision_description:
+                                # Thinking-enabled models put the CoT in a separate
+                                # field instead of a THOUGHT section; keep it as the
+                                # sidecar reasoning so the trace is not lost.
+                                attempt_vision_reasoning = getattr(vision_raw, "thinking", "") or ""
 
                             if attempt_vision_reasoning or attempt_vision_description:
                                 try:
@@ -836,6 +863,7 @@ class LlmController:
                                     refine_query.prompt,
                                     timeout=remaining_timeout(),
                                     cancellation=cancel_token,
+                                    think=think_description,
                                 )
                                 attempt_refine_tags, attempt_refine_caption = parse_refine_response(refine_raw)
 
@@ -959,6 +987,7 @@ class LlmController:
 
         cancel_token = LlmRequestCancellation()
         session = self._active_provider_session()
+        think_tags = w.llm_think_tags_checkbox.isChecked()
         if session is None:
             QMessageBox.warning(w, "No model selected", f"Choose a {w._llm_provider.display_name} model first.")
             return
@@ -1013,6 +1042,7 @@ class LlmController:
                             prepare_validation_query(annotations).prompt,
                             timeout=remaining_timeout(),
                             cancellation=cancel_token,
+                            think=think_tags,
                         )
 
                         if validation_result.strip().upper() != "OK":
@@ -1135,6 +1165,7 @@ class LlmController:
 
         cancel_token = LlmRequestCancellation()
         session = self._active_provider_session()
+        think_tags = w.llm_think_tags_checkbox.isChecked()
         if session is None:
             QMessageBox.warning(w, "No model selected", f"Choose a {w._llm_provider.display_name} model first.")
             return
@@ -1190,6 +1221,7 @@ class LlmController:
                                 search_query.prompt,
                                 timeout=remaining_timeout(),
                                 cancellation=cancel_token,
+                                think=think_tags,
                             ),
                             context="AI Find",
                         )
@@ -1296,6 +1328,8 @@ class LlmController:
         w.llm_retry_input.setEnabled(False)
         w.llm_max_resolution_input.setEnabled(False)
         w.llm_threads_input.setEnabled(False)
+        w.llm_think_tags_checkbox.setEnabled(False)
+        w.llm_think_description_checkbox.setEnabled(False)
         w.llm_use_button.setEnabled(False)
         self._llm_action_name = action_name
         self._llm_cancel = cancel_token
@@ -1395,6 +1429,8 @@ class LlmController:
         w.llm_retry_input.setEnabled(True)
         w.llm_max_resolution_input.setEnabled(True)
         w.llm_threads_input.setEnabled(True)
+        w.llm_think_tags_checkbox.setEnabled(True)
+        w.llm_think_description_checkbox.setEnabled(True)
         w.llm_use_button.setEnabled(True)
         w._update_fixup_button_state()
 

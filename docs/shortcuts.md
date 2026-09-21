@@ -45,6 +45,7 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Accept all proposed rows and merge | Alt+A | Option+A | Accept button |
 | Regenerate proposed annotations | Alt+R | Option+R | Regenerate button |
 | Fix ratio (crop to closest allowed ratio) | Alt+F | Option+F | Fix ratio button; enabled when the image ratio is not in `allowed_ratios` |
+| Autofix ratio (centre crop, no frame) | Alt+C | Option+C | Autofix ratio button; enabled when the closest allowed ratio keeps at least 99% of the pixels |
 | Previous image | Alt+Left | Command+[ | Prev button |
 | Next image | Alt+Right | Command+] | Next button |
 
