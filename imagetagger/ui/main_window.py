@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QCompleter,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -128,12 +129,13 @@ from imagetagger.ui.workers import (
     RegenerateWorker,
     TagPurgeWorker,
 )
-from imagetagger.ui.shortcuts import platform_key_sequence
+from imagetagger.ui.shortcuts import is_macos, platform_key_sequence
 from imagetagger.ui.server_settings_frame import create_server_settings_frame
 from imagetagger.ui.tag_controller import TagController
 from imagetagger.ui.llm_controller import LlmController
 from imagetagger.ui.directory_controller import DirectoryController
 from imagetagger.ui.bulk_fixup_dialog import BulkFixupDialog
+from imagetagger.ui.settings_dialog import SettingsDialog
 from imagetagger.ui.fixup_controller import FixupController
 from imagetagger.ui.image_view_controller import ImageViewController
 from imagetagger.utils.theme_colors import danger_accent_color, danger_text_on_accent_color, info_accent_color, info_text_on_accent_color, success_accent_color, success_text_on_accent_color
@@ -392,6 +394,7 @@ class MainWindow(QMainWindow):
 
         self.open_action: QAction | None = None
         self.refresh_action: QAction | None = None
+        self.settings_action: QAction | None = None
         self.save_action: QAction | None = None
         self.increase_font_action: QAction | None = None
         self.decrease_font_action: QAction | None = None
@@ -1051,15 +1054,24 @@ class MainWindow(QMainWindow):
         menu = self.menuBar().addMenu("File")
 
         self.open_action = QAction("Open Folder", self)
-        self.open_action.setShortcut(platform_key_sequence("Ctrl+L", "Meta+O"))
+        self.open_action.setShortcut(platform_key_sequence("Ctrl+L", "Ctrl+O"))
         self.open_action.triggered.connect(self.open_folder)
 
         self.refresh_action = QAction("Refresh Folder", self)
-        self.refresh_action.setShortcut(platform_key_sequence("Ctrl+R", "Meta+R"))
+        self.refresh_action.setShortcut(platform_key_sequence("Ctrl+R", "Ctrl+R"))
         self.refresh_action.triggered.connect(self.refresh_directory)
 
+        self.settings_action = QAction("Settings\u2026", self)
+        # Keeps it in the File menu on macOS. Any other role, including the
+        # default text heuristic, moves it to the application menu.
+        self.settings_action.setMenuRole(QAction.MenuRole.NoRole)
+        self.settings_action.setShortcut(platform_key_sequence("Ctrl+,", "Ctrl+,"))
+        self.settings_action.triggered.connect(self.open_settings_dialog)
+
         self.exit_action = QAction("Exit", self)
-        quit_shortcuts = [platform_key_sequence("Alt+F4", "Meta+Q")]
+        # Moved to the application menu (as Quit) on macOS.
+        self.exit_action.setMenuRole(QAction.MenuRole.QuitRole)
+        quit_shortcuts = [platform_key_sequence("Alt+F4", "Ctrl+Q")]
         for shortcut in QKeySequence.keyBindings(QKeySequence.StandardKey.Quit):
             if shortcut not in quit_shortcuts:
                 quit_shortcuts.append(shortcut)
@@ -1069,6 +1081,17 @@ class MainWindow(QMainWindow):
         menu.addAction(self.open_action)
         menu.addAction(self.refresh_action)
         menu.addSeparator()
+        menu.addAction(self.settings_action)
+        if is_macos() and self.menuBar().isNativeMenuBar():
+            # The application menu gets a Settings item too. Without one, Qt's
+            # hidden Settings placeholder there swallows Command+,. It and Exit
+            # leave this menu, so no separator.
+            app_menu_settings_action = QAction("Settings\u2026", self)
+            app_menu_settings_action.setMenuRole(QAction.MenuRole.PreferencesRole)
+            app_menu_settings_action.triggered.connect(self.open_settings_dialog)
+            menu.addAction(app_menu_settings_action)
+        else:
+            menu.addSeparator()
         menu.addAction(self.exit_action)
 
         edit_menu = self.menuBar().addMenu("Edit")
@@ -1085,6 +1108,15 @@ class MainWindow(QMainWindow):
 
         edit_menu.addAction(self.increase_font_action)
         edit_menu.addAction(self.decrease_font_action)
+
+    def open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self._cfg, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # The Fixup dialog reads its settings each time it opens an image.
+            dialog.apply_to(self._cfg)
+            _config.save(self._cfg)
+            self.statusBar().showMessage("Settings saved")
+        dialog.deleteLater()
 
     def _apply_main_window_geometry_from_config(self) -> None:
         raw = self._cfg.get("main_window_geometry")
@@ -1840,7 +1872,14 @@ class MainWindow(QMainWindow):
         for p, idx in self._record_index_by_path.items():
             if idx > record_index:
                 self._record_index_by_path[p] = idx - 1
-        deleted_item = self.list_widget.takeItem(record_index)
+        # While the current row is removed, Qt moves the current row itself and can
+        # report it by its pre-removal number (one past its place in the popped
+        # self.records).  Ignore that; the row is chosen and synced below.
+        self._ignore_selection_sync = True
+        try:
+            deleted_item = self.list_widget.takeItem(record_index)
+        finally:
+            self._ignore_selection_sync = False
         del deleted_item
 
         self._rebuild_known_tags_from_records()
@@ -1860,8 +1899,20 @@ class MainWindow(QMainWindow):
             return (True, False)
 
         if was_current:
+            # The row that took the deleted one's place, else the one above it,
+            # passing over rows the filter hides while a visible one is left.
             next_index = record_index if record_index < len(self.records) else len(self.records) - 1
+            for row in [*range(record_index, len(self.records)), *range(record_index - 1, -1, -1)]:
+                item = self.list_widget.item(row)
+                if item is not None and not item.isHidden():
+                    next_index = row
+                    break
+            # When Qt already made that row current, setCurrentRow only selects
+            # it and currentRowChanged does not fire, so sync by hand.
+            already_current = self.list_widget.currentRow() == next_index
             self.list_widget.setCurrentRow(next_index)
+            if already_current:
+                self.on_selection_changed(next_index)
         elif self.current_index > record_index:
             self.current_index -= 1
 

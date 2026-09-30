@@ -61,13 +61,13 @@ These keys are used only when `llm_threads` is `0`. See [Ollama Settings](ollama
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allowed_ratios` | string | `"1:1, 2:3, 3:4, 4:5, 16:9"` | Comma-separated `w:h` aspect ratios a training image may have. Each ratio covers both orientations (`2:3` also allows `3:2`). The merge dialog warns in its status area when an image does not fit and offers **Fix ratio** to crop it to the closest allowed ratio (and **Autofix ratio**, a centred crop without a frame, when that ratio keeps at least 99% of the pixels). In the main window, images that do not fit carry the ✂️ badge, join the Fixup pipeline and the `fixup` filter, are counted in the status bar, and **Batch Autofix ratio** centre-crops every listed near miss at once. Invalid entries are dropped; if nothing valid remains the default is used. An empty string turns the check off. |
+| `allowed_ratios` | string | `"1:1, 2:3, 3:4, 4:5, 16:9"` | Comma-separated `w:h` aspect ratios a training image may have. Each ratio covers both orientations (`2:3` also allows `3:2`). The merge dialog warns in its status area when an image does not fit and offers **Fix ratio** to crop it to the closest allowed ratio (and **Autofix ratio**, a centred crop without a frame, when that ratio keeps at least 99% of the pixels), or **Merge and Next, skip ratio** to go on without cropping. In the main window, images that do not fit carry the ✂️ badge, join the Fixup pipeline and the `fixup` filter, are counted in the status bar, and **Batch Autofix ratio** centre-crops every listed near miss at once. Invalid entries are dropped; if nothing valid remains the default is used. An empty string turns the check off. |
 
 ---
 
 ## Merge Dialog Mouse Actions
 
-Stored as a nested object under `merge_table_mouse_actions`.
+Stored as a nested object under `merge_table_mouse_actions`. Edited in the Settings dialog (File > Settings…).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

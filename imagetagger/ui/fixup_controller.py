@@ -407,17 +407,20 @@ class FixupController:
                     continue
                 break
 
-            if outcome == "next":
+            if outcome in ("next", "skip"):
                 # Deletion from merge dialog can change list indices while the dialog is open.
                 # Recompute target from current state instead of using stale pre-dialog indices.
+                # "next" stays on a current image that still needs a fixup (the one that took
+                # a deleted image's place, or a ratio Merge and Next left unfixed); "skip"
+                # (Next, "Merge and Next, skip ratio") moves past it and never comes back to it.
                 current_record = w._current_record()
-                if current_record is not None and w._record_needs_fixup(current_record):
+                if outcome == "next" and current_record is not None and w._record_needs_fixup(current_record):
                     continue
 
                 target = self._find_adjacent_fixup_index(w.current_index, 1)
                 if target is None:
                     target = self._find_adjacent_fixup_index(w.current_index, -1)
-                if target is None:
+                if target is None and outcome == "next":
                     target = self._find_fixup_index(reverse=False)
                 if target is not None:
                     self._fixup_navigating = True

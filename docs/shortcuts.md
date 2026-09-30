@@ -20,10 +20,11 @@ This page lists all keyboard shortcuts currently wired in the application code.
 | Jump to first fixup | Alt+F | Option+F | Image list |
 | Jump to last fixup | Alt+L | Option+L | Image list |
 | Remove selected tag | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) | Tag list |
-| Purge tag(s) from entire dataset | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) | Global Tags list (Controls panel) — supports multi-selection via Shift-click / Ctrl-click; shows confirmation dialog before writing |
+| Purge tag(s) from entire dataset | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) | Global Tags list (Controls panel) — supports multi-selection via Shift-click / Ctrl-click (Command-click on macOS); shows confirmation dialog before writing |
 | Open folder | Ctrl+L | Command+O | File menu |
 | Refresh folder | Ctrl+R | Command+R | File menu |
-| Exit app | Ctrl+Q | Command+Q | File menu |
+| Settings | Ctrl+, | Command+, | File menu (on macOS also the application menu) |
+| Exit app | Alt+F4 (Linux also Ctrl+Q) | Command+Q | File menu (application menu on macOS) |
 | Increase font | Ctrl++ / Ctrl+= | Command++ / Command+= | Edit menu |
 | Decrease font | Ctrl+- | Command+- | Edit menu |
 | Generate | Alt+G | Option+G | AutoTag tab active |
@@ -38,6 +39,7 @@ This page lists all keyboard shortcuts currently wired in the application code.
 |---|---|---|---|
 | Remove selected existing tags | Delete or Backspace | Delete or Backspace (Fn+Delete on some keyboards) | Left/current list |
 | Merge and next | Alt+Enter (also Alt+Return) | Option+Enter (also Option+Return) | Dialog action + Merge and Next button (suppressed when edit boxes have focus or a comparison-table cell editor is active, except when quick-add tag input is focused and empty) |
+| Merge and next, skip ratio | Shift+Alt+Enter (also Shift+Alt+Return) | Shift+Option+Enter (also Shift+Option+Return) | Merge and Next, skip ratio button; enabled when the image ratio is not in `allowed_ratios` and there is a next item. Suppressed like Merge and next |
 | Focus quick-add tag input | Alt+T | Option+T | Dialog action |
 | Undo merge/local changes | Ctrl+Z | Command+Z | Dialog action + Undo button |
 | Previous actionable row | Alt+Up | Option+Up | Dialog action |
@@ -73,7 +75,7 @@ Active after **Fix ratio**, while the crop frame is shown. The other merge dialo
 
 ## Windows vs Linux Differences
 
-No application-defined shortcut differences between Windows and Linux.
+No application-defined shortcut differences between Windows and Linux. Exit app also takes Qt's platform Quit key, which is Ctrl+Q on Linux; Windows has none, so only Alt+F4 exits there.
 
 Notes:
 - Some Linux desktop/window-manager configurations reserve certain `Alt+...` combinations globally.

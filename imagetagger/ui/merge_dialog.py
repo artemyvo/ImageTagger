@@ -49,6 +49,9 @@ from imagetagger.ui.panels.comparison_panel import ComparisonPanel
 class FixupDialog(QDialog):
     NAVIGATE_PREV_CODE = 2
     NAVIGATE_NEXT_CODE = 3
+    # Next fixup even though this image still needs one (Next, and "Merge and
+    # Next, skip ratio"); NAVIGATE_NEXT_CODE stays on such an image.
+    NAVIGATE_SKIP_CODE = 4
 
     def __init__(
         self,
@@ -113,6 +116,7 @@ class FixupDialog(QDialog):
         # Allowed aspect ratios (config "allowed_ratios"); empty disables the check.
         raw_allowed_ratios = cfg.get("allowed_ratios", DEFAULT_ALLOWED_RATIOS) if isinstance(cfg, dict) else DEFAULT_ALLOWED_RATIOS
         self._allowed_ratios = parse_allowed_ratios(raw_allowed_ratios)
+        self._ratio_not_allowed = False
         self._ratio_fix_available = False
         # Set when the closest fix keeps almost every pixel, so a centred crop is safe.
         self._autofix_candidate: CropCandidate | None = None
@@ -305,6 +309,17 @@ class FixupDialog(QDialog):
         self.autofix_ratio_button.setVisible(bool(self._allowed_ratios))
         self.autofix_ratio_button.clicked.connect(self._autofix_ratio)
 
+        self.skip_ratio_button = QPushButton("Merge and Next, skip ratio", self)
+        skip_ratio_shortcuts = platform_key_sequences(
+            ["Shift+Alt+Enter", "Shift+Alt+Return"],
+            ["Shift+Alt+Enter", "Shift+Alt+Return"],
+        )
+        self.skip_ratio_button.setShortcut(skip_ratio_shortcuts[0])
+        self._skip_ratio_shortcut_hint = native_shortcut_text(skip_ratio_shortcuts)
+        self.skip_ratio_button.setEnabled(False)
+        self.skip_ratio_button.setVisible(bool(self._allowed_ratios))
+        self.skip_ratio_button.clicked.connect(self._merge_and_next_skip_ratio)
+
         self.merge_next_button = QPushButton("Merge and Next", self)
         self.merge_next_button.setShortcut(merge_next_shortcut_labels[0])
         self.merge_next_button.setToolTip(
@@ -314,7 +329,7 @@ class FixupDialog(QDialog):
 
         self.prev_button = QPushButton("Prev", self)
         self.prev_button.setEnabled(can_navigate_prev)
-        prev_nav_shortcut = platform_key_sequence("Alt+Left", "Meta+[")
+        prev_nav_shortcut = platform_key_sequence("Alt+Left", "Ctrl+[")
         self.prev_button.setShortcut(prev_nav_shortcut)
         self._prev_nav_shortcut_hint = native_shortcut_text(prev_nav_shortcut)
         self.prev_button.setToolTip(f"Go to previous item ({self._prev_nav_shortcut_hint})")
@@ -322,11 +337,11 @@ class FixupDialog(QDialog):
 
         self.next_button = QPushButton("Next", self)
         self.next_button.setEnabled(can_navigate_next)
-        next_nav_shortcut = platform_key_sequence("Alt+Right", "Meta+]")
+        next_nav_shortcut = platform_key_sequence("Alt+Right", "Ctrl+]")
         self.next_button.setShortcut(next_nav_shortcut)
         self._next_nav_shortcut_hint = native_shortcut_text(next_nav_shortcut)
         self.next_button.setToolTip(f"Go to next item ({self._next_nav_shortcut_hint})")
-        self.next_button.clicked.connect(self._navigate_next)
+        self.next_button.clicked.connect(self._skip_to_next)
 
         for button in (
             self.accept_button,
@@ -334,6 +349,7 @@ class FixupDialog(QDialog):
             self.undo_button,
             self.fix_ratio_button,
             self.autofix_ratio_button,
+            self.skip_ratio_button,
             self.merge_next_button,
             self.prev_button,
             self.next_button,
@@ -371,6 +387,7 @@ class FixupDialog(QDialog):
         button_row.addWidget(self.autofix_ratio_button)
         if self._allowed_ratios:
             button_row.addSpacing(24)
+        button_row.addWidget(self.skip_ratio_button)
         button_row.addWidget(self.merge_next_button)
         button_row.addWidget(self.next_button)
 
@@ -441,10 +458,12 @@ class FixupDialog(QDialog):
     def _update_ratio_state(self, width: int, height: int) -> None:
         """Warn in the status area when the image ratio is not an allowed one."""
         warning = ""
+        self._ratio_not_allowed = False
         self._ratio_fix_available = False
         self._autofix_candidate = None
         if self._allowed_ratios and width > 0 and height > 0:
             if matching_ratio(width, height, self._allowed_ratios) is None:
+                self._ratio_not_allowed = True
                 warning = (
                     f"\u26a0 Image ratio {width}\u00d7{height} is not one of the allowed ratios "
                     f"({format_allowed_ratios(self._allowed_ratios)})."
@@ -503,6 +522,22 @@ class FixupDialog(QDialog):
         else:
             tooltip = "No allowed ratios configured"
         self.autofix_ratio_button.setToolTip(f"{tooltip} ({self._autofix_ratio_shortcut_hint})")
+
+        # Merge and Next stays on an image until its ratio is allowed; this one goes on.
+        can_skip = self._ratio_not_allowed and self.next_button.isEnabled()
+        self.skip_ratio_button.setEnabled(can_skip)
+        if can_skip:
+            tooltip = (
+                "Apply current annotations and go to next item without fixing the image ratio; "
+                "Merge and Next stays on this image until the ratio is fixed"
+            )
+        elif self._ratio_not_allowed:
+            tooltip = "There is no next item"
+        elif self._allowed_ratios:
+            tooltip = "Image ratio is already one of the allowed ratios: Merge and Next goes on"
+        else:
+            tooltip = "No allowed ratios configured"
+        self.skip_ratio_button.setToolTip(f"{tooltip} ({self._skip_ratio_shortcut_hint})")
 
     def _begin_ratio_fix(self) -> None:
         if self._ratio_fix_available and not self._crop_mode_active and not self._regen_panel.is_regenerating:
@@ -579,17 +614,35 @@ class FixupDialog(QDialog):
             # Some macOS keyboards report arrow keys with KeypadModifier.
             return not bool(modifiers & ~Qt.KeyboardModifier.KeypadModifier)
 
+        def _is_macos_cmd_home_end(event: QEvent) -> bool:
+            # Command+Up/Down act as Home/End on macOS, where Qt reports Command as
+            # ControlModifier (MetaModifier is the Control key).
+            return (
+                sys.platform == "darwin"
+                and event.type() == QEvent.Type.KeyPress
+                and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)
+                and (event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier) == Qt.KeyboardModifier.ControlModifier
+            )
+
         if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             modifiers = event.modifiers()
-            allowed_modifiers = Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.KeypadModifier
-            has_alt_only = bool(modifiers & Qt.KeyboardModifier.AltModifier) and not bool(modifiers & ~allowed_modifiers)
-            if has_alt_only:
+            # Alt+Enter is Merge and Next, Shift+Alt+Enter its skip-ratio variant.
+            allowed_modifiers = (
+                Qt.KeyboardModifier.AltModifier
+                | Qt.KeyboardModifier.ShiftModifier
+                | Qt.KeyboardModifier.KeypadModifier
+            )
+            has_alt = bool(modifiers & Qt.KeyboardModifier.AltModifier) and not bool(modifiers & ~allowed_modifiers)
+            if has_alt:
                 focused = self.focusWidget()
                 table_cell_editing = comparison_table.state() == QAbstractItemView.State.EditingState
                 editing_focus = isinstance(focused, (QLineEdit, QTextEdit)) and self.isAncestorOf(focused)
                 left_tag_input_empty_focus = focused is left_tag_input and not left_tag_input.text().strip()
                 if (not editing_focus or left_tag_input_empty_focus) and not table_cell_editing:
-                    self._merge_and_next()
+                    if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                        self._merge_and_next_skip_ratio()
+                    else:
+                        self._merge_and_next()
                     return True
 
         if watched in (comparison_table, comparison_table.viewport()) and event.type() == QEvent.Type.KeyPress:
@@ -605,7 +658,7 @@ class FixupDialog(QDialog):
                 return self._comparison_panel.activate_first_comparison_row()
             if event.key() == Qt.Key.Key_End and _is_plain_arrow_modifiers(event.modifiers()):
                 return self._comparison_panel.activate_last_comparison_row()
-            if sys.platform == "darwin" and event.modifiers() == Qt.KeyboardModifier.MetaModifier:
+            if _is_macos_cmd_home_end(event):
                 if event.key() == Qt.Key.Key_Up:
                     return self._comparison_panel.activate_first_comparison_row()
                 if event.key() == Qt.Key.Key_Down:
@@ -720,7 +773,12 @@ class FixupDialog(QDialog):
             if self._comparison_panel.delete_proposed_rows_for_selected_rows():
                 return True
 
-        if event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+        # Command+Up/Down skips this block and is handled with Home/End below.
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)
+            and not _is_macos_cmd_home_end(event)
+        ):
             if not _is_plain_arrow_modifiers(event.modifiers()):
                 return super().eventFilter(watched, event)
 
@@ -757,12 +815,7 @@ class FixupDialog(QDialog):
 
         if event.type() == QEvent.Type.KeyPress:
             is_home_end = event.key() in (Qt.Key.Key_Home, Qt.Key.Key_End) and _is_plain_arrow_modifiers(event.modifiers())
-            is_macos_cmd_home_end = (
-                sys.platform == "darwin"
-                and event.modifiers() == Qt.KeyboardModifier.MetaModifier
-                and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)
-            )
-            if not is_home_end and not is_macos_cmd_home_end:
+            if not is_home_end and not _is_macos_cmd_home_end(event):
                 return super().eventFilter(watched, event)
 
             activate_row = (
@@ -818,6 +871,7 @@ class FixupDialog(QDialog):
             self.undo_button,
             self.fix_ratio_button,
             self.autofix_ratio_button,
+            self.skip_ratio_button,
             self.merge_next_button,
             self.prev_button,
             self.next_button,
@@ -939,8 +993,19 @@ class FixupDialog(QDialog):
         self._regen_panel.cancel_regeneration(discard_result=True)
         self.done(self.NAVIGATE_NEXT_CODE)
 
+    def _skip_to_next(self) -> None:
+        # Unlike _navigate_next, never lands back on this image, even when it
+        # still needs a fixup (unresolved, or a ratio left unfixed).
+        self._regen_panel.cancel_regeneration(discard_result=True)
+        self.done(self.NAVIGATE_SKIP_CODE)
+
     def _merge_and_next(self) -> None:
         # Merge+Next must persist the Current column exactly as shown.
         # Proposed rows are only applied when explicitly accepted by the user.
         if self._merge_without_close() and self.next_button.isEnabled():
             self._navigate_next()
+
+    def _merge_and_next_skip_ratio(self) -> None:
+        # Merge and Next would stay here while the ratio is not an allowed one.
+        if self.skip_ratio_button.isEnabled() and self._merge_without_close():
+            self._skip_to_next()

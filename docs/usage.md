@@ -88,7 +88,7 @@ The **Tags** tab in the bottom-right controls panel gives a dataset-wide view of
 
 - Each entry shows the tag name and the number of images it appears in, for example `natural light (26)`.
 - A **Filter tags…** input at the top lets you search the list by substring — useful in large datasets.
-- **Multi-selection** is supported via Shift-click (range) and Ctrl-click (individual). Select any number of tags, then press Delete or Backspace to **purge** them from the entire dataset in one operation. A confirmation dialog is shown before any files are written.
+- **Multi-selection** is supported via Shift-click (range) and Ctrl-click (individual; Command-click on macOS). Select any number of tags, then press Delete or Backspace to **purge** them from the entire dataset in one operation. A confirmation dialog is shown before any files are written.
 
 Purging is a destructive, dataset-wide write — it removes the selected tags from every `.txt` sidecar that contains them. Use the filter to verify a tag is genuinely unwanted before purging.
 
@@ -186,6 +186,7 @@ Quick Actions:
 - Alt+A: Accept all proposed rows and merge.
 - Alt+R: Start regeneration to create fresh candidates.
 - Alt+Enter: Merge current change (save left/current pane to image and proceed to next image).
+- Shift+Alt+Enter: The same for an image whose aspect ratio you leave unfixed (Merge and Next, skip ratio; see below).
 - Left arrow key: Accept proposed change from right into result.
 - Del key: Delete selected current row, including description rows when present.
 
@@ -201,12 +202,13 @@ Trainers batch images by aspect ratio, so a dataset that sticks to a few ratios 
 - The Ratio dropdown lists every allowed ratio in both orientations, closest first, in case another one suits the picture better.
 - **Apply** (Enter) crops the image file in place and reloads it; **Cancel** (Esc) leaves the file untouched. While the frame is shown the rest of the dialog is parked, and Esc leaves the crop mode instead of closing the dialog.
 - **Autofix ratio** (Alt+C) is the one-click version for near misses. It is enabled only when the closest allowed ratio keeps at least 99% of the pixels (for example 1920x1090 to 16:9, or 1024x1360 to 3:4); the strip that goes is then too thin for its position to matter, so the image is cropped at the centre right away, with no frame and no confirmation. For anything further off, the button stays disabled and Fix ratio lets you place the crop by hand.
+- **Merge and Next, skip ratio** (Shift+Alt+Enter) leaves the ratio as it is. Merge and Next stays on an image until its ratio is fixed (the dialog opens on it again, with the merged annotations); this button merges and goes on to the next item instead. The image keeps its ✂️ badge and stays in the Fixup pipeline, so it comes up again on the next pass. The button is enabled only while the ratio is not allowed and there is a next item.
 
 Apply and Autofix ratio overwrite the image file; there is no undo, so keep your source images elsewhere. The crop keeps the file format, EXIF, ICC profile and PNG text chunks (for example Stable Diffusion generation parameters). JPEGs are re-encoded with the original quantization tables and chroma subsampling. The crop spans the full image along one axis and the other side is rounded to the nearest pixel (for example 467x831 for 9:16 on a 530x831 image), so no strip is lost to exactness; the result is within the same one-pixel tolerance the ratio check accepts. A symlinked image is cropped at its target. Animated images and 16-bit RGB PNGs are refused.
 
 Fix ratio and Autofix ratio are unavailable while a regeneration is running, because the model is looking at the uncropped file.
 
-Set `"allowed_ratios": ""` to turn the check off and hide both buttons.
+Set `"allowed_ratios": ""` to turn the check off and hide these buttons.
 
 ### Aspect Ratio Fixup in the Main Window
 
@@ -230,7 +232,7 @@ The merge comparison table also supports mouse and trackpad actions:
 - Right-click opens row context menu.
 - On macOS trackpads, a two-finger tap maps to right-click and opens the same row context menu.
 - Horizontal swipe/drag can trigger row actions when enabled.
-- Horizontal scroll (mouse horizontal wheel or trackpad horizontal two-finger scroll) can trigger row actions when enabled. This is the recommended way to merge or delete rows with a trackpad or a mouse with a horizontal scroll wheel, such as the Logitech MX Master 3. Enable `horizontal_scroll_actions_enabled` to use it.
+- Horizontal scroll (mouse horizontal wheel or trackpad horizontal two-finger scroll) can trigger row actions when enabled. This is the recommended way to merge or delete rows with a trackpad or a mouse with a horizontal scroll wheel, such as the Logitech MX Master 3. Turn it on in Settings (see below).
 
 Defaults:
 
@@ -240,6 +242,8 @@ Defaults:
 - Horizontal scroll reverse: disabled.
 - Horizontal scroll stop-idle seconds: 0.45.
 - Horizontal scroll row-target mode: 3 (safest mode).
+
+Change these in **Settings** (File > Settings…, Ctrl+, or Command+,; on macOS also in the application menu, usually named Python). The **Merge dialog: mouse and trackpad** group has a checkbox for double-click, swipe and horizontal scroll; the horizontal scroll options below it (reverse direction, pause between actions, which row it acts on) are available while horizontal scroll is on. **Restore Defaults** puts back the defaults listed above, and OK saves. The merge dialog uses the new settings from the next image it opens.
 
 Configuration is stored in config.json under `merge_table_mouse_actions`:
 
@@ -394,7 +398,7 @@ config.json stores session and UI state, including:
 - query downscale value (llm_max_resolution_mpx)
 - thread setting
 - window geometry state
-- merge-dialog mouse action settings in `merge_table_mouse_actions`
+- merge-dialog mouse action settings in `merge_table_mouse_actions` (edited in Settings)
 - `allowed_ratios` (default `"1:1, 2:3, 3:4, 4:5, 16:9"`): aspect ratios the merge dialog accepts without a warning
 - `confirm_on_delete` (default `true`): show confirmation dialog before deleting from image context menu
 

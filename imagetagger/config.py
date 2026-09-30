@@ -31,6 +31,12 @@ _DEFAULT_MERGE_TABLE_MOUSE_ACTIONS: dict[str, Any] = {
     "horizontal_scroll_row_target_mode": MERGE_TABLE_HSCROLL_TARGET_POINTER_ON_SELECTED,
 }
 
+
+def default_merge_table_mouse_actions() -> dict[str, Any]:
+    """A fresh copy of the default ``merge_table_mouse_actions`` settings."""
+    return dict(_DEFAULT_MERGE_TABLE_MOUSE_ACTIONS)
+
+
 _DEFAULTS: dict = {
     "last_open_directory": "",
     "main_window_geometry": {},

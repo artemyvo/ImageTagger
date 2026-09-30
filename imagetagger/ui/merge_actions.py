@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Literal
 
+from PyQt6.QtCore import QRect, QTimer
 from PyQt6.QtWidgets import QDialog, QMessageBox, QStyle, QWidget
 
 from imagetagger.utils.annotations import sanitize_description_text, sanitize_tag_text
@@ -103,6 +104,85 @@ def delete_sidecar_for_image(image_path: Path) -> None:
         pass
 
 
+# How long after show() the platform may still be adjusting the dialog's geometry.
+_GEOMETRY_SETTLE_MS = 250
+
+
+def _restore_dialog_geometry(dialog: QDialog, initial_geometry: dict[str, int] | None) -> QRect | None:
+    """Apply the saved geometry, kept on screen; returns what the dialog was asked to take."""
+    if not initial_geometry:
+        return None
+    x = initial_geometry.get("x")
+    y = initial_geometry.get("y")
+    width = initial_geometry.get("width")
+    height = initial_geometry.get("height")
+    if not all(isinstance(value, int) for value in (x, y, width, height)) or width <= 0 or height <= 0:
+        return None
+
+    requested = QRect(x, y, width, height)
+    screen = dialog.screen()
+    available = screen.availableGeometry() if screen is not None else None
+    if available is not None:
+        # Keep enough top inset so native title-bar controls remain reachable,
+        # also for a dialog as tall as the screen.
+        title_bar_height = dialog.style().pixelMetric(QStyle.PixelMetric.PM_TitleBarHeight, None, dialog)
+        if title_bar_height <= 0:
+            title_bar_height = 32
+        title_bar_height = min(title_bar_height, available.height() // 2)
+
+        clamped_width = min(width, available.width())
+        clamped_height = min(height, available.height() - title_bar_height)
+        max_x = available.left() + available.width() - clamped_width
+        max_y = available.top() + available.height() - clamped_height
+        clamped_x = min(max(x, available.left()), max_x)
+        clamped_y = min(max(y, available.top() + title_bar_height), max_y)
+        requested = QRect(clamped_x, clamped_y, clamped_width, clamped_height)
+
+    dialog.setGeometry(requested)
+    return requested
+
+
+def _track_shown_geometry(dialog: QDialog) -> list[QRect]:
+    """Record, once the dialog has settled on screen, the geometry the platform gave it.
+
+    The returned list stays empty if the dialog closes before that.
+    """
+    shown: list[QRect] = []
+
+    def _record() -> None:
+        if dialog.isVisible():
+            shown.append(QRect(dialog.geometry()))
+
+    timer = QTimer(dialog)
+    timer.setSingleShot(True)
+    timer.timeout.connect(_record)
+    timer.start(_GEOMETRY_SETTLE_MS)
+    return shown
+
+
+def _geometry_to_save(requested: QRect | None, shown: list[QRect], final: QRect) -> QRect | None:
+    """Geometry to persist when the dialog closes, or None to keep the saved one.
+
+    The platform does not always report back the geometry that was requested
+    (on Windows the dialog came back slightly taller, with its top higher).
+    The dialog is recreated for every image, so saving the reported geometry
+    would add that difference once per image.  Only what changed while the
+    dialog was on screen (the user moving or resizing it) is applied, on top
+    of the requested geometry.
+    """
+    if requested is None:
+        return QRect(final)
+    if not shown or shown[0] == final:
+        return None
+    settled = shown[0]
+    return QRect(
+        requested.x() + final.x() - settled.x(),
+        requested.y() + final.y() - settled.y(),
+        requested.width() + final.width() - settled.width(),
+        requested.height() + final.height() - settled.height(),
+    )
+
+
 def open_fixup_dialog_for_image(
     parent: QWidget,
     image_path: Path,
@@ -144,7 +224,7 @@ def open_fixup_dialog_for_image(
     save_regenerate_settings: Callable[[dict[str, int | float | bool | str]], None] | None = None,
     reasoning_lines: int = 5,
     cfg: dict | None = None,
-) -> Literal["merged", "cancelled", "prev", "next", "missing", "error"]:
+) -> Literal["merged", "cancelled", "prev", "next", "skip", "missing", "error"]:
     try:
         sidecar = read_sidecar_data(image_path)
     except OSError as exc:
@@ -286,30 +366,8 @@ def open_fixup_dialog_for_image(
         parent=parent,
     )
 
-    if initial_geometry:
-        x = initial_geometry.get("x")
-        y = initial_geometry.get("y")
-        width = initial_geometry.get("width")
-        height = initial_geometry.get("height")
-        if all(isinstance(value, int) for value in (x, y, width, height)) and width > 0 and height > 0:
-            screen = dialog.screen()
-            available = screen.availableGeometry() if screen is not None else None
-            if available is None:
-                dialog.setGeometry(x, y, width, height)
-            else:
-                clamped_width = min(width, available.width())
-                clamped_height = min(height, available.height())
-                max_x = available.left() + max(0, available.width() - clamped_width)
-                max_y = available.top() + max(0, available.height() - clamped_height)
-                clamped_x = min(max(x, available.left()), max_x)
-
-                # Keep enough top inset so native title-bar controls remain reachable.
-                title_bar_height = dialog.style().pixelMetric(QStyle.PixelMetric.PM_TitleBarHeight, None, dialog)
-                if title_bar_height <= 0:
-                    title_bar_height = 32
-                min_y = min(available.top() + title_bar_height, max_y)
-                clamped_y = min(max(y, min_y), max_y)
-                dialog.setGeometry(clamped_x, clamped_y, clamped_width, clamped_height)
+    requested_geometry = _restore_dialog_geometry(dialog, initial_geometry)
+    shown_geometry = _track_shown_geometry(dialog)
 
     result = dialog.exec()
 
@@ -333,20 +391,23 @@ def open_fixup_dialog_for_image(
         )
 
     if save_geometry is not None:
-        geometry = dialog.geometry()
-        save_geometry(
-            {
-                "x": int(geometry.x()),
-                "y": int(geometry.y()),
-                "width": int(geometry.width()),
-                "height": int(geometry.height()),
-            }
-        )
+        geometry = _geometry_to_save(requested_geometry, shown_geometry, dialog.geometry())
+        if geometry is not None:
+            save_geometry(
+                {
+                    "x": int(geometry.x()),
+                    "y": int(geometry.y()),
+                    "width": int(geometry.width()),
+                    "height": int(geometry.height()),
+                }
+            )
 
     if result == FixupDialog.NAVIGATE_PREV_CODE:
-        outcome: Literal["merged", "cancelled", "prev", "next", "missing", "error"] = "prev"
+        outcome: Literal["merged", "cancelled", "prev", "next", "skip", "missing", "error"] = "prev"
     elif result == FixupDialog.NAVIGATE_NEXT_CODE:
         outcome = "next"
+    elif result == FixupDialog.NAVIGATE_SKIP_CODE:
+        outcome = "skip"
     else:
         outcome = "cancelled"
 
