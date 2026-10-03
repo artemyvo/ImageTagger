@@ -9,3 +9,4 @@ prompts/
 *.log
 config.json
 IDEAS.md
+.pytest_cache/

@@ -454,10 +454,26 @@ def parse_refine_response(response: str) -> tuple[list[str], str]:
     return (tags, caption)
 
 
+def strip_inline_thinking(text: str) -> str:
+    """Drop a reasoning trace some servers put inline as ``<think>...</think>``.
+
+    Everything up to the last ``</think>`` goes (some chat templates emit only
+    the closing tag); a trace that never closed was cut off, so nothing after
+    its ``<think>`` is an answer.
+    """
+    closing = list(re.finditer(r"</think\s*>", text, re.IGNORECASE))
+    if closing:
+        return text[closing[-1].end():]
+    opening = re.search(r"<think\s*>", text, re.IGNORECASE)
+    if opening:
+        return text[:opening.start()]
+    return text
+
+
 def parse_yes_no_response(response: str, *, context: str = "AI Find") -> bool:
     from imagetagger.providers.llm_provider import LlmProviderError
 
-    match = re.search(r"\b(YES|NO)\b", response, re.IGNORECASE)
+    match = re.search(r"\b(YES|NO)\b", strip_inline_thinking(response), re.IGNORECASE)
     if match:
         val = match.group(1).upper()
         if val == "YES":

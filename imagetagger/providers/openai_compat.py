@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from imagetagger.utils.image_prep import prepare_image_for_query
+from imagetagger.utils.llm_queries import LlmQueryError
 from imagetagger.providers.llm_provider import (
     GeneratedText,
     LlmProviderCancelled,
@@ -57,7 +58,16 @@ def fetch_models(server: str, timeout: float = 5.0) -> list[str]:
 
 
 def _encode_image_data_url(image_path: Path) -> str:
-    prepared_image = prepare_image_for_query(image_path)
+    try:
+        prepared_image = prepare_image_for_query(image_path)
+    except LlmProviderError:
+        raise
+    except LlmQueryError as exc:
+        # An unreadable image fails this request only, like any provider
+        # error; it says nothing about server load, so no backoff.
+        error = LlmProviderError(str(exc))
+        error.no_backoff = True
+        raise error from exc
     encoded = base64.b64encode(prepared_image.content).decode("ascii")
     media_type = prepared_image.media_type or "image/jpeg"
     return f"data:{media_type};base64,{encoded}"

@@ -8,6 +8,7 @@ Pure Python validation logic (no Qt dependencies).
 
 from __future__ import annotations
 
+import math
 from typing import Callable
 from imagetagger.providers.llm_provider import LlmProviderError
 
@@ -98,6 +99,8 @@ class InputValidator:
 
         try:
             value = float(raw_value)
+            if not math.isfinite(value):  # "nan"/"inf" parse but slip past range checks
+                raise ValueError(raw_value)
         except ValueError as exc:
             error_msg = "Query downscale must be a number."
             if on_error:
@@ -127,6 +130,8 @@ class InputValidator:
 
         try:
             value = float(raw_value)
+            if not math.isfinite(value):  # "nan"/"inf" parse but slip past range checks
+                raise ValueError(raw_value)
         except ValueError as exc:
             error_msg = "Temperature must be a number between 0 and 2."
             if on_error:

@@ -3,16 +3,13 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
-from io import BytesIO
 import os
 from pathlib import Path
 import sys
-import threading
 import time
 from typing import Callable, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from PIL import Image, ImageCms, UnidentifiedImageError
+from PIL import Image
 
 from PyQt6.QtCore import QEvent, QModelIndex, QObject, QRect, QStringListModel, QThread, Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QImage, QImageReader, QKeySequence, QPainter, QPixmap
@@ -55,7 +52,7 @@ from imagetagger.utils.aspect_ratio import (
     matching_ratio,
     parse_allowed_ratios,
 )
-from imagetagger.utils.image_prep import configure_image_preparation, consume_image_preparation_warning
+from imagetagger.utils.image_prep import configure_image_preparation
 from imagetagger.ui.ratio_autofix import (
     RatioAutofixResult,
     RatioAutofixTarget,
@@ -70,23 +67,23 @@ from imagetagger.utils.validators import (
     create_threads_validator,
     create_timeout_validator,
 )
-from imagetagger.utils.io_utils import atomic_write_text, bg_write_text
+from imagetagger.utils.io_utils import (
+    bg_write_text,
+    run_in_write_order,
+    set_bg_write_error_handler,
+    write_text_in_order,
+)
 from imagetagger.utils.sidecar import SidecarData, get_sidecar_json_path, read_sidecar_data, write_sidecar_data
 from imagetagger.providers.llm_provider import (
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_VISION_PROVIDER,
-    LlmProviderCancelled,
     LlmProviderError,
-    LlmRequestCancellation,
     VisionLlmSession,
 )
 from imagetagger.ui.merge_actions import (
-    clear_fixup_sidecar,
     clear_validation_fields_sidecar,
+    clear_validation_stamp,
     delete_sidecar_for_image,
-    open_fixup_dialog_for_image,
-    record_ai_find_match_for_image,
-    record_refine_result_for_image,
     write_fixup_sidecar,
 )
 from imagetagger.utils.external_editors import (
@@ -97,37 +94,14 @@ from imagetagger.utils.external_editors import (
     start_graphics_editor_detection,
 )
 from imagetagger.utils.llm_queries import (
-    active_prompt_for_kind,
-    clear_prompt_override,
-    format_annotations_for_validation,
-    get_default_prompt,
     load_prompt_for_kind,
-    parse_refine_response,
-    parse_vision_response,
-    parse_yes_no_response,
-    prepare_description_query,
-    prepare_refine_query,
-    prepare_search_query,
-    prepare_tagging_query,
-    prepare_validation_query,
-    prepare_vision_query,
-    prompt_source_for_kind,
-    render_prompt_with_agent_role,
-    render_prompt_with_existing_tags,
-    render_prompt_with_user_hint,
-    reset_prompt_to_default,
-    save_prompt_for_kind,
-    set_prompt_override,
 )
 from imagetagger.ui.workers import (
-    IMAGE_EXTENSIONS,
     THUMB_SIZE,
     MIN_FONT_POINT_SIZE,
     MAX_FONT_POINT_SIZE,
     FolderLoadWorker,
-    LlmTaskWorker,
-    RegenerateWorker,
-    TagPurgeWorker,
+    thumbnail_payload_to_qimage,
 )
 from imagetagger.ui.shortcuts import is_macos, platform_key_sequence
 from imagetagger.ui.server_settings_frame import create_server_settings_frame
@@ -373,6 +347,9 @@ class _ImageRowDelegate(QStyledItemDelegate):
 class MainWindow(QMainWindow):
     _IMAGE_ROW_BADGE_SLOT_ORDER = ("⚖️", "✂️", "✨", "🔍", "✅")
 
+    # (path, error) from the background write thread; delivered on the GUI thread.
+    bg_write_failed = pyqtSignal(str, str)
+
     def __init__(self) -> None:
         super().__init__()
         self.resize(1400, 860)
@@ -448,6 +425,10 @@ class MainWindow(QMainWindow):
         self._apply_config()
         self._update_llm_controls()
 
+        self._bg_write_failures: list[str] = []
+        self.bg_write_failed.connect(self._on_bg_write_failed)
+        set_bg_write_error_handler(lambda path, exc: self.bg_write_failed.emit(str(path), str(exc)))
+
     # ------------------------------------------------------------------
     # Properties delegating LLM state to LlmController (used throughout
     # MainWindow for backwards-compatible access)
@@ -490,8 +471,8 @@ class MainWindow(QMainWindow):
         return self.llm_controller._llm_cancel
 
     @property
-    def _validate_pending_indices(self) -> set:
-        return self.llm_controller._validate_pending_indices
+    def _validate_pending_paths(self) -> set:
+        return self.llm_controller._validate_pending_paths
 
     # ------------------------------------------------------------------
     # Properties delegating directory state to DirectoryController
@@ -1555,6 +1536,7 @@ class MainWindow(QMainWindow):
         record = self.records[record_index]
         self._set_record_image_size(record, (int(width), int(height)))
         self._update_list_item_preview(record_index)
+        self._refresh_list_item_thumbnail(record_index)
         if self.current_index == record_index:
             # Show the cropped file now and re-arm the watcher on the new mtime,
             # so the file watcher does not reload it a second time.
@@ -1850,7 +1832,8 @@ class MainWindow(QMainWindow):
             errors.append(f"{record.image_path.name}: {exc}")
 
         try:
-            record.text_path.unlink(missing_ok=True)
+            # In write order, so a queued auto-save cannot recreate the file.
+            run_in_write_order(lambda: record.text_path.unlink(missing_ok=True))
         except OSError as exc:
             errors.append(f"{record.text_path.name}: {exc}")
 
@@ -2201,8 +2184,9 @@ class MainWindow(QMainWindow):
         item.setSizeHint(QSize(0, THUMB_SIZE.height() + 10))
         # Use pre-computed visibility when provided (avoids re-parsing the filter per item).
         visible = is_visible if is_visible is not None else self._record_matches_filter(record)
-        item.setHidden(not visible)
         self.list_widget.addItem(item)
+        # After addItem: Qt ignores setHidden on an item that is not in a list yet.
+        item.setHidden(not visible)
 
     @staticmethod
     def _load_normalized_pixmap(image_path: Path) -> QPixmap:
@@ -2453,6 +2437,20 @@ class MainWindow(QMainWindow):
             self._cached_success_fg_color = None
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        # Failure dialogs normally wait for the event loop, which ends with
+        # this window, so report failed saves here while closing can still
+        # be called off.
+        failures = self._take_bg_write_failures()
+        if failures and QMessageBox.question(
+            self,
+            "Save failed",
+            f"{self._bg_write_failures_text(failures)}\n\nClose anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
+
         if self._llm_cancel is not None:
             self._llm_cancel.cancel()
         if self._loader_worker is not None:
@@ -2499,7 +2497,54 @@ class MainWindow(QMainWindow):
             self._cfg["llm_threads"] = fallback_threads
 
         _config.save(self._cfg)
+        # Let queued auto-saves land before the daemon write thread dies with
+        # us; saves that fail now can only be reported, not retried.
+        failures = self._take_bg_write_failures()
+        if failures:
+            QMessageBox.warning(self, "Save failed", self._bg_write_failures_text(failures))
+        set_bg_write_error_handler(None)
         super().closeEvent(event)
+
+    def _take_bg_write_failures(self) -> list[str]:
+        """Wait for the queued saves; return the failures not yet reported, and forget them."""
+        run_in_write_order(lambda: None)
+        # Failures arrive as queued signals from the write thread: deliver them
+        # now.  PyQt routes them through a proxy object, not through self.
+        QApplication.sendPostedEvents(None, QEvent.Type.MetaCall.value)
+        failures = self._bg_write_failures
+        self._bg_write_failures = []
+        return failures
+
+    def _on_bg_write_failed(self, path_text: str, error_text: str) -> None:
+        path = Path(path_text)
+        if path.suffix.lower() == ".json":
+            # The sidecar cache has fallen back to disk; refresh the badges from it.
+            for record in self.records:
+                if record.image_path.with_suffix(".json") == path:
+                    self._on_fixup_state_changed(record.image_path)
+                    break
+        self.statusBar().showMessage(f"Save failed: {path.name}")
+        # Coalesce a burst of failures (e.g. a full disk) into one dialog.
+        self._bg_write_failures.append(f"{path.name}: {error_text}")
+        if len(self._bg_write_failures) == 1:
+            QTimer.singleShot(0, self._show_bg_write_failures)
+
+    def _show_bg_write_failures(self) -> None:
+        failures = self._bg_write_failures
+        self._bg_write_failures = []
+        if not failures:
+            return  # already reported by closeEvent
+        QMessageBox.warning(self, "Save failed", self._bg_write_failures_text(failures))
+
+    @staticmethod
+    def _bg_write_failures_text(failures: list[str]) -> str:
+        shown = failures[:20]
+        more = len(failures) - len(shown)
+        details = "\n".join(shown) + (f"\n...and {more} more" if more > 0 else "")
+        return (
+            f"Could not save {len(failures)} file{'s' if len(failures) != 1 else ''}; "
+            f"the changes are not on disk:\n\n{details}"
+        )
 
     def _populate_tag_list(self, tags: list[str]) -> None:
         self.tag_controller._populate_tag_list(tags)
@@ -2561,11 +2606,13 @@ class MainWindow(QMainWindow):
         tags = self._current_tags()
         record = self.records[self.current_index]
         new_text = self._serialize_tags(tags)
+        # The tag list is filled from _parse_annotations_for_tag_list; if it still
+        # matches, only formatting differs and nothing is saved.  Compared as
+        # shown, so a case-only edit of the description counts as a change.
+        if tags == self._parse_annotations_for_tag_list(record.text):
+            return
         old_parsed = self._parse_tags(record.text)
         new_parsed = self._parse_tags(new_text)
-        # Ignore format-only churn so loading/selection does not trigger unsolicited saves.
-        if old_parsed == new_parsed:
-            return
 
         record.text = new_text
         self._update_list_item_preview(self.current_index)
@@ -2580,7 +2627,8 @@ class MainWindow(QMainWindow):
                 del self.tag_counts[k]
             self.known_tags = set(self.tag_counts)
             self._refresh_tag_completions()
-        self._write_record_text(record, status_prefix=status_prefix)
+        if self._write_record_text(record, status_prefix=status_prefix):
+            self._drop_validation_stamp(record)
 
     def _rebuild_known_tags_from_records(self) -> None:
         self.tag_controller._rebuild_known_tags_from_records()
@@ -2632,6 +2680,15 @@ class MainWindow(QMainWindow):
         item.setToolTip(self._build_list_item_tooltip(record))
         self._set_image_list_row_widget(index)
 
+    def _refresh_list_item_thumbnail(self, index: int) -> None:
+        """Rebuild a row's thumbnail from the file, after it changed on disk (edit or crop)."""
+        if index < 0 or index >= len(self.records):
+            return
+        payload, _icc_invalid = FolderLoadWorker._thumbnail_rgba_bytes(self.records[index].image_path)
+        thumbnail = thumbnail_payload_to_qimage(payload)
+        if thumbnail is not None:
+            self._set_image_list_row_widget(index, thumbnail)
+
     def _refresh_all_list_item_previews(self) -> None:
         for index in range(len(self.records)):
             self._update_list_item_preview(index)
@@ -2644,14 +2701,27 @@ class MainWindow(QMainWindow):
         record = self.records[self.current_index]
         tags = self._current_tags()
         text = self._serialize_tags(tags)
+        changed = text != record.text
         record.text = text
 
         if self._write_record_text(record, status_prefix="Saved"):
+            if changed:
+                self._drop_validation_stamp(record)
             self._update_list_item_preview(self.current_index)
+
+    def _drop_validation_stamp(self, record: ImageRecord) -> None:
+        """The annotations changed since whoever validated them last looked."""
+        try:
+            stamp_cleared = clear_validation_stamp(record.image_path)
+        except OSError as exc:
+            self.statusBar().showMessage(f"Could not clear validation for {record.image_path.name}: {exc}")
+            return
+        if stamp_cleared:
+            self._on_fixup_state_changed(record.image_path)
 
     def _write_record_text(self, record: ImageRecord, status_prefix: str) -> bool:
         try:
-            atomic_write_text(record.text_path, record.text, encoding="utf-8")
+            write_text_in_order(record.text_path, record.text, encoding="utf-8")
         except OSError as exc:
             QMessageBox.critical(self, "Save failed", f"Could not save text file:\n{exc}")
             return False
@@ -2662,171 +2732,6 @@ class MainWindow(QMainWindow):
     def _llm_threads_status_suffix(self) -> str:
         return self.llm_controller._llm_threads_status_suffix()
 
-    def _run_parallel_llm_jobs(
-        self,
-        jobs: list[object],
-        requested_threads: int,
-        action_prefix: str,
-        cancel_token: LlmRequestCancellation,
-        report_progress: Callable[[str], None],
-        report_item: Callable[[object], None],
-        process_one: Callable[[int, object], dict],
-    ) -> None:
-        self.llm_controller._run_parallel_llm_jobs(
-            jobs=jobs,
-            requested_threads=requested_threads,
-            action_prefix=action_prefix,
-            cancel_token=cancel_token,
-            report_progress=report_progress,
-            report_item=report_item,
-            process_one=process_one,
-        )
-        total = len(jobs)
-        if total <= 0:
-            return
-
-        auto_mode = requested_threads == 0
-
-        def cfg_int(key: str, default: int, minimum: int, maximum: int) -> int:
-            raw_value = self._cfg.get(key, default)
-            try:
-                parsed = int(raw_value)
-            except (TypeError, ValueError):
-                parsed = default
-            return max(minimum, min(maximum, parsed))
-
-        def cfg_float(key: str, default: float, minimum: float, maximum: float) -> float:
-            raw_value = self._cfg.get(key, default)
-            try:
-                parsed = float(raw_value)
-            except (TypeError, ValueError):
-                parsed = default
-            return max(minimum, min(maximum, parsed))
-
-        auto_max_threads = cfg_int("llm_auto_max_threads", int(self._cfg.get("ollama_auto_max_threads", 32)), 1, 512)
-        if auto_mode:
-            max_threads = min(total, auto_max_threads)
-            target_parallelism = 1
-        else:
-            max_threads = min(total, requested_threads)
-            target_parallelism = max_threads
-
-        self._llm_threads_auto_mode = auto_mode
-        self._llm_threads_current = target_parallelism
-
-        # Auto mode uses a conservative AIMD-like controller with latency/retry guardrails.
-        # Scale up by +1 every `scale_up_every` consecutive clean completions after warmup.
-        # A retry resets the streak and steps down by 1; a timeout halves immediately.
-        adaptive_warmup_items = cfg_int("llm_auto_warmup_items", int(self._cfg.get("ollama_auto_warmup_items", 4)), 1, 1000)
-        scale_up_every = cfg_int("llm_auto_scale_up_every", int(self._cfg.get("ollama_auto_scale_up_every", 3)), 1, 100)
-        consecutive_clean = 0
-        backoff_epoch = 0
-
-        def log_thread_change(previous: int, current: int, reason: str, image_name: str = "") -> None:
-            if previous == current:
-                return
-            message = (
-                f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] "
-                f"llm_threads_change action={action_prefix.lower()} from={previous} to={current} reason={reason}"
-            )
-            if image_name:
-                message += f" image={image_name}"
-            print(message, flush=True)
-
-        executor = ThreadPoolExecutor(max_workers=max_threads)
-        in_flight: set = set()
-        future_backoff_epochs: dict = {}
-        next_job_index = 0
-        completed = 0
-
-        try:
-            while next_job_index < total and len(in_flight) < target_parallelism:
-                future = executor.submit(process_one, next_job_index + 1, jobs[next_job_index])
-                in_flight.add(future)
-                future_backoff_epochs[future] = backoff_epoch
-                next_job_index += 1
-
-            while in_flight:
-                cancel_token.raise_if_cancelled()
-                finished = next(as_completed(in_flight))
-                in_flight.remove(finished)
-                finished_backoff_epoch = int(future_backoff_epochs.pop(finished, backoff_epoch))
-
-                payload = finished.result()
-                completed += 1
-
-                retried = bool(payload.get("retried")) if isinstance(payload, dict) else False
-                perf_retry = bool(payload.get("perf_retry", retried)) if isinstance(payload, dict) else retried
-                image_name = ""
-                if isinstance(payload, dict):
-                    image_name = str(payload.get("image_name", "")).strip()
-                if auto_mode:
-                    timed_out = bool(payload.get("timed_out")) if isinstance(payload, dict) else False
-                    if timed_out:
-                        # Only the first negative signal from a given submission epoch
-                        # should trigger backoff. Other in-flight failures from the same
-                        # overload window are stale signals and should not keep shrinking.
-                        if finished_backoff_epoch == backoff_epoch:
-                            previous_parallelism = target_parallelism
-                            target_parallelism = max(1, target_parallelism // 2)
-                            backoff_epoch += 1
-                            consecutive_clean = 0
-                            log_thread_change(
-                                previous_parallelism,
-                                target_parallelism,
-                                f"timeout_backoff completed={completed}/{total} epoch={backoff_epoch}",
-                                image_name=image_name,
-                            )
-                    elif perf_retry:
-                        if finished_backoff_epoch == backoff_epoch:
-                            previous_parallelism = target_parallelism
-                            target_parallelism = max(1, target_parallelism - 1)
-                            backoff_epoch += 1
-                            consecutive_clean = 0
-                            log_thread_change(
-                                previous_parallelism,
-                                target_parallelism,
-                                f"retry_backoff completed={completed}/{total} epoch={backoff_epoch}",
-                                image_name=image_name,
-                            )
-                    elif completed >= adaptive_warmup_items:
-                        consecutive_clean += 1
-                        # Require scale_up_every * current_parallelism clean items before
-                        # adding a thread. This naturally slows ramp-up at higher concurrency
-                        # and prevents runaway scaling when the server is under load.
-                        threshold = scale_up_every * max(1, target_parallelism)
-                        if consecutive_clean >= threshold and target_parallelism < max_threads:
-                            previous_parallelism = target_parallelism
-                            target_parallelism += 1
-                            consecutive_clean = 0
-                            log_thread_change(
-                                previous_parallelism,
-                                target_parallelism,
-                                f"clean_scale_up completed={completed}/{total} threshold={threshold}",
-                                image_name=image_name,
-                            )
-                    self._llm_threads_current = target_parallelism
-
-                if image_name:
-                    report_progress(f"{action_prefix}: processing {completed}/{total} - {image_name}")
-                else:
-                    report_progress(f"{action_prefix}: processing {completed}/{total}")
-
-                report_item(payload)
-
-                while next_job_index < total and len(in_flight) < target_parallelism:
-                    future = executor.submit(process_one, next_job_index + 1, jobs[next_job_index])
-                    in_flight.add(future)
-                    future_backoff_epochs[future] = backoff_epoch
-                    next_job_index += 1
-        except Exception:
-            cancel_token.cancel()
-            for future in in_flight:
-                future.cancel()
-            raise
-        finally:
-            executor.shutdown(wait=True, cancel_futures=True)
-
     def generate_with_llm(self) -> None:
         self.llm_controller.generate_with_llm()
 
@@ -2835,76 +2740,6 @@ class MainWindow(QMainWindow):
 
     def ai_find_with_llm(self) -> None:
         self.llm_controller.ai_find_with_llm()
-
-    def _start_llm_task(
-        self,
-        task: Callable[[Callable[[str], None], Callable[[object], None]], object],
-        action_name: str,
-        empty_message: str,
-        cancel_token: LlmRequestCancellation | None = None,
-        result_as_single: bool = False,
-        merge_with_existing: bool = False,
-        validation_report: bool = False,
-    ) -> None:
-        self.llm_controller._start_llm_task(
-            task=task,
-            action_name=action_name,
-            empty_message=empty_message,
-            cancel_token=cancel_token,
-            result_as_single=result_as_single,
-            merge_with_existing=merge_with_existing,
-            validation_report=validation_report,
-        )
-        if not self.llm_model_name.strip():
-            QMessageBox.warning(self, "No model selected", f"Connect to {self._llm_provider.display_name} and choose a model first.")
-            return
-        if self._llm_thread is not None:
-            return
-
-        resize_warning = consume_image_preparation_warning()
-        if resize_warning:
-            QMessageBox.warning(self, "Image resize disabled", resize_warning)
-
-        self.statusBar().showMessage(f"{action_name} with {self._llm_provider.display_name}...")
-        self.validate_button.setEnabled(False)
-        self.llm_endpoint_input.setEnabled(False)
-        self.llm_fetch_button.setEnabled(False)
-        self.llm_model_combo.setEnabled(False)
-        self.llm_timeout_input.setEnabled(False)
-        self.llm_retry_input.setEnabled(False)
-        self.llm_max_resolution_input.setEnabled(False)
-        self.llm_threads_input.setEnabled(False)
-        self.llm_think_tags_checkbox.setEnabled(False)
-        self.llm_think_description_checkbox.setEnabled(False)
-        self.llm_use_button.setEnabled(False)
-        self._llm_action_name = action_name
-        self._llm_cancel = cancel_token
-        self._update_llm_controls()
-
-        self._llm_thread = QThread(self)
-        self._llm_worker = LlmTaskWorker(task)
-        self._llm_worker.moveToThread(self._llm_thread)
-        self._llm_thread.started.connect(self._llm_worker.run)
-        self._llm_worker.finished.connect(
-            lambda result: self._on_llm_task_finished(
-                result,
-                action_name,
-                empty_message,
-                result_as_single,
-                merge_with_existing,
-                validation_report,
-            )
-        )
-        self._llm_worker.progress.connect(self._on_llm_task_progress)
-        self._llm_worker.item_ready.connect(self._on_llm_task_item_ready)
-        self._llm_worker.cancelled.connect(self._on_llm_task_cancelled)
-        self._llm_worker.failed.connect(self._on_llm_task_failed)
-        self._llm_worker.finished.connect(self._llm_thread.quit)
-        self._llm_worker.cancelled.connect(self._llm_thread.quit)
-        self._llm_worker.failed.connect(self._llm_thread.quit)
-        self._llm_thread.finished.connect(self._cleanup_llm_task)
-        self._update_llm_controls()
-        self._llm_thread.start()
 
     def _request_stop_generation(self) -> None:
         self.llm_controller._request_stop_generation()
@@ -2917,37 +2752,6 @@ class MainWindow(QMainWindow):
 
     def _format_duration(self, seconds: float) -> str:
         return self.llm_controller._format_duration(seconds)
-
-    def _batch_progress_details(
-        self,
-        processed: int,
-        total: int,
-        started_at: float | None,
-        retry_images: int,
-    ) -> str:
-        return self.llm_controller._batch_progress_details(
-            processed=processed,
-            total=total,
-            started_at=started_at,
-            retry_images=retry_images,
-        )
-        if started_at is None:
-            return f" | elapsed --:-- | est --:-- | retried images {retry_images}"
-
-        elapsed = max(0.0, time.monotonic() - started_at)
-        if processed > 0:
-            remaining = max(0, total - processed)
-            average_per_image = elapsed / processed
-            estimated_remaining = average_per_image * remaining
-            estimated_text = self._format_duration(estimated_remaining)
-        else:
-            estimated_text = "--:--"
-
-        return (
-            f" | elapsed {self._format_duration(elapsed)}"
-            f" | est {estimated_text}"
-            f" | retried images {retry_images}"
-        )
 
     def _on_llm_task_progress(self, message: str) -> None:
         self.llm_controller._on_llm_task_progress(message)
@@ -3052,6 +2856,7 @@ class MainWindow(QMainWindow):
 
         record.text = new_text
         if self._write_record_text(record, status_prefix="Generate + auto-saved"):
+            self._drop_validation_stamp(record)
             self._update_list_item_preview(record_index)
 
             if self.current_index == record_index and not self.tag_input.hasFocus():
@@ -3064,276 +2869,6 @@ class MainWindow(QMainWindow):
 
     def _on_llm_task_item_ready(self, payload: object) -> None:
         self.llm_controller._on_llm_task_item_ready(payload)
-
-    def _on_llm_task_finished(
-        self,
-        result: object,
-        action_name: str,
-        empty_message: str,
-        result_as_single: bool = False,
-        merge_with_existing: bool = False,
-        validation_report: bool = False,
-    ) -> None:
-        self.llm_controller._on_llm_task_finished(
-            result=result,
-            action_name=action_name,
-            empty_message=empty_message,
-            result_as_single=result_as_single,
-            merge_with_existing=merge_with_existing,
-            validation_report=validation_report,
-        )
-        if (
-            isinstance(result, dict)
-            and result.get("batch") is True
-            and result.get("streamed") is True
-            and result.get("mode") == "validate"
-        ):
-            skipped = self._validate_batch_skipped
-            total_checked = self._validate_batch_clean + self._validate_batch_issues
-            errors = self._validate_batch_errors
-
-            if total_checked == 0 and errors == 0:
-                QMessageBox.information(self, f"{action_name} finished", empty_message)
-                self.statusBar().showMessage(f"{action_name} finished")
-            else:
-                parts = [
-                    f"{total_checked} image{'s' if total_checked != 1 else ''} checked",
-                    f"{self._validate_batch_clean} clean",
-                    f"{self._validate_batch_issues} fixup file{'s' if self._validate_batch_issues != 1 else ''}",
-                ]
-                if errors:
-                    parts.append(f"{errors} error{'s' if errors != 1 else ''}")
-                if skipped:
-                    parts.append(f"{skipped} skipped")
-                self.statusBar().showMessage(
-                    f"{action_name} complete via {self._llm_provider.display_name} ({', '.join(parts)})"
-                )
-
-            self._validate_batch_total = 0
-            self._validate_batch_processed = 0
-            self._validate_batch_clean = 0
-            self._validate_batch_issues = 0
-            self._validate_batch_skipped = 0
-            self._validate_batch_errors = 0
-            ctx_exhausted = self._validate_batch_context_exhausted
-            self._validate_batch_context_exhausted = 0
-            if ctx_exhausted > 0:
-                n = ctx_exhausted
-                QMessageBox.warning(
-                    self,
-                    "Context window exhausted",
-                    f"{n} image{'s' if n != 1 else ''} failed because the model exhausted its "
-                    f"context window — thinking (CoT) tokens consumed all available space, leaving "
-                    f"no room for a response.\n\n"
-                    f"To fix this, increase num_ctx on your Ollama server. For example, pull the "
-                    f"model with a higher context size or set num_ctx in the model options "
-                    f"(e.g. 32768 or higher).",
-                )
-            return
-
-        if (
-            isinstance(result, dict)
-            and result.get("batch") is True
-            and result.get("streamed") is True
-            and result.get("mode") == "ai_find"
-        ):
-            query = " ".join(str(result.get("query") or "").split())
-            total = self._ai_find_batch_total
-            matched = self._ai_find_batch_matched
-            if matched <= 0:
-                QMessageBox.information(self, f"{action_name} finished", empty_message)
-                self.statusBar().showMessage(f"{action_name} complete (found images: 0 of {total} for '{query}')")
-            else:
-                self.statusBar().showMessage(
-                    f"{action_name} complete (found images: {matched} of {total} for '{query}')"
-                )
-
-            self._ai_find_batch_total = 0
-            self._ai_find_batch_processed = 0
-            self._ai_find_batch_matched = 0
-            self._ai_find_batch_retry_images = 0
-            return
-
-        if isinstance(result, dict) and result.get("batch") is True and result.get("streamed") is True:
-            # Check if any output was generated (tags/description or vision)
-            has_annotations = self._generate_batch_updated > 0
-            has_vision = self._generate_batch_vision_updated > 0
-            has_refine = self._generate_batch_refine_updated > 0
-
-            if not has_annotations and not has_vision and not has_refine:
-                QMessageBox.information(self, f"{action_name} finished", empty_message)
-                self.statusBar().showMessage(f"{action_name} finished")
-            else:
-                parts = []
-                if has_annotations:
-                    parts.append(f"{self._generate_batch_updated} image{'s' if self._generate_batch_updated != 1 else ''}, {self._generate_batch_new_annotations} new annotation{'s' if self._generate_batch_new_annotations != 1 else ''}")
-                if has_vision:
-                    parts.append(f"{self._generate_batch_vision_updated} vision update{'s' if self._generate_batch_vision_updated != 1 else ''}")
-                if has_refine:
-                    parts.append(f"{self._generate_batch_refine_updated} refine fixup{'s' if self._generate_batch_refine_updated != 1 else ''}")
-                summary = ", ".join(parts)
-                self.statusBar().showMessage(
-                    f"{action_name} complete via {self._llm_provider.display_name} ({summary})"
-                )
-            self._generate_batch_total = 0
-            self._generate_batch_processed = 0
-            self._generate_batch_updated = 0
-            self._generate_batch_vision_updated = 0
-            self._generate_batch_refine_updated = 0
-            self._generate_batch_new_annotations = 0
-            return
-
-        if isinstance(result, dict) and result.get("batch") is True:
-            batch_results = result.get("results")
-            entries = batch_results if isinstance(batch_results, list) else []
-            updated = 0
-            with_new = 0
-
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                raw_index = entry.get("index")
-                if not isinstance(raw_index, int):
-                    continue
-                if raw_index < 0 or raw_index >= len(self.records):
-                    continue
-
-                raw_items = entry.get("items")
-                items = [str(item).strip() for item in raw_items] if isinstance(raw_items, list) else []
-                items = [item for item in items if item]
-
-                record = self.records[raw_index]
-                existing_tags = self._parse_tags(record.text)
-                seen = {tag.casefold() for tag in existing_tags}
-                merged_tags = list(existing_tags)
-                added = 0
-
-                for item in items:
-                    key = item.casefold()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged_tags.append(item)
-                    added += 1
-
-                if added == 0:
-                    continue
-
-                record.text = self._serialize_tags(merged_tags)
-                if self._write_record_text(record, status_prefix="Generate + auto-saved"):
-                    self._update_list_item_preview(raw_index)
-                    updated += 1
-                    with_new += added
-
-            if updated == 0:
-                QMessageBox.information(self, f"{action_name} finished", empty_message)
-                self.statusBar().showMessage(f"{action_name} finished")
-                return
-
-            self._rebuild_known_tags_from_records()
-            self._refresh_tag_completions()
-
-            if 0 <= self.current_index < len(self.records):
-                self._populate_tag_list(self._parse_annotations_for_tag_list(self.records[self.current_index].text))
-
-            self.statusBar().showMessage(
-                f"{action_name} complete via {self._llm_provider.display_name} ({updated} image{'s' if updated != 1 else ''}, {with_new} new annotation{'s' if with_new != 1 else ''})"
-            )
-            return
-
-        if validation_report:
-            cleaned = str(result).strip()
-            if not cleaned:
-                QMessageBox.information(self, f"{action_name} finished", empty_message)
-                self.statusBar().showMessage(f"{action_name} finished")
-                return
-
-            if cleaned.casefold() == "ok":
-                self.statusBar().showMessage("Validate complete: no issues found")
-                record = self._current_record()
-                if record is not None:
-                    clear_validation_fields_sidecar(
-                        record.image_path,
-                        model=self.llm_model_name,
-                        date=datetime.now().astimezone().isoformat(timespec="seconds"),
-                    )
-                    self._on_fixup_state_changed()
-                return
-
-            if self.current_index < 0 or self.current_index >= len(self.records):
-                QMessageBox.warning(self, "Validate failed", "No selected image to write a fixup file.")
-                self.statusBar().showMessage("Validate failed")
-                return
-
-            record = self.records[self.current_index]
-            try:
-                from imagetagger.utils.fixup_parser import parse_fixup_data
-                parsed_fixup = parse_fixup_data(cleaned, self._parse_tags, self._sanitize_annotation_text)
-                if not parsed_fixup.issues and not parsed_fixup.corrected_tags and not parsed_fixup.corrected_description_raw:
-                    clear_validation_fields_sidecar(
-                        record.image_path,
-                        model=self.llm_model_name,
-                        date=datetime.now().astimezone().isoformat(timespec="seconds"),
-                    )
-                    self.statusBar().showMessage("Validate complete: no issues found")
-                    self._on_fixup_state_changed()
-                    return
-                write_fixup_sidecar(
-                    record.image_path,
-                    parsed_fixup.issues or None,
-                    parsed_fixup.corrected_tags or None,
-                    parsed_fixup.corrected_description_raw or None,
-                    model=self.llm_model_name,
-                    date=datetime.now().astimezone().isoformat(timespec="seconds"),
-                )
-            except OSError as exc:
-                QMessageBox.warning(self, "Fixup write failed", f"Could not write sidecar:\n{exc}")
-                self.statusBar().showMessage("Validate failed: could not write sidecar")
-                return
-
-            self.statusBar().showMessage("Validate found issues: saved to sidecar")
-            self._on_fixup_state_changed()
-            return
-
-        if isinstance(result, list):
-            tags = [str(item).strip() for item in result if str(item).strip()]
-        else:
-            text_result = str(result)
-            tags = [text_result.strip()] if result_as_single else self._parse_tags(text_result)
-        if not tags:
-            QMessageBox.information(self, f"{action_name} finished", empty_message)
-            self.statusBar().showMessage(f"{action_name} finished")
-            return
-
-        if merge_with_existing:
-            existing_tags = self._current_tags()
-            seen = {tag.casefold() for tag in existing_tags}
-            merged_tags = list(existing_tags)
-            added_count = 0
-
-            for tag in tags:
-                normalized = tag.strip()
-                if not normalized:
-                    continue
-                key = normalized.casefold()
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged_tags.append(normalized)
-                added_count += 1
-
-            if added_count == 0:
-                self.statusBar().showMessage(f"{action_name} finished (no new tags added)")
-                return
-
-            self._set_current_tags(merged_tags, status_prefix=f"{action_name} + auto-saved")
-            self.statusBar().showMessage(
-                f"{action_name} complete via {self._llm_provider.display_name} ({added_count} tag{'s' if added_count != 1 else ''} added)"
-            )
-            return
-
-        self._set_current_tags(tags, status_prefix=f"{action_name} + auto-saved")
-        self.statusBar().showMessage(f"{action_name} complete via {self._llm_provider.display_name}")
 
     def _on_llm_task_failed(self, message: str) -> None:
         self.llm_controller._on_llm_task_failed(message)

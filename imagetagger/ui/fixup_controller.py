@@ -3,15 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QThreadPool, QTimer, pyqtSlot
+from PyQt6.QtCore import QObject, QThreadPool, QTimer, pyqtSignal
 
 from imagetagger.providers.llm_provider import LlmProviderError
 from imagetagger.ui.merge_actions import open_fixup_dialog_for_image
-from imagetagger.ui.workers import _SimpleRunnable
 from imagetagger.ui.models import _UNKNOWN
 
 if TYPE_CHECKING:
     from imagetagger.ui.main_window import MainWindow
+
+
+class _CacheWarmSignaller(QObject):
+    """Reports a finished background cache warm back on the main thread."""
+
+    warmed = pyqtSignal()
 
 
 class FixupController:
@@ -36,6 +41,10 @@ class FixupController:
         self._preview_sync_timer.setInterval(150)
         self._preview_sync_timer.timeout.connect(self._sync_main_window_preview)
 
+        # Owned by the window so it outlives any warm still running on the pool.
+        self._cache_warm_signaller = _CacheWarmSignaller(window)
+        self._cache_warm_signaller.warmed.connect(self._on_fixup_cache_warmed)
+
     # ------------------------------------------------------------------
     # Fixup button state
     # ------------------------------------------------------------------
@@ -49,7 +58,7 @@ class FixupController:
             if item is None or item.isHidden():
                 enabled = False
         if w._llm_thread is not None:
-            if w._llm_action_name != "Validate" or w.current_index in w._validate_pending_indices:
+            if w._llm_action_name != "Validate" or record is None or record.image_path in w._validate_pending_paths:
                 enabled = False
         w.fixup_button.setEnabled(enabled)
 
@@ -113,19 +122,19 @@ class FixupController:
     def _async_warm_fixup_cache(self) -> None:
         records = list(self._window.records)  # snapshot to avoid mutation during iteration
 
+        signaller = self._cache_warm_signaller
+
         def _warm() -> None:
             from imagetagger.utils.sidecar import read_sidecar_data
             for record in records:
                 sidecar = read_sidecar_data(record.image_path)
                 record._sidecar_has_pending_fixup = sidecar.has_pending_fixup
                 record._sidecar_validated = sidecar.validated
+            signaller.warmed.emit()
 
-        worker = _SimpleRunnable(_warm)
-        worker.finished.connect(self._on_fixup_cache_warmed)
-        QThreadPool.globalInstance().start(worker)
+        QThreadPool.globalInstance().start(_warm)
 
-    # Step 5.3 — slot called on the main thread once the cache is warm
-    @pyqtSlot()
+    # Step 5.3 — called on the main thread once the cache is warm
     def _on_fixup_cache_warmed(self) -> None:
         w = self._window
         QTimer.singleShot(0, w._refresh_all_list_item_previews)
@@ -151,11 +160,11 @@ class FixupController:
                 index += direction
                 continue
 
-            if index in w._validate_pending_indices:
+            record = w.records[index]
+            if record.image_path in w._validate_pending_paths:
                 index += direction
                 continue
 
-            record = w.records[index]
             if w._record_needs_fixup(record):
                 return index
 
@@ -170,12 +179,12 @@ class FixupController:
 
         indices = range(len(w.records) - 1, -1, -1) if reverse else range(len(w.records))
         for index in indices:
-            if index in w._validate_pending_indices:
-                continue
             item = w.list_widget.item(index)
             if item is not None and item.isHidden():
                 continue
             record = w.records[index]
+            if record.image_path in w._validate_pending_paths:
+                continue
             if w._record_needs_fixup(record):
                 return index
         return None

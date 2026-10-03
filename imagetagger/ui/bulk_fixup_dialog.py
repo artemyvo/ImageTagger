@@ -202,7 +202,10 @@ class BulkFixupDialog(QDialog):
 
             # --- Update .txt ---
             all_annotations = self._parse_tags(record.text)
-            description_part = [t for t in all_annotations if self._is_description_like(t)]
+            # The description is kept as written; _parse_tags would lowercase it.
+            description_part = [
+                t for t in mw._split_record_annotations(record.text) if self._is_description_like(t)
+            ]
             current_tag_set = {t for t in all_annotations if not self._is_description_like(t)}
             new_tag_set = (current_tag_set | img_accepted_adds) - img_accepted_dels
             new_annotations = description_part + sorted(new_tag_set)

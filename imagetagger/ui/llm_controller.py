@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 import time
 from typing import TYPE_CHECKING, Callable
 
@@ -11,8 +12,9 @@ from PyQt6.QtWidgets import QMessageBox
 from imagetagger.utils.annotations import sanitize_annotation_text, sanitize_tag_text
 from imagetagger.utils.image_prep import configure_image_preparation, consume_image_preparation_warning
 from imagetagger.utils.input_validators import InputValidator
-from imagetagger.utils.sidecar import read_sidecar_data, write_sidecar_data
+from imagetagger.utils.sidecar import read_sidecar_data
 from imagetagger.utils.llm_queries import (
+    LlmQueryError,
     active_prompt_for_kind,
     clear_prompt_override,
     format_annotations_for_validation,
@@ -39,6 +41,7 @@ from imagetagger.ui.merge_actions import (
     clear_validation_fields_sidecar,
     record_ai_find_match_for_image,
     record_refine_result_for_image,
+    record_vision_result_for_image,
     write_fixup_sidecar,
 )
 from imagetagger.providers.llm_provider import (
@@ -51,6 +54,7 @@ from imagetagger.ui.workers import LlmTaskWorker, RegenerateWorker
 
 if TYPE_CHECKING:
     from imagetagger.ui.main_window import MainWindow
+    from imagetagger.ui.models import ImageRecord
 
 
 class LlmController:
@@ -89,13 +93,16 @@ class LlmController:
         self._validate_batch_llm_disobeyed: int = 0
         self._validate_batch_errors: int = 0
         self._validate_batch_context_exhausted: int = 0
-        self._validate_pending_indices: set[int] = set()
+        # Image paths still being validated; paths, not list indexes, because
+        # the record list can change (delete, folder reload) mid-batch.
+        self._validate_pending_paths: set[Path] = set()
 
         self._ai_find_batch_total: int = 0
         self._ai_find_batch_processed: int = 0
         self._ai_find_batch_matched: int = 0
         self._ai_find_batch_started_at: float | None = None
         self._ai_find_batch_retry_images: int = 0
+        self._ai_find_batch_errors: int = 0
 
     # ------------------------------------------------------------------
     # Public read-only properties used by MainWindow
@@ -114,8 +121,8 @@ class LlmController:
         return self._llm_cancel
 
     @property
-    def validate_pending_indices(self) -> set[int]:
-        return self._validate_pending_indices
+    def validate_pending_paths(self) -> set[Path]:
+        return self._validate_pending_paths
 
     # ------------------------------------------------------------------
     # Prompt helpers (kept here because they are LLM-only)
@@ -195,7 +202,7 @@ class LlmController:
         w = self._window
         try:
             set_prompt_override(kind, self._prompt_editor_text(kind))
-        except LlmProviderError as exc:
+        except LlmQueryError as exc:
             QMessageBox.critical(w, "Apply prompt failed", str(exc))
             return
         self._update_prompt_status(kind)
@@ -205,7 +212,7 @@ class LlmController:
         w = self._window
         try:
             saved_text = save_prompt_for_kind(kind, self._prompt_editor_text(kind))
-        except LlmProviderError as exc:
+        except LlmQueryError as exc:
             QMessageBox.critical(w, "Save prompt failed", str(exc))
             return
 
@@ -220,7 +227,7 @@ class LlmController:
         try:
             default_text = reset_prompt_to_default(kind)
             clear_prompt_override(kind)
-        except LlmProviderError as exc:
+        except LlmQueryError as exc:
             QMessageBox.critical(w, "Reset prompt failed", str(exc))
             return
 
@@ -702,6 +709,8 @@ class LlmController:
         if not selected_indexes:
             QMessageBox.information(w, "No image selected", "Select an image before generating annotations.")
             return
+        # Records, not list indexes: the list can change while the batch runs.
+        selected_records = [w.records[index] for index in selected_indexes]
         include_tags = w.generate_tags_checkbox.isChecked()
         include_description = w.generate_description_checkbox.isChecked()
         include_vision = w.generate_vision_checkbox.isChecked()
@@ -731,8 +740,7 @@ class LlmController:
             description_role = agent_roles.get("description") or None
             tagging_role = agent_roles.get("tagging") or None
 
-            def process_one(position: int, record_index: int) -> dict:
-                record = w.records[record_index]
+            def process_one(position: int, record: ImageRecord) -> dict:
                 image_name = w._display_image_path(record.image_path)
 
                 existing_parts = w._split_record_annotations(record.text)
@@ -841,22 +849,21 @@ class LlmController:
                                 # field instead of a THOUGHT section; keep it as the
                                 # sidecar reasoning so the trace is not lost.
                                 attempt_vision_reasoning = getattr(vision_raw, "thinking", "") or ""
-
-                            if attempt_vision_reasoning or attempt_vision_description:
-                                try:
-                                    vision_data = read_sidecar_data(record.image_path)
-                                    vision_data.description = attempt_vision_description
-                                    vision_data.reasoning = attempt_vision_reasoning
-                                    write_sidecar_data(record.image_path, vision_data)
-                                except OSError as exc:
-                                    raise LlmProviderError(f"Could not write {record.image_path.with_suffix('.json').name}: {exc}") from exc
+                        # The GUI thread saves the Vision result, once it has
+                        # checked the image is still in the list.
 
                         if refine_enabled:
-                            sidecar = read_sidecar_data(record.image_path)
-                            if sidecar.description or sidecar.reasoning:
+                            if attempt_vision_reasoning or attempt_vision_description:
+                                refine_description = attempt_vision_description
+                                refine_reasoning = attempt_vision_reasoning
+                            else:
+                                sidecar = read_sidecar_data(record.image_path)
+                                refine_description = sidecar.description
+                                refine_reasoning = sidecar.reasoning
+                            if refine_description or refine_reasoning:
                                 refine_query = prepare_refine_query(
-                                    description=sidecar.description,
-                                    reasoning=sidecar.reasoning,
+                                    description=refine_description,
+                                    reasoning=refine_reasoning,
                                 )
                                 refine_raw = session.generate(
                                     record.image_path,
@@ -899,7 +906,7 @@ class LlmController:
 
                 return {
                     "kind": "generate_item",
-                    "index": record_index,
+                    "image_path": record.image_path,
                     "description": generated_description,
                     "tags": generated_tags,
                     "vision_description": vision_description,
@@ -916,13 +923,13 @@ class LlmController:
                 }
 
             self._run_parallel_llm_jobs(
-                jobs=[int(index) for index in selected_indexes],
+                jobs=selected_records,
                 requested_threads=thread_count,
                 action_prefix="Generate",
                 cancel_token=cancel_token,
                 report_progress=report_progress,
                 report_item=report_item,
-                process_one=lambda position, job: process_one(position, int(job)),
+                process_one=process_one,
             )
 
             report_progress(f"Generate: finalizing {total}/{total}")
@@ -970,16 +977,18 @@ class LlmController:
             QMessageBox.information(w, "No image selected", "Select an image before validating tags.")
             return
 
-        annotated_records: list[tuple[int, str]] = []
+        # Records, not list indexes: the list can change while the batch runs.
+        annotated_records: list[tuple[ImageRecord, str]] = []
         skipped_without_annotations = 0
         for record_index in selected_indexes:
             if record_index < 0 or record_index >= len(w.records):
                 continue
-            annotations = w.records[record_index].text
+            record = w.records[record_index]
+            annotations = record.text
             if not annotations.strip():
                 skipped_without_annotations += 1
                 continue
-            annotated_records.append((record_index, annotations))
+            annotated_records.append((record, annotations))
 
         if not annotated_records:
             QMessageBox.information(w, "No annotations to validate", "Add tags or a description before validating.")
@@ -1000,8 +1009,7 @@ class LlmController:
             retry_count = self._llm_retry_count()
             total = len(annotated_records)
 
-            def process_one(position: int, record_index: int, annotations: str) -> dict:
-                record = w.records[record_index]
+            def process_one(position: int, record: ImageRecord, annotations: str) -> dict:
                 image_name = w._display_image_path(record.image_path)
                 image_retried = False
                 image_perf_retry = False
@@ -1064,7 +1072,7 @@ class LlmController:
                         if attempt >= retry_count:
                             return {
                                 "kind": "validate_item_error",
-                                "index": record_index,
+                                "image_path": record.image_path,
                                 "error": str(exc),
                                 "timed_out": image_timed_out,
                                 "context_exhausted": getattr(exc, "context_exhausted", False),
@@ -1083,7 +1091,8 @@ class LlmController:
 
                 return {
                     "kind": "validate_item",
-                    "index": record_index,
+                    "image_path": record.image_path,
+                    "annotations": annotations,
                     "result": validation_result,
                     "retried": image_retried,
                     "perf_retry": image_perf_retry,
@@ -1095,13 +1104,13 @@ class LlmController:
                 }
 
             self._run_parallel_llm_jobs(
-                jobs=[(int(record_index), str(annotations)) for record_index, annotations in annotated_records],
+                jobs=annotated_records,
                 requested_threads=thread_count,
                 action_prefix="Validate",
                 cancel_token=cancel_token,
                 report_progress=report_progress,
                 report_item=report_item,
-                process_one=lambda position, job: process_one(position, int(job[0]), str(job[1])),
+                process_one=lambda position, job: process_one(position, job[0], job[1]),
             )
 
             report_progress(f"Validate: finalizing {total}/{total}")
@@ -1123,7 +1132,7 @@ class LlmController:
         self._validate_batch_llm_disobeyed = 0
         self._validate_batch_errors = 0
         self._validate_batch_context_exhausted = 0
-        self._validate_pending_indices = {idx for idx, _ in annotated_records}
+        self._validate_pending_paths = {record.image_path for record, _ in annotated_records}
 
         self._start_llm_task(
             task=validate_task,
@@ -1162,6 +1171,8 @@ class LlmController:
         if not selected_indexes:
             QMessageBox.information(w, "No image selected", "Select one or more images before running AI Find.")
             return
+        # Records, not list indexes: the list can change while the batch runs.
+        selected_records = [w.records[index] for index in selected_indexes]
 
         cancel_token = LlmRequestCancellation()
         session = self._active_provider_session()
@@ -1179,12 +1190,12 @@ class LlmController:
             retry_count = self._llm_retry_count()
             total = len(selected_indexes)
 
-            def process_one(position: int, record_index: int) -> dict:
-                record = w.records[record_index]
+            def process_one(position: int, record: ImageRecord) -> dict:
                 image_name = record.image_path.name
                 image_retried = False
                 image_perf_retry = False
                 matched = False
+                failure = ""
                 image_timed_out = False
                 image_started_at = time.monotonic()
 
@@ -1238,7 +1249,11 @@ class LlmController:
                             flush=True,
                         )
                         if attempt >= retry_count:
-                            raise
+                            # Give up on this image only, as Generate and Validate do;
+                            # re-raising would stop the whole search.
+                            failure = str(exc) or "request failed"
+                            matched = False
+                            break
                         continue
 
                     elapsed_seconds = time.monotonic() - attempt_start
@@ -1250,8 +1265,9 @@ class LlmController:
 
                 return {
                     "kind": "ai_find_item",
-                    "index": record_index,
+                    "image_path": record.image_path,
                     "matched": matched,
+                    "error": failure,
                     "retried": image_retried,
                     "perf_retry": image_perf_retry,
                     "timed_out": image_timed_out,
@@ -1263,13 +1279,13 @@ class LlmController:
                 }
 
             self._run_parallel_llm_jobs(
-                jobs=[int(index) for index in selected_indexes],
+                jobs=selected_records,
                 requested_threads=thread_count,
                 action_prefix="AI Find",
                 cancel_token=cancel_token,
                 report_progress=report_progress,
                 report_item=report_item,
-                process_one=lambda position, job: process_one(position, int(job)),
+                process_one=process_one,
             )
 
             report_progress(f"AI Find: finalizing {total}/{total}")
@@ -1286,6 +1302,7 @@ class LlmController:
         self._ai_find_batch_matched = 0
         self._ai_find_batch_started_at = time.monotonic()
         self._ai_find_batch_retry_images = 0
+        self._ai_find_batch_errors = 0
 
         self._start_llm_task(
             task=find_task,
@@ -1411,12 +1428,13 @@ class LlmController:
         self._validate_batch_retry_images = 0
         self._validate_batch_errors = 0
         self._validate_batch_context_exhausted = 0
-        self._validate_pending_indices = set()
+        self._validate_pending_paths = set()
         self._ai_find_batch_total = 0
         self._ai_find_batch_processed = 0
         self._ai_find_batch_matched = 0
         self._ai_find_batch_started_at = None
         self._ai_find_batch_retry_images = 0
+        self._ai_find_batch_errors = 0
         self._llm_action_name = None
         self._llm_cancel = None
         self._llm_threads_auto_mode = False
@@ -1549,13 +1567,20 @@ class LlmController:
 
         w.statusBar().showMessage(message or f"{action} stopped.")
 
+    def _payload_record_index(self, payload: dict) -> int:
+        """Current list index of the image a batch result is for, or -1 if it is gone."""
+        image_path = payload.get("image_path")
+        if not isinstance(image_path, Path):
+            return -1
+        return self._window._record_index_for_image_path(image_path)
+
     def _on_llm_task_item_ready(self, payload: object) -> None:
         w = self._window
         if not isinstance(payload, dict):
             return
         kind = payload.get("kind")
         if kind == "generate_item":
-            raw_index = payload.get("index")
+            raw_index = self._payload_record_index(payload)
             raw_description = payload.get("description")
             raw_tags = payload.get("tags")
             raw_vision_description = payload.get("vision_description")
@@ -1564,9 +1589,9 @@ class LlmController:
             raw_position = payload.get("position")
             raw_total = payload.get("total")
 
-            if not isinstance(raw_index, int):
-                return
-            if raw_index < 0 or raw_index >= len(w.records):
+            if raw_index < 0:
+                # The image left the list (deleted, or another folder opened).
+                self._generate_batch_processed += 1
                 return
             description = str(raw_description).strip() if isinstance(raw_description, str) else ""
             tags = [str(item).strip() for item in raw_tags] if isinstance(raw_tags, list) else []
@@ -1595,9 +1620,15 @@ class LlmController:
             vision_desc = str(raw_vision_description).strip() if isinstance(raw_vision_description, str) else ""
             vision_reason = str(raw_vision_reasoning).strip() if isinstance(raw_vision_reasoning, str) else ""
             if vision_desc or vision_reason:
-                self._generate_batch_vision_updated += 1
-                if w.current_index == raw_index:
-                    w._load_vision_for_current_image()
+                image_path = w.records[raw_index].image_path
+                try:
+                    record_vision_result_for_image(image_path, str(raw_vision_description), str(raw_vision_reasoning))
+                except OSError as exc:
+                    w.statusBar().showMessage(f"Could not save Vision result for {image_path.name}: {exc}")
+                else:
+                    self._generate_batch_vision_updated += 1
+                    if w.current_index == raw_index:
+                        w._load_vision_for_current_image()
 
             raw_refine_tags = payload.get("refine_tags")
             raw_refine_caption = payload.get("refine_caption")
@@ -1618,16 +1649,16 @@ class LlmController:
             return
 
         if kind == "ai_find_item":
-            raw_index = payload.get("index")
+            raw_index = self._payload_record_index(payload)
             raw_matched = payload.get("matched")
             raw_retried = payload.get("retried")
             raw_position = payload.get("position")
             raw_total = payload.get("total")
             raw_query = payload.get("query")
 
-            if not isinstance(raw_index, int):
-                return
-            if raw_index < 0 or raw_index >= len(w.records):
+            if raw_index < 0:
+                # The image left the list (deleted, or another folder opened).
+                self._ai_find_batch_processed += 1
                 return
 
             matched = bool(raw_matched)
@@ -1636,6 +1667,13 @@ class LlmController:
             self._ai_find_batch_processed += 1
             if isinstance(raw_retried, bool) and raw_retried:
                 self._ai_find_batch_retry_images += 1
+            raw_error = str(payload.get("error") or "")
+            if raw_error:
+                self._ai_find_batch_errors += 1
+                print(
+                    f"[{datetime.now().astimezone().isoformat(timespec='seconds')}] ai_find_error image={payload.get('image_name')} error={raw_error!r}",
+                    flush=True,
+                )
 
             if matched and query:
                 try:
@@ -1665,14 +1703,14 @@ class LlmController:
             return
 
         if kind == "validate_item_error":
-            raw_index = payload.get("index")
+            raw_path = payload.get("image_path")
             raw_error = str(payload.get("error") or "")
             raw_image_name = str(payload.get("image_name") or "").strip()
             raw_timed_out = bool(payload.get("timed_out"))
             raw_context_exhausted = bool(payload.get("context_exhausted"))
 
-            if isinstance(raw_index, int) and 0 <= raw_index < len(w.records):
-                self._validate_pending_indices.discard(raw_index)
+            if isinstance(raw_path, Path):
+                self._validate_pending_paths.discard(raw_path)
             self._validate_batch_processed += 1
             self._validate_batch_errors += 1
             if raw_timed_out:
@@ -1689,19 +1727,27 @@ class LlmController:
         if kind != "validate_item":
             return
 
-        raw_index = payload.get("index")
+        raw_path = payload.get("image_path")
+        raw_index = self._payload_record_index(payload)
         raw_result = payload.get("result")
         raw_retried = payload.get("retried")
         raw_position = payload.get("position")
         raw_total = payload.get("total")
 
-        if not isinstance(raw_index, int):
+        if isinstance(raw_path, Path):
+            self._validate_pending_paths.discard(raw_path)
+        if raw_index < 0:
+            # The image left the list (deleted, or another folder opened).
+            self._validate_batch_processed += 1
             return
-        if raw_index < 0 or raw_index >= len(w.records):
+        if w.records[raw_index].text != payload.get("annotations"):
+            # Edited while the request was out: the result is about text that
+            # is gone, and must not stamp or fix up the new one.
+            self._validate_batch_processed += 1
+            self._validate_batch_skipped += 1
             return
 
         outcome, llm_violated_no_commas = w._apply_validation_result_to_record(raw_index, str(raw_result or ""))
-        self._validate_pending_indices.discard(raw_index)
         self._validate_batch_processed += 1
         if isinstance(raw_retried, bool) and raw_retried:
             self._validate_batch_retry_images += 1
@@ -1791,18 +1837,19 @@ class LlmController:
             query = " ".join(str(result.get("query") or "").split())
             total = self._ai_find_batch_total
             matched = self._ai_find_batch_matched
+            errors = self._ai_find_batch_errors
+            errors_text = f", {errors} error{'s' if errors != 1 else ''}" if errors else ""
             if matched <= 0:
                 QMessageBox.information(w, f"{action_name} finished", empty_message)
-                w.statusBar().showMessage(f"{action_name} complete (found images: 0 of {total} for '{query}')")
-            else:
-                w.statusBar().showMessage(
-                    f"{action_name} complete (found images: {matched} of {total} for '{query}')"
-                )
+            w.statusBar().showMessage(
+                f"{action_name} complete (found images: {matched} of {total} for '{query}'{errors_text})"
+            )
 
             self._ai_find_batch_total = 0
             self._ai_find_batch_processed = 0
             self._ai_find_batch_matched = 0
             self._ai_find_batch_retry_images = 0
+            self._ai_find_batch_errors = 0
             return
 
         if isinstance(result, dict) and result.get("batch") is True and result.get("streamed") is True:
@@ -1831,64 +1878,6 @@ class LlmController:
             self._generate_batch_vision_updated = 0
             self._generate_batch_refine_updated = 0
             self._generate_batch_new_annotations = 0
-            return
-
-        if isinstance(result, dict) and result.get("batch") is True:
-            batch_results = result.get("results")
-            entries = batch_results if isinstance(batch_results, list) else []
-            updated = 0
-            with_new = 0
-
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                raw_index = entry.get("index")
-                if not isinstance(raw_index, int):
-                    continue
-                if raw_index < 0 or raw_index >= len(w.records):
-                    continue
-
-                raw_items = entry.get("items")
-                items = [str(item).strip() for item in raw_items] if isinstance(raw_items, list) else []
-                items = [item for item in items if item]
-
-                record = w.records[raw_index]
-                existing_tags = w._parse_tags(record.text)
-                seen = {tag.casefold() for tag in existing_tags}
-                merged_tags = list(existing_tags)
-                added = 0
-
-                for item in items:
-                    key = item.casefold()
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    merged_tags.append(item)
-                    added += 1
-
-                if added == 0:
-                    continue
-
-                record.text = w._serialize_tags(merged_tags)
-                if w._write_record_text(record, status_prefix="Generate + auto-saved"):
-                    w._update_list_item_preview(raw_index)
-                    updated += 1
-                    with_new += added
-
-            if updated == 0:
-                QMessageBox.information(w, f"{action_name} finished", empty_message)
-                w.statusBar().showMessage(f"{action_name} finished")
-                return
-
-            w._rebuild_known_tags_from_records()
-            w._refresh_tag_completions()
-
-            if 0 <= w.current_index < len(w.records):
-                w._populate_tag_list(w._parse_annotations_for_tag_list(w.records[w.current_index].text))
-
-            w.statusBar().showMessage(
-                f"{action_name} complete via {w._llm_provider.display_name} ({updated} image{'s' if updated != 1 else ''}, {with_new} new annotation{'s' if with_new != 1 else ''})"
-            )
             return
 
         if validation_report:

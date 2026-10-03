@@ -1139,7 +1139,11 @@ class ComparisonPanel(QWidget):
             return False
         before_count = self.left_list.count()
         self._remove_left_item_from_table(row, left_text)
-        return self.left_list.count() < before_count
+        if self.left_list.count() >= before_count:
+            return False
+        # Keep a row selected, as the ✕ button does: the next row now sits at *row*.
+        self._advance_to_next_actionable_from(row)
+        return True
 
     def _apply_proposed_value_for_table_row(self, row: int) -> bool:
         if row < 0 or row >= len(self._table_row_map):

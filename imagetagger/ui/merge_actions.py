@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -10,6 +11,7 @@ from imagetagger.utils.annotations import sanitize_description_text, sanitize_ta
 from imagetagger.utils.fixup_parser import FixupData
 from imagetagger.utils.sidecar import (
     SidecarData,
+    delete_sidecar_data,
     get_sidecar_json_path,
     read_sidecar_data,
     write_sidecar_data,
@@ -55,6 +57,13 @@ def record_ai_find_match_for_image(
         write_sidecar_data(image_path, data)
 
 
+def record_vision_result_for_image(image_path: Path, description: str, reasoning: str) -> None:
+    data = read_sidecar_data(image_path)
+    data.description = description
+    data.reasoning = reasoning
+    write_sidecar_data(image_path, data)
+
+
 def record_refine_result_for_image(
     image_path: Path,
     tags: list[str],
@@ -96,10 +105,20 @@ def clear_validation_fields_sidecar(image_path: Path, model: str | None = None, 
     write_sidecar_data(image_path, data)
 
 
+def clear_validation_stamp(image_path: Path) -> bool:
+    """Drop the validated stamp; returns True when there was one to drop."""
+    data = read_sidecar_data(image_path)
+    if data.validated is None and data.validated_by is None:
+        return False
+    data.validated = None
+    data.validated_by = None
+    write_sidecar_data(image_path, data)
+    return True
+
+
 def delete_sidecar_for_image(image_path: Path) -> None:
-    path = get_sidecar_json_path(image_path)
     try:
-        path.unlink(missing_ok=True)
+        delete_sidecar_data(image_path)
     except OSError:
         pass
 
@@ -231,16 +250,8 @@ def open_fixup_dialog_for_image(
         QMessageBox.warning(parent, "Sidecar read failed", f"Could not read sidecar file:\n{exc}")
         return "error"
 
-    original_sidecar = SidecarData(
-        description=sidecar.description,
-        reasoning=sidecar.reasoning,
-        fixup_issues=sidecar.fixup_issues,
-        fixup_tags=list(sidecar.fixup_tags) if sidecar.fixup_tags is not None else None,
-        fixup_description=sidecar.fixup_description,
-        ai_find_matches=list(sidecar.ai_find_matches) if sidecar.ai_find_matches is not None else None,
-        vision_tags=list(sidecar.vision_tags) if sidecar.vision_tags is not None else None,
-        vision_caption=sidecar.vision_caption,
-    )
+    # Undo restores exactly this, every field included.
+    original_sidecar = copy.deepcopy(sidecar)
 
     if not sidecar.has_pending_fixup:
         # No pending fixup — open in clean mode: proposed mirrors current so the

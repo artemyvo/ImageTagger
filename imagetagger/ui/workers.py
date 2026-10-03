@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Callable
-from PyQt6.QtCore import QObject, QRunnable, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
 from imagetagger.providers.llm_provider import LlmProviderCancelled, LlmProviderError
 import os
 import threading
@@ -11,27 +11,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image, ImageCms, UnidentifiedImageError
 from PyQt6.QtCore import QSize
+from PyQt6.QtGui import QImage
 
 from imagetagger.ui.models import ImageRecord
 from imagetagger.utils.sidecar import read_sidecar_data
-
-
-class _SimpleRunnable(QObject, QRunnable):
-    """Minimal QRunnable that can emit a *finished* signal.
-
-    ``QRunnable`` alone cannot emit signals; the ``QObject`` mixin enables it.
-    """
-
-    finished = pyqtSignal()
-
-    def __init__(self, fn: Callable[[], None]) -> None:
-        QObject.__init__(self)
-        QRunnable.__init__(self)
-        self._fn = fn
-
-    def run(self) -> None:
-        self._fn()
-        self.finished.emit()
 
 
 class RegenerateWorker(QObject):
@@ -65,35 +48,23 @@ MIN_FONT_POINT_SIZE = 8
 MAX_FONT_POINT_SIZE = 40
 
 
-class TagPurgeWorker(QObject):
-    """Write updated text files for a bulk tag removal in a background thread."""
-
-    progress = pyqtSignal(int, int)   # (done, total)
-    finished = pyqtSignal()
-    failed = pyqtSignal(str)
-
-    def __init__(self, jobs: list[tuple[Path, str]]) -> None:
-        """
-        jobs: list of (text_path, new_text) pairs to write atomically.
-        """
-        super().__init__()
-        self._jobs = jobs
-
-    def run(self) -> None:
-        total = len(self._jobs)
-        try:
-            for done, (path, text) in enumerate(self._jobs, 1):
-                # Use a temp-file rename for atomicity but skip fsync —
-                # full fsync durability is not needed for bulk tag edits
-                # and makes bulk writes orders of magnitude slower.
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                tmp.write_text(text, encoding="utf-8")
-                tmp.replace(path)
-                self.progress.emit(done, total)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-            return
-        self.finished.emit()
+def thumbnail_payload_to_qimage(payload: object) -> "QImage | None":
+    """Rebuild the QImage for a thumbnail payload from FolderLoadWorker._thumbnail_rgba_bytes."""
+    if not isinstance(payload, dict):
+        return None
+    try:
+        data = payload.get("bytes")
+        width = int(payload.get("width", 0))
+        height = int(payload.get("height", 0))
+        bytes_per_line = int(payload.get("bytes_per_line", width * 4))
+        has_alpha = bool(payload.get("has_alpha", True))
+        if data is None or width <= 0 or height <= 0 or bytes_per_line <= 0:
+            return None
+        fmt = QImage.Format.Format_RGBA8888 if has_alpha else QImage.Format.Format_RGB888
+        # Detach from the underlying bytes buffer to avoid lifetime issues.
+        return QImage(data, width, height, bytes_per_line, fmt).copy()
+    except Exception:
+        return None
 
 
 class FolderLoadWorker(QObject):

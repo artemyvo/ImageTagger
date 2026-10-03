@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import threading
 from urllib.parse import urlparse
 
@@ -122,6 +123,7 @@ def request_json(
     # first attempt), discard it and retry once with a fresh connection.
     for attempt in range(2):
         response: http.client.HTTPResponse | None = None
+        sock: socket.socket | None = None
         _discard = False
 
         try:
@@ -130,6 +132,12 @@ def request_json(
                 cancellation.set_active_resource(connection)
 
             connection.request(method, request_path, body=data, headers=headers)
+            # On a "Connection: close" answer getresponse() hands the socket to
+            # the response and clears connection.sock, so cancel needs the
+            # socket itself to interrupt reading the body.
+            sock = connection.sock
+            if cancellation is not None and sock is not None:
+                cancellation.set_active_resource(sock)
             response = connection.getresponse()
 
             chunks = bytearray()
@@ -141,21 +149,37 @@ def request_json(
                 if not chunk:
                     break
                 chunks.extend(chunk)
+            if cancellation is not None:
+                # A cancel shuts the socket down, which can end the body early.
+                cancellation.raise_if_cancelled()
 
-            response_text = chunks.decode("utf-8")
             if response.status >= 400:
                 message = f"Server returned HTTP {response.status}."
-                details = response_text.strip()
+                # Error pages (e.g. from a proxy) are not always UTF-8.
+                details = chunks.decode("utf-8", errors="replace").strip()
                 if details:
                     message = f"{message} {details}"
                 raise error_class(message)
 
-            return json.loads(response_text)
+            try:
+                response_text = chunks.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise error_class("Server returned a response that is not UTF-8 text.") from exc
+            result = json.loads(response_text)
+            if not isinstance(result, dict):
+                raise error_class("Server returned unexpected JSON (not an object).")
+            return result
 
-        except cancel_class:
+        except LlmProviderCancelled as exc:
+            # Also the plain LlmProviderCancelled from raise_if_cancelled: the
+            # connection may be shut down, so never reuse it.
             _discard = True
-            raise
-        except TimeoutError as exc:
+            if isinstance(exc, cancel_class):
+                raise
+            raise cancel_class(str(exc)) from exc
+        # socket.timeout is only an alias of TimeoutError from Python 3.10 on.
+        # Caught before OSError: a timeout is not a stale connection to retry.
+        except (TimeoutError, socket.timeout) as exc:
             _discard = True
             raise error_class(
                 f"Timed out after {int(timeout)} seconds while contacting server. "
@@ -170,11 +194,20 @@ def request_json(
                 pass
             else:
                 raise error_class(f"Could not reach server: {exc}") from exc
+        except http.client.HTTPException as exc:
+            # Not an OSError: e.g. BadStatusLine from a server that does not
+            # speak HTTP, or ResponseNotReady after a cancel closed the socket.
+            _discard = True
+            if cancellation is not None and cancellation.is_cancelled():
+                raise cancel_class("Request stopped.") from exc
+            raise error_class(f"Could not reach server: invalid HTTP answer ({exc!r})") from exc
         except json.JSONDecodeError as exc:
             raise error_class("Server returned invalid JSON.") from exc
         finally:
             if cancellation is not None:
                 cancellation.clear_active_resource(connection)
+                if sock is not None:
+                    cancellation.clear_active_resource(sock)
             if response is not None:
                 try:
                     response.close()

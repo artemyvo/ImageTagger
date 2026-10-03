@@ -156,9 +156,10 @@ def _prepare_image_bytes(
 
     try:
         with Image.open(BytesIO(image_bytes)) as image:
+            # Read the format first: exif_transpose returns a copy without one.
+            image_format = (image.format or "").upper() or None
             image = ImageOps.exif_transpose(image)
             width, height = image.size
-            image_format = (image.format or "").upper() or None
             media_type = _media_type_from_format(image_format, suffix)
             is_webp = image_format == "WEBP" or suffix_is_webp
             should_transcode_webp = force_webp_to_png and is_webp
@@ -179,9 +180,14 @@ def _prepare_image_bytes(
                     height=height,
                 )
 
-            scale = math.sqrt(_max_image_pixels / float(pixels))
-            target_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-            resized = image.resize(target_size, Image.Resampling.LANCZOS)
+            # Only ever shrink: a WEBP under the limit is transcoded at its own size.
+            scale = min(1.0, math.sqrt(_max_image_pixels / float(pixels)))
+            if scale < 1.0:
+                target_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                resized = image.resize(target_size, Image.Resampling.LANCZOS)
+            else:
+                target_size = (width, height)
+                resized = image
 
             output = BytesIO()
             output_format = image_format or "PNG"
@@ -202,7 +208,7 @@ def _prepare_image_bytes(
                 media_type=_media_type_from_format(output_format, suffix),
                 width=target_size[0],
                 height=target_size[1],
-                was_resized=True,
+                was_resized=scale < 1.0,
             )
     except (OSError, ValueError, UnidentifiedImageError):
         return PreparedImage(content=image_bytes, media_type=_media_type_from_format(None, suffix))

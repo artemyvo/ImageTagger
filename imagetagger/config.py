@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -164,11 +165,16 @@ def _normalize_geometry(value: Any) -> dict[str, int]:
     }
 
 
+def _fresh_defaults() -> dict:
+    """A copy of the defaults whose nested dicts and lists the caller may change."""
+    return copy.deepcopy(_DEFAULTS)
+
+
 def _normalize_loaded_config(data: Any) -> dict:
     if not isinstance(data, dict):
-        return dict(_DEFAULTS)
+        return _fresh_defaults()
 
-    normalized = dict(_DEFAULTS)
+    normalized = _fresh_defaults()
     normalized["last_open_directory"] = _normalize_string(
         data.get("last_open_directory"),
         _DEFAULTS["last_open_directory"],
@@ -282,9 +288,9 @@ def load() -> dict:
         try:
             data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
             return _normalize_loaded_config(data)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             pass
-    return dict(_DEFAULTS)
+    return _fresh_defaults()
 
 
 def save(cfg: dict) -> None:

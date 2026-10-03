@@ -60,6 +60,7 @@ class ImageViewController:
             # ratio badge and fixup state.
             w._refresh_record_image_size(w.records[record_index])
             w._update_list_item_preview(record_index)
+            w._refresh_list_item_thumbnail(record_index)
             w._update_fixup_button_state()
 
         w.statusBar().showMessage(f"Reloaded image: {image_path.name}")

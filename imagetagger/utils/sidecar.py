@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import threading
 from dataclasses import dataclass, field
@@ -7,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from imagetagger.utils.io_utils import atomic_write_text
+from imagetagger.utils.io_utils import run_in_write_order, write_text_in_order
 
 
 def get_sidecar_json_path(image_path: Path) -> Path:
@@ -62,7 +63,28 @@ class SidecarData:
         )
 
 
+def _copy_sidecar(data: SidecarData) -> SidecarData:
+    """A copy callers can change freely: the list fields are copied too."""
+    return dataclasses.replace(
+        data,
+        **{
+            f.name: list(getattr(data, f.name))
+            for f in dataclasses.fields(data)
+            if isinstance(getattr(data, f.name), list)
+        },
+    )
+
+
 def read_sidecar_data(image_path: Path) -> SidecarData:
+    """The image's sidecar data, as a copy the caller may change.
+
+    Callers change it and then write it back; handing out the cached object
+    itself would make a failed write look saved.
+    """
+    return _copy_sidecar(_read_sidecar_data_shared(image_path))
+
+
+def _read_sidecar_data_shared(image_path: Path) -> SidecarData:
     # Pending async write takes priority — return it directly without hitting disk.
     with _pending_sidecar_lock:
         pending = _pending_sidecar.get(image_path)
@@ -72,7 +94,8 @@ def read_sidecar_data(image_path: Path) -> SidecarData:
     path = get_sidecar_json_path(image_path)
 
     # Fast-path: return cached negative result without a stat().
-    # Safe because write_sidecar_data always pops this entry on any write.
+    # Writes through this module pop the entry; sidecars made by other
+    # programs show up after forget_missing_sidecars() (folder load/refresh).
     with _sidecar_cache_lock:
         cached = _sidecar_cache.get(image_path)
     if cached is not None and cached[0] is None:
@@ -93,6 +116,17 @@ def read_sidecar_data(image_path: Path) -> SidecarData:
     with _sidecar_cache_lock:
         _sidecar_cache[image_path] = (mtime, data)
     return data
+
+
+def forget_missing_sidecars() -> None:
+    """Drop the cached "no sidecar" results, so the next read looks on disk again.
+
+    Called when a folder is (re)loaded, which is when the user expects to see
+    sidecars that other programs created meanwhile.
+    """
+    with _sidecar_cache_lock:
+        for image_path in [p for p, (mtime, _) in _sidecar_cache.items() if mtime is None]:
+            del _sidecar_cache[image_path]
 
 
 def _parse_sidecar_file(path: Path) -> SidecarData:
@@ -170,7 +204,20 @@ def _build_sidecar_content(data: SidecarData) -> str:
 def write_sidecar_data(image_path: Path, data: SidecarData) -> None:
     path = get_sidecar_json_path(image_path)
     content = _build_sidecar_content(data)
-    atomic_write_text(path, content, encoding="utf-8")
+    # Waits for queued async writes first, so none of them can land on top of
+    # this one.  Their completion callbacks have run by then, so any pending
+    # entry left for this image belongs to a write queued after this one.
+    write_text_in_order(path, content, encoding="utf-8")
+    with _sidecar_cache_lock:
+        _sidecar_cache.pop(image_path, None)
+
+
+def delete_sidecar_data(image_path: Path) -> None:
+    """Delete the sidecar after any queued writes to it have landed."""
+    path = get_sidecar_json_path(image_path)
+    run_in_write_order(lambda: path.unlink(missing_ok=True))
+    with _pending_sidecar_lock:
+        _pending_sidecar.pop(image_path, None)
     with _sidecar_cache_lock:
         _sidecar_cache.pop(image_path, None)
 
@@ -186,6 +233,8 @@ def write_sidecar_data_async(image_path: Path, data: SidecarData) -> None:
 
     path = get_sidecar_json_path(image_path)
     content = _build_sidecar_content(data)
+    # The caches keep their own copy, so later changes by the caller do not leak in.
+    data = _copy_sidecar(data)
 
     # Make the new data available to reads immediately.
     with _pending_sidecar_lock:
@@ -194,11 +243,16 @@ def write_sidecar_data_async(image_path: Path, data: SidecarData) -> None:
     with _sidecar_cache_lock:
         _sidecar_cache.pop(image_path, None)
 
-    def _on_write_complete() -> None:
-        # Replace pending entry with a real mtime-keyed cache entry.
+    def _on_write_complete(error: BaseException | None) -> None:
+        # Replace pending entry with a real mtime-keyed cache entry, or on
+        # failure drop it so reads fall back to what is actually on disk.
         with _pending_sidecar_lock:
             if _pending_sidecar.get(image_path) is data:
                 _pending_sidecar.pop(image_path, None)
+        if error is not None:
+            with _sidecar_cache_lock:
+                _sidecar_cache.pop(image_path, None)
+            return
         try:
             mtime = path.stat().st_mtime
             with _sidecar_cache_lock:

@@ -93,10 +93,20 @@ To update dependencies later: `update.bat` or `./update.sh`.
 
 ---
 
+## Running Tests
+
+```bash
+./run_tests.sh
+```
+
+The first run installs the test dependencies from `requirements-dev.txt` into `.venv`. Tests run headless (Qt offscreen) against temporary folders and never touch your `config.json`. Pass pytest options through, for example `./run_tests.sh -m "not ui"` to skip the slower window tests.
+
+---
+
 ## Acknowledgements
 
 This project is heavily inspired by [TagGUI](https://github.com/jhc13/taggui), which deserves full credit for the core UI layout direction and practical workflow ideas.
 
 ## AI Generation Disclosure
 
-For transparency, this codebase was 100% AI-generated with GitHub Copilot.
+For transparency, this codebase was 100% AI-generated.

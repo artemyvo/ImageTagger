@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QSize, QThread, Qt
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import QFileDialog, QListWidgetItem, QMessageBox
 
 from imagetagger import config as _config
@@ -16,7 +16,8 @@ from imagetagger.utils.filter_parser import (
     _parse_filter_expression,
 )
 from imagetagger.ui.models import ImageRecord, _UNKNOWN
-from imagetagger.ui.workers import IMAGE_EXTENSIONS, THUMB_SIZE, FolderLoadWorker
+from imagetagger.utils.sidecar import forget_missing_sidecars
+from imagetagger.ui.workers import IMAGE_EXTENSIONS, THUMB_SIZE, FolderLoadWorker, thumbnail_payload_to_qimage
 
 if TYPE_CHECKING:
     from imagetagger.ui.main_window import MainWindow
@@ -83,6 +84,8 @@ class DirectoryController:
         self._set_loading_state(True)
         self._window.statusBar().showMessage("Scanning folder...")
         self._pending_selection_path = restore_selection
+        # Sidecars other programs created since the last look become visible.
+        forget_missing_sidecars()
 
         try:
             max_thread_cap = int(self._window._cfg.get("directory_loader_max_threads", 8))
@@ -251,27 +254,7 @@ class DirectoryController:
                 text_path_str = str(data.get("text_path", "")).strip()
                 text = str(data.get("text", ""))
                 thumb_payload = data.get("thumbnail")
-                thumb_image: QImage | None = None
-                if isinstance(thumb_payload, dict):
-                    try:
-                        b = thumb_payload.get("bytes")
-                        width = int(thumb_payload.get("width", 0))
-                        height = int(thumb_payload.get("height", 0))
-                        bytes_per_line = int(thumb_payload.get("bytes_per_line", width * 4))
-                        has_alpha = bool(thumb_payload.get("has_alpha", True))
-                        if b is not None and width > 0 and height > 0 and bytes_per_line > 0:
-                            fmt = QImage.Format.Format_RGBA8888 if has_alpha else QImage.Format.Format_RGB888
-                            qimage = QImage(
-                                b,
-                                width,
-                                height,
-                                bytes_per_line,
-                                fmt,
-                            )
-                            # Detach from the underlying bytes buffer to avoid lifetime issues.
-                            thumb_image = qimage.copy()
-                    except Exception:
-                        thumb_image = None
+                thumb_image = thumbnail_payload_to_qimage(thumb_payload)
 
                 if not image_path_str or not text_path_str:
                     continue

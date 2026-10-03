@@ -3,14 +3,20 @@ from __future__ import annotations
 from collections import Counter
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QRect, QSize, QStringListModel, QThread, Qt, QTimer
+from PyQt6.QtCore import QObject, QRect, QSize, QStringListModel, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QInputDialog, QLineEdit, QListWidget, QListWidgetItem, QMessageBox
 
 from imagetagger.utils.annotations import sanitize_tag_text
-from imagetagger.ui.workers import TagPurgeWorker
+from imagetagger.utils.io_utils import bg_write_text
 
 if TYPE_CHECKING:
     from imagetagger.ui.main_window import MainWindow, TagListWidget, GlobalTagListWidget
+
+
+class _BulkWriteSignaller(QObject):
+    """Reports each finished background write (True when it succeeded) on the main thread."""
+
+    written = pyqtSignal(bool)
 
 
 class TagController:
@@ -90,12 +96,23 @@ class TagController:
 
         new_text = item.text().strip()
         row = self._tag_list.row(item)
+        # Tags are stored normalized, as when added through the tag input; the
+        # description keeps its case.
+        if new_text and not self._window._is_description_like_annotation(new_text):
+            new_text = sanitize_tag_text(new_text)
 
-        if not new_text:
+        duplicate = bool(new_text) and any(
+            sanitize_tag_text(self._tag_list.item(i).text()) == sanitize_tag_text(new_text)
+            for i in range(self._tag_list.count())
+            if i != row
+        )
+        if not new_text or duplicate:
             removed = self._tag_list.takeItem(row)
             del removed
             self._update_tag_item_heights()
             self._window._sync_record_from_tag_list()
+            if duplicate:
+                self._window.statusBar().showMessage(f"Tag already exists: {new_text}")
             return
 
         self._updating_tag_list = True
@@ -249,53 +266,72 @@ class TagController:
         if confirm.exec() != QMessageBox.StandardButton.Yes:
             return
 
-        # Compute new text for every affected record on the main thread (fast, no I/O).
+        # Drop only the matching parts; descriptions and other tags stay as written.
         jobs: list[tuple] = []
         for record in affected:
-            new_tags = [t for t in self._window._parse_tags(record.text) if t not in tags_set]
-            new_text = self._window._serialize_tags(new_tags)
+            parts = self._window._split_record_annotations(record.text)
+            new_text = self._window._serialize_tags(
+                [part for part in parts if sanitize_tag_text(part) not in tags_set]
+            )
             record.text = new_text
             jobs.append((record.text_path, new_text))
 
         # Refresh UI immediately so the user sees the change right away.
         self._rebuild_known_tags_from_records()
         self._refresh_tag_completions()
-        idx = self._window.current_index
-        if 0 <= idx < len(self._window.records):
-            record = self._window.records[idx]
-            if record in affected:
-                self._populate_tag_list(self._window._parse_tags(record.text))
+        self._refresh_changed_records(affected)
 
+        self._write_texts_in_background(
+            jobs,
+            lambda done, total: f"Removing {tag_label} — writing {done} / {total}…",
+            lambda total: f"Removed {tag_label} from {total} file(s).",
+        )
+
+    def _refresh_changed_records(self, changed: list) -> None:
+        """Update list rows, and the tag list if the current image is among *changed*."""
+        w = self._window
+        for record in changed:
+            index = w._record_index_for_image_path(record.image_path)
+            if index >= 0:
+                w._update_list_item_preview(index)
+        current = w._current_record()
+        if current is not None and current in changed:
+            self._populate_tag_list(w._parse_annotations_for_tag_list(current.text))
+
+    def _write_texts_in_background(self, jobs: list[tuple], progress_message, done_message) -> None:
+        """Queue (text_path, text) writes in order behind any earlier saves, reporting progress.
+
+        They are queued now, on the main thread, so a later edit of the same
+        file is always written after them.  Failures are reported by the
+        window's background write error handler.
+        """
+        w = self._window
         total = len(jobs)
-        self._window.statusBar().showMessage(f'Removing {tag_label} — writing 0 / {total}…')
+        signaller = _BulkWriteSignaller(w)
+        state = {"done": 0, "failed": 0}
 
-        worker = TagPurgeWorker(jobs)
-        thread = QThread(self._window)
-        worker.moveToThread(thread)
+        def on_written(ok: bool) -> None:
+            state["done"] += 1
+            if not ok:
+                state["failed"] += 1
+            if state["done"] < total:
+                w.statusBar().showMessage(progress_message(state["done"], total))
+                return
+            message = done_message(total - state["failed"])
+            if state["failed"]:
+                message += f" {state['failed']} could not be saved."
+            w.statusBar().showMessage(message)
+            signaller.deleteLater()
 
-        def on_progress(done: int, total: int) -> None:
-            self._window.statusBar().showMessage(f'Removing {tag_label} — writing {done} / {total}…')
-
-        def on_finished() -> None:
-            self._window.statusBar().showMessage(f'Removed {tag_label} from {total} file(s).')
-            thread.quit()
-
-        def on_failed(msg: str) -> None:
-            QMessageBox.critical(self._window, "Save failed", f"Could not write some files:\n{msg}")
-            thread.quit()
-
-        worker.progress.connect(on_progress)
-        worker.finished.connect(on_finished)
-        worker.failed.connect(on_failed)
-        thread.started.connect(worker.run)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-
-        # Keep references so Python doesn't GC the thread/worker before they finish.
-        self._purge_thread = thread
-        self._purge_worker = worker
-
-        thread.start()
+        signaller.written.connect(on_written)
+        w.statusBar().showMessage(progress_message(0, total))
+        for path, text in jobs:
+            bg_write_text(
+                path,
+                text,
+                on_complete=lambda error: signaller.written.emit(error is None),
+                durable=False,
+            )
 
     def _bump_selected_tag(self) -> None:
         if self._window.current_index < 0 or self._window.current_index >= len(self._window.records):
@@ -342,47 +378,21 @@ class TagController:
             )
             return
 
-        # Refresh the current record's tag list immediately.
-        current_record = self._window.records[self._window.current_index]
-        if current_record in affected:
-            self._populate_tag_list(
-                self._window._parse_annotations_for_tag_list(current_record.text)
-            )
-            # Restore selection to the bumped tag at its new position.
+        changed = [record for record in affected if any(path == record.text_path for path, _ in jobs)]
+        self._refresh_changed_records(changed)
+        # Restore selection to the bumped tag at its new position.
+        if self._window._current_record() in changed:
             for i in range(self._tag_list.count()):
                 if self._tag_list.item(i).text().casefold() == tag_casefolded:
                     self._tag_list.setCurrentRow(i)
                     break
 
-        total = len(jobs)
         tag_label = f'"{tag_to_bump}"'
-        self._window.statusBar().showMessage(f'Bumping {tag_label} — writing 0 / {total}…')
-
-        worker = TagPurgeWorker(jobs)
-        thread = QThread(self._window)
-        worker.moveToThread(thread)
-
-        def on_progress(done: int, total: int = total) -> None:
-            self._window.statusBar().showMessage(f'Bumping {tag_label} — writing {done} / {total}…')
-
-        def on_finished(total: int = total) -> None:
-            self._window.statusBar().showMessage(f'Bumped {tag_label} in {total} file(s).')
-            thread.quit()
-
-        def on_failed(msg: str) -> None:
-            QMessageBox.critical(self._window, "Save failed", f"Could not write some files:\n{msg}")
-            thread.quit()
-
-        worker.progress.connect(on_progress)
-        worker.finished.connect(on_finished)
-        worker.failed.connect(on_failed)
-        thread.started.connect(worker.run)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-
-        self._bump_thread = thread
-        self._bump_worker = worker
-        thread.start()
+        self._write_texts_in_background(
+            jobs,
+            lambda done, total: f"Bumping {tag_label} — writing {done} / {total}…",
+            lambda total: f"Bumped {tag_label} in {total} file(s).",
+        )
 
     def _rename_selected_tag(self) -> None:
         selected = self._known_tags_list.selectedItems()
@@ -432,19 +442,22 @@ class TagController:
         if not affected:
             return
 
-        # Build updated text for every affected record on the main thread (fast, no I/O).
+        # Replace only the matching parts; descriptions and other tags stay as written.
         jobs: list[tuple] = []
         for record in affected:
-            old_tags = self._window._parse_tags(record.text)
-            new_tags = [new_tag if t.casefold() == old_casefolded else t for t in old_tags]
+            parts = self._window._split_record_annotations(record.text)
+            renamed = [
+                new_tag if sanitize_tag_text(part).casefold() == old_casefolded else part
+                for part in parts
+            ]
             # Deduplicate while preserving order (handles merge-into-existing case).
             seen: set[str] = set()
             deduped: list[str] = []
-            for t in new_tags:
-                key = t.casefold()
+            for part in renamed:
+                key = sanitize_tag_text(part).casefold()
                 if key not in seen:
                     seen.add(key)
-                    deduped.append(t)
+                    deduped.append(part)
             new_text = self._window._serialize_tags(deduped)
             record.text = new_text
             jobs.append((record.text_path, new_text))
@@ -452,47 +465,12 @@ class TagController:
         # Update in-memory tag index immediately.
         self._rebuild_known_tags_from_records()
         self._refresh_tag_completions()
+        self._refresh_changed_records(affected)
 
-        # Refresh the currently-visible image's tag list if it was affected.
-        idx = self._window.current_index
-        if 0 <= idx < len(self._window.records):
-            current_record = self._window.records[idx]
-            if current_record in affected:
-                self._populate_tag_list(self._window._parse_tags(current_record.text))
-
-        total = len(jobs)
         old_label = f'"{old_tag}"'
         new_label = f'"{new_tag}"'
-        self._window.statusBar().showMessage(
-            f'Renaming {old_label} → {new_label} — writing 0 / {total}…'
+        self._write_texts_in_background(
+            jobs,
+            lambda done, total: f"Renaming {old_label} → {new_label} — writing {done} / {total}…",
+            lambda total: f"Renamed {old_label} → {new_label} in {total} file(s).",
         )
-
-        worker = TagPurgeWorker(jobs)
-        thread = QThread(self._window)
-        worker.moveToThread(thread)
-
-        def on_progress(done: int, total: int = total) -> None:
-            self._window.statusBar().showMessage(
-                f'Renaming {old_label} → {new_label} — writing {done} / {total}…'
-            )
-
-        def on_finished(total: int = total) -> None:
-            self._window.statusBar().showMessage(
-                f'Renamed {old_label} → {new_label} in {total} file(s).'
-            )
-            thread.quit()
-
-        def on_failed(msg: str) -> None:
-            QMessageBox.critical(self._window, "Save failed", f"Could not write some files:\n{msg}")
-            thread.quit()
-
-        worker.progress.connect(on_progress)
-        worker.finished.connect(on_finished)
-        worker.failed.connect(on_failed)
-        thread.started.connect(worker.run)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-
-        self._rename_thread = thread
-        self._rename_worker = worker
-        thread.start()

@@ -28,6 +28,18 @@ def _normalize_search_match_entry(value: str, sanitize_annotation: Callable[[str
     return normalized.lower()
 
 
+# Headers like "ISSUES:", "### Tags :", "**Description**:" or "**TAGS:**".
+# The ':' is required so content lines such as "Description incorrectly..."
+# are not taken for a DESCRIPTION header; bold/italic markup may close
+# before it.  "markup" is the opening '*'/'_' run, stripped again after the
+# colon.
+_HEADER_PATTERN = re.compile(
+    r"^[#\s>\-]*(?P<markup>[*_]*)\s*"
+    r"(?P<keyword>ISSUES|TAGS|DESCRIPTION|AI_FIND_MATCHES|VISIONTAGS|VISIONDESC)\b[*_\s]*:",
+    re.IGNORECASE,
+)
+
+
 @dataclass
 class FixupData:
     issues: str
@@ -49,11 +61,7 @@ def parse_fixup_data(
     current_section = "issues"
     has_headers = False
 
-    # Robust regex for headers like "ISSUES:", "### Tags :", "**Description**:", etc.
-    # CRITICAL: Must require ':' after the keyword to avoid matching content lines like
-    # "Description incorrectly..." which would incorrectly be treated as a DESCRIPTION header.
-    header_pattern = re.compile(r"^[#*_\s>\-]*(ISSUES|TAGS|DESCRIPTION|AI_FIND_MATCHES|VISIONTAGS|VISIONDESC)\b\s*:", re.IGNORECASE)
-
+    header_pattern = _HEADER_PATTERN
     for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line:
@@ -62,7 +70,7 @@ def parse_fixup_data(
         match = header_pattern.match(line)
         if match:
             has_headers = True
-            header_keyword = match.group(1).upper()
+            header_keyword = match.group("keyword").upper()
             if header_keyword == "ISSUES":
                 current_section = "issues"
             elif header_keyword == "TAGS":
@@ -76,10 +84,12 @@ def parse_fixup_data(
             elif header_keyword == "VISIONDESC":
                 current_section = "visiondesc"
 
-            # Handle content on the same line after the header (after colon or match end)
-            sep_idx = line.find(":")
-            content_start = sep_idx + 1 if sep_idx != -1 else match.end()
-            inline_content = line[content_start:].strip()
+            # Content on the same line after the header, without the closing
+            # markup of a bold/italic header ("**TAGS:** cat" -> "cat").
+            inline_content = line[match.end():].strip()
+            opening_markup = match.group("markup")
+            if opening_markup and inline_content.startswith(opening_markup):
+                inline_content = inline_content[len(opening_markup):].strip()
             if inline_content:
                 sections[current_section].append(inline_content)
             continue
@@ -115,7 +125,9 @@ def parse_fixup_data(
     ]
     vision_caption = " ".join(line.strip() for line in sections["visiondesc"] if line.strip())
 
-    if not issues and not corrected_description and not corrected_tags:
+    # Without any header the whole answer is the issue text.  With headers
+    # and nothing under them, the answer is clean: leave everything empty.
+    if not has_headers and not issues and not corrected_description and not corrected_tags:
         issues = content.strip()
 
     return FixupData(
@@ -132,8 +144,4 @@ def parse_fixup_data(
 
 def has_fixup_section_headers(text: str) -> bool:
     """Return True if the text contains at least one recognised fixup section header."""
-    header_pattern = re.compile(
-        r"^[#*_\s>\-]*(ISSUES|TAGS|DESCRIPTION|AI_FIND_MATCHES|VISIONTAGS|VISIONDESC)\b\s*:",
-        re.IGNORECASE,
-    )
-    return any(header_pattern.match(line.strip()) for line in text.splitlines())
+    return any(_HEADER_PATTERN.match(line.strip()) for line in text.splitlines())

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import socket
 import threading
 from typing import Protocol
 from urllib.parse import urlparse
@@ -67,12 +68,41 @@ def normalize_server_url(
     if "://" not in trimmed:
         trimmed = f"http://{trimmed}"
 
-    parsed = urlparse(trimmed)
+    try:
+        parsed = urlparse(trimmed)
+        parsed.port  # raises ValueError for a non-numeric or out-of-range port
+    except ValueError as exc:
+        raise LlmProviderError(f"Enter a valid server address ({exc}).") from exc
     if parsed.scheme not in allowed_schemes or not parsed.netloc:
         raise LlmProviderError("Enter a valid server address.")
 
     normalized = f"{parsed.scheme}://{parsed.netloc}"
     return normalized.rstrip("/")
+
+
+def _interrupt(resource: object) -> None:
+    """Stop a request in flight on *resource* (a socket, an HTTP connection or anything closable).
+
+    Closing a socket does not wake a thread blocked reading it, and closing
+    the connection waits for that read to finish.  Shutting the socket down
+    does neither: the blocked read returns at once and the request code then
+    discards the connection itself.
+    """
+    sock = resource if isinstance(resource, socket.socket) else getattr(resource, "sock", None)
+    if isinstance(sock, socket.socket):
+        try:
+            # The plain socket method, also for TLS: SSLSocket.shutdown would
+            # tear down TLS state the reading thread is still using.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+            return
+        except OSError:
+            pass  # not connected: nothing to interrupt, close instead
+    close = getattr(resource, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
 
 
 class LlmRequestCancellation:
@@ -87,12 +117,7 @@ class LlmRequestCancellation:
             resources = list(self._active_resources)
             self._active_resources.clear()
         for resource in resources:
-            close = getattr(resource, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
+            _interrupt(resource)
 
     def is_cancelled(self) -> bool:
         return self._event.is_set()
@@ -106,12 +131,7 @@ class LlmRequestCancellation:
             self._active_resources.add(resource)
             already_cancelled = self._event.is_set()
         if already_cancelled:
-            close = getattr(resource, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
+            _interrupt(resource)
             raise LlmProviderCancelled("Request stopped.")
 
     def clear_active_resource(self, resource: object) -> None:
